@@ -1012,6 +1012,66 @@ DROP FUNCTION lca_spilled(text);
 DROP FUNCTION lca_ordered(text);
 DROP TABLE lca_big, lca_many;
 
+-- ---------- 12. several anti joins ----------
+-- Two or more NOT EXISTS, or LEFT JOIN ... IS NULLs, each on the same key of
+-- r: every arm's child goes to one sort of keys, a key two arms share looked
+-- up once and a row two arms match taken away once (DESIGN.md §27, "Several
+-- anti joins").  lca_more shares keys 1, 2 and 5 with lca_skip, has keys of
+-- its own, NULL and a duplicate; lca_tag shares 1, 2, 5 and 7.
+CREATE TABLE lca_more (a int, w int NOT NULL);
+INSERT INTO lca_more VALUES (1, 0), (2, 0), (5, 1), (11, 0), (12, 1), (12, 1),
+	(NULL, 0), (390, 0), (777, 1);
+VACUUM (ANALYZE) lca_more;
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.kn)');
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.kn)');
+SELECT q, lca(q) FROM (VALUES
+	('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.kn)'),
+	('SELECT count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.k)'),
+	-- each arm's own filter, and three arms
+	('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn AND s.f = 0) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.kn AND m.w = 1)'),
+	('SELECT count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.kn) AND NOT EXISTS (SELECT 1 FROM lca_tag t WHERE t.a = r.kn AND t.tag = ''on'')'),
+	-- the LEFT JOIN form, both arms and one of two
+	('SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn LEFT JOIN lca_more m ON m.a = r.kn WHERE r.x < 5 AND s.a IS NULL AND m.a IS NULL'),
+	('SELECT count(*) FROM lca_rows r LEFT JOIN lca_more m ON m.a = r.kn AND m.w = 0 WHERE m.w IS NULL AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn)'),
+	-- an arm whose inner side is a join, and an arm with nothing to take
+	('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s JOIN lca_tag t ON t.a = s.a WHERE s.b = r.kn) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.kn)'),
+	('SELECT count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.kn AND m.w > 5)'),
+	-- a GROUP BY, a HAVING, and every row of z = 99 taken by both arms
+	('SELECT r.g, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.kn) GROUP BY r.g'),
+	('SELECT r.z, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.kn) GROUP BY r.z HAVING count(*) > 100'),
+	-- beside a count by cells: a tier of a score
+	('SELECT CASE WHEN CASE WHEN r.x = 1 THEN 3 ELSE 0 END + CASE WHEN r.g IN (2, 3) THEN 2 ELSE 0 END + CASE WHEN r.z = 99 THEN 5 ELSE 0 END >= 5 THEN ''high'' ELSE ''low'' END AS tier, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.kn) GROUP BY 1'),
+	('SELECT count(*) FROM lca_rows r LEFT JOIN lca_more m ON m.a = r.kn WHERE m.a IS NULL AND CASE WHEN r.x = 1 THEN r.g = 2 ELSE r.g = 3 END AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn)')
+) v(q);
+-- ... and declined, core's answer either way: arms on two columns of r, a
+-- key of another type in one arm, an arm with a join clause beyond its key,
+-- and an anti join of an arm's own inside it
+SELECT q, lca(q) FROM (VALUES
+	('SELECT count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.k)'),
+	('SELECT count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.c = r.kn) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.kn)'),
+	('SELECT count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn AND s.f <> r.z) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.kn)')
+) v(q);
+-- an anti join nested in the subquery is its arm's child's own
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = s.b))');
+-- a generic plan, and parallel: one participant runs both children
+SELECT lca_prep('SELECT count(*) FROM lca_rows r WHERE r.x = $1 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn AND s.f = $2) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.kn)', '3, 0');
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET pg_lion.parallel_range_keys = 1;
+SELECT ln FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.kn)') AS ln
+	WHERE ln !~ 'Workers Planned';
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn) AND NOT EXISTS (SELECT 1 FROM lca_more m WHERE m.a = r.kn)');
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET pg_lion.parallel_range_keys;
+DROP TABLE lca_more;
+
 DROP TABLE lca_rows, lca_skip, lca_num, lca_tag;
 DROP FUNCTION lca(text);
 DROP FUNCTION lca_val(text);

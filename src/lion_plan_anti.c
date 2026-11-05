@@ -132,6 +132,45 @@ lion_anti_index_keys(const LionSmallAnti *anti, IndexOptInfo *idx,
 }
 
 /*
+ * Does `arm`, a further NOT EXISTS beside the first (LionSmallAnti's arms),
+ * look its keys up in plan's B-tree as the first does: by the same scan keys
+ * - each one's column, operator, collation and order - on values of the same
+ * type, with no join clause but them?  The child's rows of every arm go to
+ * one sort by those values, which a lookup each distinct one of takes once,
+ * so that a row two arms' keys find is subtracted once; a join clause beyond
+ * the keys would have to be tested with the inner row of its own arm.  Sets
+ * the arm's keys' values and join clauses, in the scan keys' order, into
+ * *keyexprs and *clauses.
+ */
+static bool
+lion_anti_arm_keys(const LionSmallAnti *arm, const LionAntiPlan *plan,
+				   List **keyexprs, List **clauses)
+{
+	LionAntiPlan cand;
+	int			k;
+
+	memset(&cand, 0, sizeof(cand));
+	cand.idx = plan->idx;
+	(void) lion_anti_index_keys(arm, plan->idx, &cand);
+	if (cand.nkey != plan->nkey || list_length(arm->clauses) != cand.nkey)
+		return false;
+	*keyexprs = NIL;
+	*clauses = NIL;
+	for (k = 0; k < cand.nkey; k++)
+	{
+		if (cand.keycol[k] != plan->keycol[k] ||
+			cand.keyop[k] != plan->keyop[k] ||
+			cand.keycoll[k] != plan->keycoll[k] ||
+			cand.keysort[k] != plan->keysort[k] ||
+			exprType(cand.keyexpr[k]) != exprType(plan->keyexpr[k]))
+			return false;
+		*keyexprs = lappend(*keyexprs, cand.keyexpr[k]);
+		*clauses = lappend(*clauses, cand.keyclause[k]);
+	}
+	return true;
+}
+
+/*
  * `clauses` - RestrictInfos or bare expressions - in the order core tests a
  * scan's or a join's quals in (order_qual_clauses(), which createplan.c keeps
  * to itself): by security level, a leakproof clause of less than ten
@@ -444,6 +483,7 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 	IndexOptInfo *idx = plan->idx;
 	Path	   *child = anti->innerpath;
 	double		childrows = Max(child->rows, 1.0);
+	double		allrows;
 	double		tuples = Max(rel->tuples, 1.0);
 	double		relpages = Max((double) rel->pages, 1.0);
 	double		idxtuples = Max(idx->tuples, 1.0);
@@ -470,6 +510,8 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 	QualCost	roweval;
 	int			width;
 	int			k;
+	ListCell   *la;
+	ListCell   *lk;
 
 	for (k = 0; k < plan->nkey; k++)
 	{
@@ -477,9 +519,28 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 		outerkeys = list_append_unique(outerkeys, plan->keyvar[k]);
 	}
 
-	/* the distinct keys of the child's rows */
+	/*
+	 * the distinct keys of the child's rows - of each arm's child, whose
+	 * keys another arm's may repeat, which the sort then takes once
+	 */
 	lookups = estimate_num_groups(root, innerkeys, childrows, NULL, NULL);
 	lookups = clamp_row_est(Min(lookups, childrows));
+	allrows = childrows;
+	cost_qual_eval(&keyeval, innerkeys, root);
+	cost = keyeval.startup + childrows * keyeval.per_tuple;
+	forboth(la, anti->arms, lk, plan->armkeyexprs)
+	{
+		const LionSmallAnti *arm = (const LionSmallAnti *) lfirst(la);
+		double		armrows = Max(arm->innerpath->rows, 1.0);
+		double		armlookups;
+
+		armlookups = estimate_num_groups(root, (List *) lfirst(lk), armrows,
+										 NULL, NULL);
+		lookups += clamp_row_est(Min(armlookups, armrows));
+		allrows += armrows;
+		cost_qual_eval(&keyeval, (List *) lfirst(lk), root);
+		cost += keyeval.startup + armrows * keyeval.per_tuple;
+	}
 
 	/*
 	 * ... and the rows each finds: every row of its key in the table, which
@@ -506,7 +567,7 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 
 	/* ... the index tuples it reads and their scan keys */
 	idxperlookup = Max(perlookup * idxtuples / tuples, 1.0);
-	cost = lookups * (descent + idxperlookup *
+	cost += lookups * (descent + idxperlookup *
 					  (cpu_index_tuple_cost + plan->nkey * cpu_operator_cost));
 
 	/* ... the index's pages, over every lookup */
@@ -554,18 +615,16 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 	}
 
 	/*
-	 * the child's rows: their keys evaluated, and the rows sorted by them -
-	 * with the inner row where a join clause but the scan keys' reads it
+	 * the children's rows sorted by their keys, evaluated above - with the
+	 * inner row where a join clause but the scan keys' reads it
 	 */
-	cost_qual_eval(&keyeval, innerkeys, root);
 	width = 0;
 	for (k = 0; k < plan->nkey; k++)
 		width += get_typavgwidth(exprType(plan->keyexpr[k]),
 								 exprTypmod(plan->keyexpr[k]));
 	if (list_length(anti->clauses) > plan->nkey)
 		width += child->pathtarget->width;
-	cost += keyeval.startup + childrows * keyeval.per_tuple +
-		lion_anti_sort_price(childrows, width);
+	cost += lion_anti_sort_price(allrows, width);
 
 	plan->lookups = lookups;
 	plan->fetched = fetched;
@@ -586,6 +645,11 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
  * join clauses then reject, and the fewest pages.  `ngroup` and `rowexprs`
  * are what a row found is subtracted from: its group's columns, or the
  * predicates that tell its cell (lion_anti_price()).
+ *
+ * Of several arms (LionSmallAnti's arms) only a B-tree every arm looks its
+ * keys up in by the same scan keys, with no join clause but them
+ * (lion_anti_arm_keys()): the further arms' keys' values and clauses are
+ * *out's armkeyexprs and armclauses.
  */
 bool
 lion_anti_choose(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions,
@@ -617,6 +681,29 @@ lion_anti_choose(PlannerInfo *root, const LionSmallAnti *anti, List *restriction
 			(ncol == bestcols && best.idx != NULL &&
 			 idx->pages >= best.idx->pages))
 			continue;
+
+		/* ... and, of several arms, every arm's keys the same scan keys */
+		cand.narm = 1 + list_length(anti->arms);
+		if (anti->arms != NIL)
+		{
+			ListCell   *la;
+
+			if (list_length(anti->clauses) != cand.nkey)
+				continue;
+			foreach(la, anti->arms)
+			{
+				List	   *keyexprs;
+				List	   *clauses;
+
+				if (!lion_anti_arm_keys((const LionSmallAnti *) lfirst(la),
+										&cand, &keyexprs, &clauses))
+					break;
+				cand.armkeyexprs = lappend(cand.armkeyexprs, keyexprs);
+				cand.armclauses = lappend(cand.armclauses, clauses);
+			}
+			if (la != NULL)
+				continue;
+		}
 		best = cand;
 		bestcols = ncol;
 	}

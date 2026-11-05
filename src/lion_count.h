@@ -1258,6 +1258,19 @@ typedef struct LionCellDim
 								 * NULL to work each out */
 } LionCellDim;
 
+/*
+ * Rows a count by cells leaves out (DESIGN.md §27, "A GROUP BY column beside
+ * the cells"): at each container key the walk counts rows at, apply() clears
+ * from `rows` - LION_BITSET_WORDS words, the bit of a lo each - those of the
+ * key it leaves out.  The keys come in ascending order within one call of
+ * lion_count_cells(), which may skip keys.
+ */
+typedef struct LionCellsExclude
+{
+	void		(*apply) (void *arg, uint32 ckey, uint64 *rows);
+	void	   *arg;
+} LionCellsExclude;
+
 extern int	lion_cells_outcome(const LionCellDim *dim, uint64 mask);
 extern void lion_count_cells(Relation heap, Snapshot snapshot,
 							 const LionDecodeCol *driver, const uint64 *drvadd,
@@ -1265,6 +1278,7 @@ extern void lion_count_cells(Relation heap, Snapshot snapshot,
 							 int nlabel, const LionCellLabel *labels,
 							 uint64 ncells, uint32 lokey, uint64 hikey,
 							 const LionPostingSet *where,
+							 const LionCellsExclude *exclude,
 							 LionDecodeTally *tally, LionCountStats *stats,
 							 LionDecodeStats *dstats, LionVisCache *cache,
 							 bool rel_read_only);

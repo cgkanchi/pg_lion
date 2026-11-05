@@ -163,7 +163,14 @@ typedef struct LionAntiKey
  * anti join evaluates, as the RestrictInfo core has it - a row of t matched
  * when all of them hold for one inner row; `keys` those of them a B-tree on t
  * may look a key up by.
+ *
+ * Of several NOT EXISTS - each an arm, whose rows of t with a match a row
+ * without any has none of - *out is the first arm's and `arms` the others',
+ * each a LionSmallAnti of its own (whose `arms` is NIL): the rows the count
+ * loses are those any arm's inner rows match, each once.
  */
+#define LION_MAX_ANTI_ARMS	8
+
 typedef struct LionSmallAnti
 {
 	RelOptInfo *joinrel;		/* the query's join rel */
@@ -172,6 +179,7 @@ typedef struct LionSmallAnti
 	Path	   *innerpath;		/* innerrel's cheapest total path */
 	List	   *clauses;		/* RestrictInfo: every join clause */
 	List	   *keys;			/* LionAntiKey: the clauses that are keys */
+	List	   *arms;			/* LionSmallAnti: the further arms */
 } LionSmallAnti;
 
 /*
@@ -206,10 +214,11 @@ extern bool lion_fkjoin_recognize_join(PlannerInfo *root, RelOptInfo *joinrel,
 
 /*
  * Whether joinrel is the anti join over a small inner side (DESIGN.md §27,
- * "The anti join over a small inner side"): one table, NOT EXISTS of a
- * subquery correlated with it by at least one key, and nothing else.  Fills
- * *out when it is.  Whether the table's own clauses can be counted, and
- * whether a B-tree of it looks a key up, is the caller's to decide.
+ * "The anti join over a small inner side"): one table, one or more NOT
+ * EXISTS of a subquery correlated with it by at least one key, and nothing
+ * else.  Fills *out when it is.  Whether the table's own clauses can be
+ * counted, and whether a B-tree of it looks a key up, is the caller's to
+ * decide.
  */
 extern bool lion_fkjoin_recognize_small_anti(PlannerInfo *root,
 											 RelOptInfo *joinrel,

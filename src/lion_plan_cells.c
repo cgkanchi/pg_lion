@@ -1795,12 +1795,14 @@ cells_label_rows(const LionCellsDimPlan *dp, double tuples)
  * its passes - or, where none will do, `fallback`, a lion-indexed column of
  * the table no dimension is (lion_count_all_driver()), which labels nothing.
  * False when neither will: too many entries, or none at all; or when a
- * dimension is RANGED, which only LionProbeJoin reads.
+ * dimension is RANGED, which only LionProbeJoin reads.  `grouped` makes
+ * fallback, a GROUP BY column, the driver whatever the work: its dimension's
+ * if it is one, and itself if not ("A GROUP BY column beside the cells").
  */
 bool
 lion_cells_choose_driver(PlannerInfo *root, RelOptInfo *rel,
 						 LionCellsPlan *cp, Var *fallback,
-						 double fallbackentries)
+						 double fallbackentries, bool grouped)
 {
 	double		tuples = Max(rel->tuples, 1.0);
 	double		total = 0;
@@ -1830,6 +1832,8 @@ lion_cells_choose_driver(PlannerInfo *root, RelOptInfo *rel,
 			passes > LION_CELLS_MAX_PASSES ||
 			dp->entries * dp->priv.nval > LION_CELLS_MAX_COMPARES)
 			continue;
+		if (grouped && dp->var->varattno != fallback->varattno)
+			continue;
 		work = Max(passes, 1.0) * (total - rows[d]) +
 			dp->entries * dp->priv.nval;
 		if (bestwork < 0 || work < bestwork)
@@ -1846,7 +1850,8 @@ lion_cells_choose_driver(PlannerInfo *root, RelOptInfo *rel,
 		for (d = 0; d < cp->ndim; d++)
 			isdim |= (cp->dims[d].var->varattno == fallback->varattno);
 		if (!isdim && passes <= LION_CELLS_MAX_PASSES &&
-			(bestwork < 0 || Max(passes, 1.0) * total < bestwork))
+			(grouped || bestwork < 0 ||
+			 Max(passes, 1.0) * total < bestwork))
 		{
 			best = -1;
 			bestwork = Max(passes, 1.0) * total;

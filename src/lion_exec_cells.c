@@ -52,6 +52,9 @@ lion_begin_cells(LionCountScanState *st, const LionCountPriv *priv,
 	cr->idxcol = (AttrNumber *) palloc0(sizeof(AttrNumber) * cr->ndim);
 	cr->radix = (int *) palloc(sizeof(int) * cr->ndim);
 	cr->dims = (LionCellDim *) palloc0(sizeof(LionCellDim) * cr->ndim);
+	cr->baseweight = (uint64 *) palloc(sizeof(uint64) * cr->ndim);
+	cr->gradix = (int *) palloc(sizeof(int) * (cr->ndim + 1));
+	cr->grouped = priv->cellgroup;
 	for (d = cr->ndim - 1; d >= 0; d--)
 	{
 		const LionCellsDimPriv *pv = &cr->dimpriv[d];
@@ -59,6 +62,8 @@ lion_begin_cells(LionCountScanState *st, const LionCountPriv *priv,
 		cr->radix[d] = pv->radix;
 		cr->dims[d].multi = (pv->kind == LION_CELLDIM_MULTI);
 		cr->dims[d].weight = weight;
+		cr->baseweight[d] = weight;
+		cr->gradix[d] = pv->radix;
 		cr->dims[d].nullout = pv->nullout;
 		cr->dims[d].nbit = pv->nbit;
 		if ((uint64) pv->radix > (UINT64CONST(1) << 62) / weight)
@@ -66,7 +71,8 @@ lion_begin_cells(LionCountScanState *st, const LionCountPriv *priv,
 		weight *= (uint64) pv->radix;
 	}
 	cr->ncells = weight;
-	cr->outs = (int *) palloc0(sizeof(int) * cr->ndim);
+	cr->basecells = weight;
+	cr->outs = (int *) palloc0(sizeof(int) * (cr->ndim + 1));
 	cr->truth = (uint8 *) palloc0(sizeof(uint8) * cr->npred);
 	cr->labelcxt = AllocSetContextCreate(estate->es_query_cxt,
 										 "LionCount cell labels",
@@ -436,6 +442,10 @@ lion_cells_pass(LionCountScanState *st, uint32 lokey, uint64 hikey)
 			}
 		}
 		cr->drvadd[v] = (uint64) out * cr->dims[Max(cr->drv, 0)].weight;
+
+		/* ... and, of a GROUP BY column beside the cells, the entry's own */
+		if (cr->grouped)
+			cr->drvadd[v] += (uint64) v;
 	}
 
 	relocated = (bool *) palloc0(sizeof(bool) * Max(dr->nvals[0], 1));
@@ -466,8 +476,8 @@ lion_cells_pass(LionCountScanState *st, uint32 lokey, uint64 hikey)
 	lion_count_cells(st->heap, estate->es_snapshot, &drv, cr->drvadd,
 					 cr->ndim, cr->dims, cr->nlabel, cr->labels, cr->ncells,
 					 lokey, hikey, st->wcollected ? &st->wherecoll : NULL,
-					 dr->tally, &st->stats, &dr->stats, st->viscache,
-					 st->rel_read_only);
+					 lion_anti_exclude(st), dr->tally, &st->stats, &dr->stats,
+					 st->viscache, st->rel_read_only);
 
 	for (v = 0; v < dr->nvals[0]; v++)
 	{
@@ -792,6 +802,215 @@ lion_cells_code_of(LionCellsRun *cr, const uint8 *truth)
 	return code;
 }
 
+/* ---------------------------------------------------------------------
+ * A GROUP BY column beside the cells (DESIGN.md §10, "A GROUP BY column
+ * beside the cells")
+ * --------------------------------------------------------------------- */
+
+/*
+ * The driver's column is a GROUP BY column, each of its entries a group: the
+ * code of a row is its cell's times the pass's capacity, plus its entry's
+ * place in the pass, which the tally's last place is (gradix).  Once the
+ * walk's capacity is known, at the run's first pass.
+ */
+static void
+lion_cells_grouped_scale(LionCountScanState *st)
+{
+	LionDecodeRun *dr = st->decode;
+	LionCellsRun *cr = st->cells;
+	uint64		cap = (uint64) Max(dr->cap[0], 1);
+	int			d;
+
+	if (cr->basecells > (UINT64CONST(1) << 62) / cap)
+		elog(ERROR, "LionCount: the cells of a count by cells do not fit a code");
+	for (d = 0; d < cr->ndim; d++)
+		cr->dims[d].weight = cr->baseweight[d] * cap;
+	cr->ncells = cr->basecells * cap;
+	cr->gradix[cr->ndim] = (int) cap;
+}
+
+/*
+ * The first pass of the next range a participant claims (as
+ * lion_cells_run_ranged() claims them) that has one: its WHERE collected,
+ * its first chunk of the driver's entries read.  False once no range is
+ * left.
+ */
+static bool
+lion_cells_grouped_range(LionCountScanState *st)
+{
+	LionJoinShared *shared = st->shared;
+	LionRangedState *rs = lion_st_ranged(st);
+	LionCellsRun *cr = st->cells;
+
+	for (;;)
+	{
+		uint32		r = pg_atomic_fetch_add_u32(&shared->nextchunk, 1);
+
+		if (r >= (uint32) shared->nranges)
+		{
+			rs->range = -1;
+			cr->inrange = false;
+			return false;
+		}
+		CHECK_FOR_INTERRUPTS();
+		rs->ranges++;
+		rs->range = (int) r;
+		lion_key_range(shared->nranges, shared->ckeys, (int) r,
+					   &cr->rangelo, &cr->rangehi);
+		cr->inrange = true;
+		lion_posting_set_release(&st->wherecoll);
+		st->wcollected = false;
+		MemoryContextReset(rs->cxt);
+		if (st->nitem > 0 &&
+			!lion_where_collect_range(st, cr->rangelo, cr->rangehi))
+			continue;
+		if (lion_decode_fill(st, 0, true))
+			return true;
+	}
+}
+
+/*
+ * The run's first pass: the WHERE read and the labels located, as
+ * lion_cells_run() and lion_cells_run_ranged() have them, and the driver's
+ * first chunk.  False when there is no pass at all.
+ */
+static bool
+lion_cells_grouped_start(LionCountScanState *st)
+{
+	LionDecodeRun *dr = st->decode;
+	LionCellsRun *cr = st->cells;
+	EState	   *estate = st->css.ss.ps.state;
+	int			k;
+
+	for (k = 1; k <= st->nitem; k++)
+	{
+		if (st->sources[k].rangewalk != NULL)
+			elog(ERROR, "LionCount: a count by cells beside a range it walks");
+	}
+	if (st->shared != NULL)
+	{
+		LionRangedState *rs = lion_st_ranged(st);
+
+		if (RecoveryInProgress())
+			elog(ERROR, "LionCount: a parallel count by cells during recovery");
+		if ((st->nitem > 0 && st->nsource != st->nitem + 1) ||
+			st->ingroupitem >= 0)
+			elog(ERROR, "LionCount: a parallel count by cells of another shape");
+		if (dr->cap[0] == 0)
+			lion_decode_caps(st);
+		lion_cells_locate(st);
+		lion_cells_grouped_scale(st);
+		if (rs->cxt == NULL)
+			rs->cxt = AllocSetContextCreate(estate->es_query_cxt,
+											"LionCount key range",
+											ALLOCSET_DEFAULT_SIZES);
+		return lion_cells_grouped_range(st);
+	}
+	if (!lion_decode_where(st))
+		return false;
+	if (dr->cap[0] == 0)
+		lion_decode_caps(st);
+	lion_cells_locate(st);
+	lion_cells_grouped_scale(st);
+	cr->rangelo = 0;
+	cr->rangehi = (uint64) PG_UINT32_MAX + 1;
+	return lion_decode_fill(st, 0, true);
+}
+
+/* ... and the next pass: the next chunk, or the next range's first */
+static bool
+lion_cells_grouped_advance(LionCountScanState *st)
+{
+	if (lion_decode_fill(st, 0, false))
+		return true;
+	if (st->shared == NULL)
+		return false;
+	return lion_cells_grouped_range(st);
+}
+
+/*
+ * The next partial row of a count by cells beside a GROUP BY column: a cell
+ * with rows of one group, the group's key, its predicates' truths and its
+ * count.  Each pass of the driver's entries is counted into a tally of its
+ * own and goes up before the next is counted: a pass's rows are of its
+ * entries alone, so no row of a group is in two passes - but a range's are,
+ * in parallel, whose partial rows the Finalize Agg adds up as it does the
+ * cells' of one group.  The anti join over a small inner side leaves its
+ * rows found out of the walk (lion_anti_exclude()), and takes nothing from a
+ * row that goes up.
+ */
+static TupleTableSlot *
+lion_next_cells_grouped(LionCountScanState *st, bool *exhausted)
+{
+	LionDecodeRun *dr = st->decode;
+	LionCellsRun *cr = st->cells;
+
+	*exhausted = false;
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
+
+		if (dr->finished)
+		{
+			*exhausted = true;
+			return NULL;
+		}
+		if (dr->emitting)
+		{
+			uint64		code;
+			int64		count;
+			TupleTableSlot *slot;
+			Datum		key;
+			bool		isnull;
+			int			v;
+			int			p;
+
+			if (lion_decode_tally_next(dr->tally, &code, &count))
+			{
+				lion_decode_code_split(code, cr->ndim + 1, cr->gradix,
+									   cr->outs);
+				v = cr->outs[cr->ndim];
+				if (v < 0 || v >= dr->nvals[0])
+					elog(ERROR, "LionCount: a cell of entry %d of a pass of %d",
+						 v, dr->nvals[0]);
+				for (p = 0; p < cr->npred; p++)
+					cr->truth[p] = lion_cells_truth(cr, p);
+				key = dr->keys[0][v];
+				isnull = dr->isnull[0][v];
+				dr->rowsup++;
+				slot = lion_emit_keys(st, 1, &key, &isnull, count);
+				if (slot == NULL)
+					continue;
+				return slot;
+			}
+			dr->emitting = false;
+			lion_decode_tally_end(dr->tally);
+			if (!lion_cells_grouped_advance(st))
+			{
+				dr->finished = true;
+				continue;
+			}
+		}
+		else if (!dr->started)
+		{
+			dr->started = true;
+			if (!lion_cells_grouped_start(st))
+			{
+				dr->finished = true;
+				continue;
+			}
+		}
+
+		/* the pass the walk stands at, counted */
+		if (!lion_decode_tally_begin(dr->tally, cr->ndim + 1, cr->gradix))
+			elog(ERROR, "LionCount: the cells of a count by cells do not fit a code");
+		lion_anti_exclude_rewind(st);
+		lion_cells_pass(st, cr->rangelo, cr->rangehi);
+		dr->emitting = true;
+	}
+}
+
 /*
  * The next partial row of a count by cells: a cell with rows, its
  * predicates' truths and its count.  The whole count is made by the first
@@ -809,6 +1028,8 @@ lion_next_cells(LionCountScanState *st, bool *exhausted)
 	LionDecodeRun *dr = st->decode;
 	LionCellsRun *cr = st->cells;
 
+	if (cr->grouped)
+		return lion_next_cells_grouped(st, exhausted);
 	*exhausted = false;
 	for (;;)
 	{
@@ -890,7 +1111,9 @@ lion_explain_cells(LionCountScanState *st, List *ancestors, ExplainState *es)
 	int			p;
 	int			i = 0;
 
-	ExplainPropertyText("Group Strategy", "Cells", es);
+	ExplainPropertyText("Group Strategy",
+						cr->grouped ? "Cells, by the grouping column" : "Cells",
+						es);
 	/* each column with the index it is read from: `ix.col (col)` */
 	for (d = 0; d < cr->ndim; d++)
 	{
@@ -925,5 +1148,8 @@ lion_explain_cells(LionCountScanState *st, List *ancestors, ExplainState *es)
 	for (p = 0; p < cr->npred; p++)
 		preds = lappend(preds, text[p] != NULL ? text[p] : pstrdup("?"));
 	ExplainPropertyList("Cell Predicates", preds, es);
-	ExplainPropertyInteger("Cells", NULL, (int64) cr->ncells, es);
+	/* ... of the predicates: beside a GROUP BY column, each group's */
+	ExplainPropertyInteger("Cells", NULL,
+						   (int64) (cr->grouped ? cr->basecells : cr->ncells),
+						   es);
 }

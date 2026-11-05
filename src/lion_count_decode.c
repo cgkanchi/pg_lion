@@ -1008,9 +1008,10 @@ lion_count_cells(Relation heap, Snapshot snapshot,
 				 int ndim, const LionCellDim *dims,
 				 int nlabel, const LionCellLabel *labels,
 				 uint64 ncells, uint32 lokey, uint64 hikey,
-				 const LionPostingSet *where, LionDecodeTally *tally,
-				 LionCountStats *stats, LionDecodeStats *dstats,
-				 LionVisCache *cache, bool rel_read_only)
+				 const LionPostingSet *where, const LionCellsExclude *exclude,
+				 LionDecodeTally *tally, LionCountStats *stats,
+				 LionDecodeStats *dstats, LionVisCache *cache,
+				 bool rel_read_only)
 {
 	const LionMatSet *mat = NULL;
 	MemoryContext cxt;
@@ -1264,6 +1265,10 @@ lion_count_cells(Relation heap, Snapshot snapshot,
 		}
 		else
 			memcpy(rows, present, LION_BITSET_BYTES);
+
+		/* ... less the rows the caller leaves out */
+		if (exclude != NULL)
+			exclude->apply(exclude->arg, key, rows);
 
 		/* the labels, a dimension at a time */
 		i = nhot0;
