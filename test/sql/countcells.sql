@@ -599,7 +599,11 @@ SELECT q, lcc_check(q) FROM (VALUES
 	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id AND s.b = t.id) GROUP BY tier'),
 	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.n AND s.b = t.n) GROUP BY tier'),
 	-- keys of no row: nothing taken away
-	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id AND s.a < 0) GROUP BY tier')
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id AND s.a < 0) GROUP BY tier'),
+	-- the same anti join spelled `LEFT JOIN ... IS NULL`
+	('SELECT tier, count(*) FROM lcc_tiered t LEFT JOIN lcc_skip s ON s.a = t.id WHERE s.a IS NULL GROUP BY tier'),
+	('SELECT count(*) FROM lcc_tiered t LEFT JOIN lcc_skip s ON s.a = t.n WHERE t.tier = ''high'' AND s.a IS NULL'),
+	('SELECT score, count(*) FROM lcc_scored t LEFT JOIN lcc_skip s ON s.a = t.n AND s.b = t.n WHERE s.a IS NULL GROUP BY score')
 ) v(q);
 -- Many outcomes to a dimension, of which a row taken away has the one its
 -- truths are of, found in a table of the dimension's outcomes by their

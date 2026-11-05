@@ -968,18 +968,66 @@ SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT
 DROP STATISTICS lca_rows_kkn_st;
 DROP INDEX lca_rows_kkn;
 DROP TABLE lca_pairs;
--- a LEFT JOIN ... IS NULL, and a NOT IN over a nullable column
-SELECT lca('SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.k WHERE r.x = 3 AND s.a IS NULL');
-           lca           
--------------------------
- not pushed down, 1 rows
-(1 row)
-
+-- a NOT IN over a nullable column
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND r.k NOT IN (SELECT s.a FROM lca_skip s WHERE s.f = 0 AND s.a IS NOT NULL)');
            lca           
 -------------------------
  not pushed down, 1 rows
 (1 row)
+
+/*
+ * `LEFT JOIN s ON ... WHERE s.a IS NULL`, which core makes the same anti join
+ * as a NOT EXISTS of the ON clauses: taken when nothing above the join reads
+ * s but IS NULL tests of its columns, true of every row the join emits.  The
+ * ON's filter of s alone is the child's; a clause of r and s in the ON is a
+ * join clause, tested on the rows found.
+ */
+SELECT q, lca(q) FROM (VALUES
+	('SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.k WHERE r.x = 3 AND s.a IS NULL'),
+	('SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.k WHERE s.a IS NULL'),
+	('SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn AND s.f = 0 WHERE r.x < 5 AND s.a IS NULL'),
+	('SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.b = r.kn AND s.c = r.z WHERE s.b IS NULL'),
+	('SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn AND s.f <> r.z WHERE r.g = 2 AND s.a IS NULL'),
+	-- the IS NULL of another column of s, or of two: still always true
+	('SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x = 3 AND s.a IS NULL AND s.b IS NULL'),
+	('SELECT count(*), count(r.id) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x = 3 AND s.f IS NULL AND s.a IS NULL'),
+	-- a GROUP BY of r's columns
+	('SELECT r.g, count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x < 5 AND s.a IS NULL GROUP BY r.g'),
+	('SELECT r.g, r.y, count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE s.a IS NULL GROUP BY r.g, r.y HAVING count(*) > 10')
+) v(q);
+                                                                   q                                                                   |         lca          
+---------------------------------------------------------------------------------------------------------------------------------------+----------------------
+ SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.k WHERE r.x = 3 AND s.a IS NULL                                       | pushed down, 1 rows
+ SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.k WHERE s.a IS NULL                                                   | pushed down, 1 rows
+ SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn AND s.f = 0 WHERE r.x < 5 AND s.a IS NULL                          | pushed down, 1 rows
+ SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.b = r.kn AND s.c = r.z WHERE s.b IS NULL                                    | pushed down, 1 rows
+ SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn AND s.f <> r.z WHERE r.g = 2 AND s.a IS NULL                       | pushed down, 1 rows
+ SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x = 3 AND s.a IS NULL AND s.b IS NULL                      | pushed down, 1 rows
+ SELECT count(*), count(r.id) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x = 3 AND s.f IS NULL AND s.a IS NULL         | pushed down, 1 rows
+ SELECT r.g, count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x < 5 AND s.a IS NULL GROUP BY r.g                    | pushed down, 7 rows
+ SELECT r.g, r.y, count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE s.a IS NULL GROUP BY r.g, r.y HAVING count(*) > 10 | pushed down, 56 rows
+(9 rows)
+
+-- ... and declined, core's answer either way: a WHERE above the join that
+-- reads s otherwise, s in the target list or the HAVING, an IS NULL the ON
+-- is not strict for (a LEFT JOIN still), a clause of r and s above the join
+SELECT q, lca(q) FROM (VALUES
+	('SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x = 3 AND s.a IS NULL AND coalesce(s.f, 0) = 0'),
+	('SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x = 3 AND s.a IS NULL AND (s.b IS NULL OR r.g = 1)'),
+	('SELECT count(s.f) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x = 3 AND s.a IS NULL'),
+	('SELECT s.f, count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x = 3 AND s.a IS NULL GROUP BY s.f'),
+	('SELECT r.g, count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE s.a IS NULL GROUP BY r.g HAVING count(s.b) = 0'),
+	('SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x = 3 AND s.b IS NULL')
+) v(q);
+                                                               q                                                               |           lca           
+-------------------------------------------------------------------------------------------------------------------------------+-------------------------
+ SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x = 3 AND s.a IS NULL AND coalesce(s.f, 0) = 0     | not pushed down, 1 rows
+ SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x = 3 AND s.a IS NULL AND (s.b IS NULL OR r.g = 1) | not pushed down, 1 rows
+ SELECT count(s.f) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x = 3 AND s.a IS NULL                            | not pushed down, 1 rows
+ SELECT s.f, count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x = 3 AND s.a IS NULL GROUP BY s.f            | not pushed down, 1 rows
+ SELECT r.g, count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE s.a IS NULL GROUP BY r.g HAVING count(s.b) = 0  | not pushed down, 7 rows
+ SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.kn WHERE r.x = 3 AND s.b IS NULL                              | not pushed down, 1 rows
+(6 rows)
 
 -- ... and a NOT IN whose sides are both never NULL, kn declared so and s.a
 -- by its filter: an anti join from PostgreSQL 19, which the node takes as it
