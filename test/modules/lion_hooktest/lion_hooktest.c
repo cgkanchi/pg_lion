@@ -272,7 +272,7 @@ lion_hooktest_cells(void)
 					 list_make1_int(1),
 					 NIL);
 	dim = lappend(dim, NIL);
-	return list_make3(list_make3_int(1, 1, -1), list_make1(dim),
+	return list_make3(list_make4_int(1, 1, -1, 0), list_make1(dim),
 					  list_make1(list_make5_int(0, LION_CELLPRED_TABLE, 0,
 												LION_TRUTH_FALSE,
 												LION_TRUTH_TRUE)));
@@ -286,7 +286,7 @@ lion_hooktest_cells(void)
 static List *
 lion_hooktest_anti(int nkey)
 {
-	List	   *ints = list_make3_int(nkey, 1, 0);
+	List	   *ints = list_make4_int(nkey, 1, 0, 1);
 	List	   *oids = list_make1_oid(ClassOidIndexId);
 	int			i;
 
@@ -334,7 +334,7 @@ lion_hooktest_cells_anti(List *priv, int ngroupn)
 	lfirst(list_nth_cell(priv, LION_PRIV_ANTI)) = lion_hooktest_anti(1);
 	lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
 		list_make4_int(LION_TL_CELLPRED(0), LION_TL_COUNT,
-					   LION_TL_RESID(Anum_pg_class_oid), LION_TL_ANTI(1));
+					   LION_TL_RESID(Anum_pg_class_oid), LION_TL_ANTI(0, 1));
 }
 
 /*
@@ -477,7 +477,7 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 	{
 		List	   *cells = lion_hooktest_cells();
 
-		linitial(cells) = list_make3_int(2, 1, -1);
+		linitial(cells) = list_make4_int(2, 1, -1, 0);
 		lfirst(list_nth_cell(priv, LION_PRIV_CELLS)) = cells;
 	}
 	else if (strcmp(variant, "cells value outcome") == 0)
@@ -560,7 +560,7 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 	}
 	else if (strcmp(variant, "inner column without an anti join") == 0)
 		lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
-			list_make2_int(LION_TL_COUNT, LION_TL_ANTI(1));
+			list_make2_int(LION_TL_COUNT, LION_TL_ANTI(0, 1));
 	else if (strcmp(variant, "cells beside an anti join") == 0)
 	{
 		lion_hooktest_cells_anti(priv, 1);
@@ -602,7 +602,7 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 		lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
 			list_make4_int(LION_TL_CELLPRED(0), LION_TL_COUNT,
 						   LION_TL_RESID(Anum_pg_class_oid),
-						   LION_TL_ANTI(PG_INT16_MAX + 1));
+						   LION_TL_ANTI(0, PG_INT16_MAX + 1));
 		nplans = 1;
 	}
 	else if (strcmp(variant, "table column of a count by cells without an anti join") == 0)
