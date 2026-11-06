@@ -67,6 +67,29 @@ lion_cost_strip(Node *node)
 }
 
 /*
+ * The value a multi-key qual's query is priced at: the argument itself when
+ * it is a Const, and otherwise, with root given, what
+ * estimate_expression_value() folds it to - a STABLE call over constants
+ * (`tsv @@ phraseto_tsquery('word')`, whose one-argument form reads the
+ * session's text search configuration) or a custom plan's bound parameter -
+ * as core's selectivity functions estimate such a value (DESIGN.md §17, "A
+ * query known only at run time").  What is folded only PRICES the scan: the
+ * scan still takes the query's mode from the value it gets at run time, and
+ * a caller deciding what is rechecked passes no root, so a value that does
+ * not fold - a generic plan's Param - is priced as the expensive shape, as
+ * before.
+ */
+static Node *
+lion_cost_estimated_value(PlannerInfo *root, Node *node)
+{
+	Node	   *arg = lion_cost_strip(node);
+
+	if (arg == NULL || IsA(arg, Const) || root == NULL)
+		return arg;
+	return lion_cost_strip(estimate_expression_value(root, arg));
+}
+
+/*
  * Does this index's opclass extract many keys from one value (DESIGN.md §17)?
  * The presence of support function 2 is the same test lion_fill_state() makes.
  */
@@ -367,7 +390,8 @@ lion_cost_col_free(LionCostCol *cc)
  * never read the column whole.
  */
 static bool
-lion_cost_qual_is_full(IndexOptInfo *index, int c, Node *cl, bool *all)
+lion_cost_qual_is_full(PlannerInfo *root, IndexOptInfo *index, int c,
+					   Node *cl, bool *all)
 {
 	*all = false;
 	if (IsA(cl, NullTest) || !lion_index_is_multikey(index, c))
@@ -382,7 +406,8 @@ lion_cost_qual_is_full(IndexOptInfo *index, int c, Node *cl, bool *all)
 		if (list_length(op->args) == 2 &&
 			(strategy = (StrategyNumber)
 			 get_op_opfamily_strategy(op->opno, index->opfamily[c])) != 0 &&
-			(arg = lion_cost_strip((Node *) lsecond(op->args))) != NULL &&
+			(arg = lion_cost_estimated_value(root,
+											 (Node *) lsecond(op->args))) != NULL &&
 			IsA(arg, Const))
 		{
 			/* a strict operator with NULL is never true: nothing is scanned */
@@ -406,7 +431,8 @@ lion_cost_qual_is_full(IndexOptInfo *index, int c, Node *cl, bool *all)
 									  index->opfamily[c])) != 0 &&
 			(strategy == LION_STRAT_EQUAL ||
 			 !lion_array_query_is_full_scan(index, c, strategy,
-											lion_cost_strip((Node *) lsecond(saop->args)))))
+											lion_cost_estimated_value(root,
+																	  (Node *) lsecond(saop->args)))))
 			return false;		/* a union of single-key lookups, or of exact queries */
 		*all = true;
 		return true;
@@ -448,7 +474,8 @@ lion_cost_qual_is_full(IndexOptInfo *index, int c, Node *cl, bool *all)
  * second one's sets answer it.
  */
 static bool
-lion_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
+lion_scan_walks_whole_index(PlannerInfo *root, IndexPath *path,
+							bool *emits_all_rows)
 {
 	IndexOptInfo *index = path->indexinfo;
 	int			ncols = index->nkeycolumns;
@@ -495,7 +522,7 @@ lion_scan_walks_whole_index(IndexPath *path, bool *emits_all_rows)
 			{
 				bool		all;
 
-				if (!lion_cost_qual_is_full(index, c,
+				if (!lion_cost_qual_is_full(root, index, c,
 											(Node *) lfirst_node(RestrictInfo, lc)->clause,
 											&all))
 					colfull = false;
@@ -553,7 +580,7 @@ lion_cost_other_column(IndexPath *path, int col)
  * needs every row (lion_cost_qual_is_full()).
  */
 static bool
-lion_cost_sets_beside(IndexPath *path, int col)
+lion_cost_sets_beside(PlannerInfo *root, IndexPath *path, int col)
 {
 	IndexOptInfo *index = path->indexinfo;
 	bool		beside = false;
@@ -571,7 +598,7 @@ lion_cost_sets_beside(IndexPath *path, int col)
 		{
 			bool		all;
 
-			if (!lion_cost_qual_is_full(index, c,
+			if (!lion_cost_qual_is_full(root, index, c,
 										(Node *) lfirst_node(RestrictInfo, lc)->clause,
 										&all))
 			{
@@ -683,7 +710,7 @@ lion_path_rechecked_quals(PlannerInfo *root, IndexPath *path)
 			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 			bool		all;
 
-			if (lion_cost_qual_is_full(index, c, (Node *) rinfo->clause,
+			if (lion_cost_qual_is_full(NULL, index, c, (Node *) rinfo->clause,
 									   &all))
 				quals = lappend(quals, rinfo);
 			else if (lion_cost_is_long_list(root, index, c,
@@ -760,7 +787,7 @@ lion_cost_notnull_quals(PlannerInfo *root, IndexPath *path, Selectivity sel,
 			Node	   *cl = (Node *) lfirst_node(RestrictInfo, lc)->clause;
 			bool		all;
 
-			if (lion_cost_qual_is_full(index, c, cl, &all))
+			if (lion_cost_qual_is_full(root, index, c, cl, &all))
 				continue;
 			answers = true;
 			if (lion_cost_is_long_list(root, index, c, cl))
@@ -1051,7 +1078,7 @@ lion_range_walk_cost(PlannerInfo *root, IndexPath *path, double *walkrows)
 			double		entries = lion_cost_ranges_entries(root, path, c,
 														   ranges, sel);
 
-			if (lion_cost_sets_beside(path, c))
+			if (lion_cost_sets_beside(root, path, c))
 			{
 				double		containers = ceil((double) index->rel->pages /
 											  LION_BLOCKS_PER_CONTAINER);
@@ -1688,7 +1715,8 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
  * column selects nothing, since the scan then reads no set at all.
  */
 static int
-lion_scan_set_quals(IndexPath *path, AttrNumber **cols, RestrictInfo ***quals)
+lion_scan_set_quals(PlannerInfo *root, IndexPath *path, AttrNumber **cols,
+					RestrictInfo ***quals)
 {
 	IndexOptInfo *index = path->indexinfo;
 	int			ncols = index->nkeycolumns;
@@ -1721,7 +1749,8 @@ lion_scan_set_quals(IndexPath *path, AttrNumber **cols, RestrictInfo ***quals)
 			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 			bool		all;
 
-			if (lion_cost_qual_is_full(index, c, (Node *) rinfo->clause, &all))
+			if (lion_cost_qual_is_full(root, index, c, (Node *) rinfo->clause,
+									   &all))
 				continue;
 			(*cols)[nsets] = (AttrNumber) (c + 1);
 			(*quals)[nsets] = rinfo;
@@ -1970,7 +1999,8 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 {
 	GenericCosts costs = {0};
 	bool		emits_all_rows;
-	bool		fullscan = lion_scan_walks_whole_index(path, &emits_all_rows);
+	bool		fullscan = lion_scan_walks_whole_index(root, path,
+															&emits_all_rows);
 	double		walkrows = 0.0;
 	double		idxloops;
 
@@ -2091,7 +2121,7 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		IndexOptInfo **setidx;
 		AttrNumber *setcols;
 		RestrictInfo **setquals;
-		int			nsets = lion_scan_set_quals(path, &setcols, &setquals);
+		int			nsets = lion_scan_set_quals(root, path, &setcols, &setquals);
 
 		if (nsets >= 2)
 		{
