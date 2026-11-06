@@ -117,6 +117,7 @@ bool		lion_enable_ordered_scan = true;
 bool		lion_enable_btree_scan = true;
 bool		lion_enable_heap_probe = false;
 bool		lion_enable_lazy_set = true;
+static bool lion_enable_not_sets = true;
 static bool lion_enable_shared_set = true;
 static double lion_ordered_switch_ratio = 32.0;
 static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
@@ -135,8 +136,9 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *	LO_PRIV_ORDCOLS	IntList: the index column (0-based) of each ordered
  *					index qual, in custom_exprs' order
  *	LO_PRIV_TREE	List of IntList, the lion tree in preorder: an inner node
- *					is (LO_NODE_AND or LO_NODE_OR, number of children), a leaf
- *					(LO_NODE_LEAF, number of quals, their index columns ...);
+ *					is (LO_NODE_AND, LO_NODE_OR or LO_NODE_MINUS, number of
+ *					children), a leaf (LO_NODE_LEAF, number of quals, their
+ *					index columns ...);
  *					NIL when a lion column's walk has no set and every row it
  *					meets is fetched
  *	LO_PRIV_LEAVES	OidList: each leaf's lion index, in preorder
@@ -304,6 +306,7 @@ static const char *const lo_lazy_why_names[LO_LAZY_NWHY] = {
 #define LO_NODE_LEAF		0
 #define LO_NODE_AND			1
 #define LO_NODE_OR			2
+#define LO_NODE_MINUS		3	/* the first child less the others (§30.2) */
 
 #define LO_FLAG_LOSSY		0x0001	/* a lion index clause was lossy */
 #define LO_FLAG_LIONWALK	0x0002	/* the order is a lion column's walk */
@@ -950,6 +953,7 @@ typedef struct LionOrderedState
 
 	/* the lion side; noset: none, every row the walk meets is fetched */
 	bool		noset;
+	bool		minus;			/* the tree has a MINUS node (never lazy) */
 	LoNode	   *tree;
 	LoLeaf	   *leaves;
 	int			nleaves;
@@ -1175,6 +1179,8 @@ lo_qual_ok(Node *clause)
 	return false;
 }
 
+static bool lo_iclause_negated(IndexClause *iclause);
+
 /* Every index qual of an IndexPath is one lo_qual_ok() takes. */
 static bool
 lo_indexpath_ok(IndexPath *ipath)
@@ -1188,6 +1194,8 @@ lo_indexpath_ok(IndexPath *ipath)
 
 		if (iclause->indexcols != NIL)
 			return false;
+		if (lo_iclause_negated(iclause))
+			continue;			/* lo_not_leaf()'s: an OpExpr of its making */
 		foreach(lc2, iclause->indexquals)
 		{
 			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
@@ -1331,6 +1339,7 @@ lo_lion_tree(Path *path, List **tree, List **leaves, List **quals)
 	{
 		IndexPath  *ipath = (IndexPath *) path;
 		List	   *node = list_make2_int(LO_NODE_LEAF, 0);
+		List	   *negs = NIL;
 		int			n = 0;
 
 		foreach(lc, ipath->indexclauses)
@@ -1338,6 +1347,11 @@ lo_lion_tree(Path *path, List **tree, List **leaves, List **quals)
 			IndexClause *iclause = lfirst_node(IndexClause, lc);
 			ListCell   *lc2;
 
+			if (lo_iclause_negated(iclause))
+			{
+				negs = lappend(negs, iclause);
+				continue;
+			}
 			foreach(lc2, iclause->indexquals)
 			{
 				RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
@@ -1348,8 +1362,41 @@ lo_lion_tree(Path *path, List **tree, List **leaves, List **quals)
 			}
 		}
 		lsecond_int(node) = n;
+
+		/*
+		 * A negated clause (lo_not_leaf()) makes the leaf a MINUS: its other
+		 * clauses' set, less the query's rows and the column's NULLs, each a
+		 * leaf of the same index.
+		 */
+		if (negs != NIL)
+		{
+			if (n == 0)
+				elog(ERROR, "LionOrdered: a negated clause with no other");
+			*tree = lappend(*tree, list_make2_int(LO_NODE_MINUS,
+												  1 + 2 * list_length(negs)));
+		}
 		*tree = lappend(*tree, node);
 		*leaves = lappend_oid(*leaves, ipath->indexinfo->indexoid);
+		foreach(lc, negs)
+		{
+			IndexClause *iclause = lfirst_node(IndexClause, lc);
+			RestrictInfo *inner = linitial_node(RestrictInfo,
+												iclause->indexquals);
+			NullTest   *nt = makeNode(NullTest);
+
+			nt->arg = (Expr *) copyObject(linitial(((OpExpr *) inner->clause)->args));
+			nt->nulltesttype = IS_NULL;
+			nt->argisrow = false;
+			nt->location = -1;
+			*quals = lappend(*quals, inner->clause);
+			*tree = lappend(*tree, list_make3_int(LO_NODE_LEAF, 1,
+												  iclause->indexcol));
+			*quals = lappend(*quals, nt);
+			*tree = lappend(*tree, list_make3_int(LO_NODE_LEAF, 1,
+												  iclause->indexcol));
+			*leaves = lappend_oid(*leaves, ipath->indexinfo->indexoid);
+			*leaves = lappend_oid(*leaves, ipath->indexinfo->indexoid);
+		}
 		return;
 	}
 	else
@@ -2451,6 +2498,213 @@ lo_scratch_rel(RelOptInfo *rel, List *indexes, List *exclude, bool joins)
 }
 
 /*
+ * Is iclause a NEGATED multi-key clause (DESIGN.md §30.2, "A negated
+ * multi-key query"): one lo_not_paths() made, whose RestrictInfo is the
+ * restriction `NOT (col op const)` and whose one index qual is `col op
+ * const` itself?  Core never makes such an IndexClause: its index quals are
+ * implied by the clause, never its negation.
+ */
+static bool
+lo_iclause_negated(IndexClause *iclause)
+{
+	Expr	   *clause = iclause->rinfo->clause;
+
+	/*
+	 * Not core's `NOT flag`, a boolean column's index clause `flag = false`:
+	 * the one index qual is the NOT's own argument, an operator.
+	 */
+	return IsA(clause, BoolExpr) &&
+		((BoolExpr *) clause)->boolop == NOT_EXPR &&
+		list_length(iclause->indexquals) == 1 &&
+		IsA(linitial(((BoolExpr *) clause)->args), OpExpr) &&
+		equal(linitial(((BoolExpr *) clause)->args),
+			  linitial_node(RestrictInfo, iclause->indexquals)->clause);
+}
+
+/*
+ * The index column of idx a restriction `NOT (col op const)` negates: a
+ * multi-key column of a plain Var of rel, op a search strategy of its
+ * family, const a non-NULL Const the posting sets answer exactly
+ * (lion_multikey_literal_mode(): LION_QMODE_KEYS, or NONE, whose negation
+ * takes away nothing but the NULLs).  -1 for anything else.  *inner gets
+ * `col op const`.
+ */
+static int
+lo_not_column(RelOptInfo *rel, IndexOptInfo *idx, RestrictInfo *rinfo,
+			  OpExpr **inner)
+{
+	BoolExpr   *b;
+	OpExpr	   *op;
+	Node	   *left;
+	Node	   *right;
+	int			c;
+
+	if (!IsA(rinfo->clause, BoolExpr) || rinfo->pseudoconstant)
+		return -1;
+	b = (BoolExpr *) rinfo->clause;
+	if (b->boolop != NOT_EXPR || list_length(b->args) != 1 ||
+		!IsA(linitial(b->args), OpExpr))
+		return -1;
+	op = (OpExpr *) linitial(b->args);
+	if (list_length(op->args) != 2)
+		return -1;
+	left = (Node *) linitial(op->args);
+	right = (Node *) lsecond(op->args);
+	while (IsA(left, RelabelType))
+		left = (Node *) ((RelabelType *) left)->arg;
+	while (IsA(right, RelabelType))
+		right = (Node *) ((RelabelType *) right)->arg;
+	if (!IsA(left, Var) || (Index) ((Var *) left)->varno != rel->relid ||
+		((Var *) left)->varlevelsup != 0 || ((Var *) left)->varattno <= 0 ||
+		!IsA(right, Const) || ((Const *) right)->constisnull)
+		return -1;
+	for (c = 0; c < idx->nkeycolumns; c++)
+	{
+		LionQueryMode mode;
+
+		if (idx->indexkeys[c] != ((Var *) left)->varattno ||
+			!lion_opfamily_is_multikey(idx->opfamily[c], idx->opcintype[c]) ||
+			get_op_opfamily_strategy(op->opno, idx->opfamily[c]) == 0 ||
+			(OidIsValid(idx->indexcollations[c]) &&
+			 idx->indexcollations[c] != op->inputcollid))
+			continue;
+		mode = lion_multikey_literal_mode(idx, (AttrNumber) (c + 1),
+										  op->opno, (Const *) right);
+		if (mode != LION_QMODE_KEYS && mode != LION_QMODE_NONE)
+			return -1;
+		*inner = op;
+		return c;
+	}
+	return -1;
+}
+
+/*
+ * An IndexPath of the lion index ipath reads, with each of the negations in
+ * `nots` it can take added as a NEGATED index clause (lo_iclause_negated()):
+ * the leaf's set less the rows the clause's query selects and less the
+ * column's NULLs (lo_build_leaf()), which is the set of `NOT (col op
+ * const)` beside the leaf's other clauses - the operator is strict, so a
+ * NULL column makes the clause NULL.  A leaf of no other clause has no set to
+ * take them from, and is left alone.  Priced as the index's lookup of the
+ * clause's query on top of the leaf's, with the negation's selectivity.
+ * NULL when no negation applies.
+ */
+static IndexPath *
+lo_not_leaf(PlannerInfo *root, RelOptInfo *rel, IndexPath *ipath, List *nots)
+{
+	IndexPath  *copy = NULL;
+	ListCell   *lc;
+
+	if (ipath->indexclauses == NIL)
+		return NULL;
+	foreach(lc, nots)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		OpExpr	   *inner;
+		int			c = lo_not_column(rel, ipath->indexinfo, rinfo, &inner);
+		IndexClause *iclause;
+		IndexClause *pos;
+		IndexPath  *alone;
+		List	   *clauses = NIL;
+		bool		placed = false;
+		ListCell   *lc2;
+
+		if (c < 0)
+			continue;
+		iclause = makeNode(IndexClause);
+		iclause->rinfo = rinfo;
+		iclause->indexquals = list_make1(make_simple_restrictinfo(root,
+																  (Expr *) inner));
+		iclause->lossy = false;
+		iclause->indexcol = (AttrNumber) c;
+		iclause->indexcols = NIL;
+
+		/* the price of looking the query up: the positive clause alone */
+		pos = makeNode(IndexClause);
+		memcpy(pos, iclause, sizeof(IndexClause));
+		pos->rinfo = linitial_node(RestrictInfo, iclause->indexquals);
+		alone = create_index_path(root, ipath->indexinfo, list_make1(pos),
+								  NIL, NIL, NIL, ForwardScanDirection, false,
+								  NULL, 1.0, false);
+
+		if (copy == NULL)
+		{
+			copy = makeNode(IndexPath);
+			memcpy(copy, ipath, sizeof(IndexPath));
+		}
+		/* core's index clauses come in index column order; so do these */
+		foreach(lc2, copy->indexclauses)
+		{
+			IndexClause *other = lfirst_node(IndexClause, lc2);
+
+			if (!placed && other->indexcol > c)
+			{
+				clauses = lappend(clauses, iclause);
+				placed = true;
+			}
+			clauses = lappend(clauses, other);
+		}
+		if (!placed)
+			clauses = lappend(clauses, iclause);
+		copy->indexclauses = clauses;
+		copy->indextotalcost += alone->indextotalcost;
+		copy->path.total_cost += alone->indextotalcost;
+		copy->indexselectivity *=
+			clause_selectivity(root, (Node *) rinfo, 0, JOIN_INNER, NULL);
+	}
+	return copy;
+}
+
+/*
+ * The accesses of `cands` with the negations of `nots` added where a leaf of
+ * the index that answers them stands on the AND path from the root: an
+ * IndexPath itself, or one child of a BitmapAnd.  Each is offered beside the
+ * access it comes from, for the price to choose.
+ */
+static List *
+lo_not_paths(PlannerInfo *root, RelOptInfo *rel, List *cands, List *nots)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	foreach(lc, cands)
+	{
+		Path	   *cand = (Path *) lfirst(lc);
+
+		if (IsA(cand, IndexPath))
+		{
+			IndexPath  *n = lo_not_leaf(root, rel, (IndexPath *) cand, nots);
+
+			if (n != NULL)
+				result = lappend(result, n);
+		}
+		else if (IsA(cand, BitmapAndPath))
+		{
+			List	   *quals = ((BitmapAndPath *) cand)->bitmapquals;
+			ListCell   *lc2;
+
+			foreach(lc2, quals)
+			{
+				IndexPath  *n;
+				List	   *newquals;
+
+				if (!IsA(lfirst(lc2), IndexPath) ||
+					(n = lo_not_leaf(root, rel, lfirst_node(IndexPath, lc2),
+									 nots)) == NULL)
+					continue;
+				newquals = list_copy(quals);
+				lfirst(list_nth_cell(newquals,
+									 foreach_current_index(lc2))) = n;
+				result = lappend(result,
+								 create_bitmap_and_path(root, rel, newquals));
+				break;
+			}
+		}
+	}
+	return result;
+}
+
+/*
  * The lion accesses core builds for rel's restriction clauses less `exclude`:
  * create_index_paths() run on a scratch copy of rel that sees only its lion
  * indexes (DESIGN.md §30.2).
@@ -2492,6 +2746,27 @@ lo_lion_accesses(PlannerInfo *root, RelOptInfo *rel, List *lionidx,
 			q = p;
 		if (q != NULL && lo_lion_tree_ok(q, lionam))
 			cands = lappend(cands, q);
+	}
+
+	/*
+	 * ... and with a restriction `NOT (col op const)` of a multi-key column
+	 * added to a leaf, which core has no index path for (DESIGN.md §30.2, "A
+	 * negated multi-key query").
+	 */
+	if (lion_enable_not_sets && cands != NIL)
+	{
+		List	   *nots = NIL;
+
+		foreach(lc, scratch->baserestrictinfo)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+			if (IsA(rinfo->clause, BoolExpr) &&
+				((BoolExpr *) rinfo->clause)->boolop == NOT_EXPR)
+				nots = lappend(nots, rinfo);
+		}
+		if (nots != NIL)
+			cands = list_concat(cands, lo_not_paths(root, scratch, cands, nots));
 	}
 	return cands;
 }
@@ -6302,6 +6577,37 @@ lo_set_combine(LionOrderedState *st, LionTidSet *a, LionTidSet *b, bool isand)
 }
 
 /*
+ * a less b (a MINUS node, DESIGN.md §30.2, "A negated multi-key query"): a's
+ * containers, each less b's of the same key; a key b lacks is kept whole.
+ */
+static LionTidSet *
+lo_set_andnot(LionOrderedState *st, LionTidSet *a, LionTidSet *b)
+{
+	LionTidSet *r = lo_set_new(st);
+	LionContainer *buf = (LionContainer *)
+		MemoryContextAlloc(st->buildcxt, LION_CONTAINER_MAX_SIZE);
+	int			i = 0;
+	int			j = 0;
+
+	while (i < a->n)
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		while (j < b->n && b->keys[j] < a->keys[i])
+			j++;
+		if (j >= b->n || b->keys[j] != a->keys[i])
+			lo_set_push(st, r, a->keys[i], a->conts[i]);
+		else if (lion_container_andnot(a->conts[i], b->conts[j], buf) > 0)
+			lo_set_push(st, r, a->keys[i], buf);
+		i++;
+	}
+	pfree(buf);
+	lo_set_drop(st, a);
+	lo_set_drop(st, b);
+	return r;
+}
+
+/*
  * The index of tid's container key if tid is a member, else -1.  The keys
  * are distinct and ascending, so a key's index is no further from either end
  * than the key is from that end's key: the search starts within those
@@ -6409,6 +6715,29 @@ lo_build_node(LionOrderedState *st, LoNode *node)
 		return lo_build_leaf(st, node->leaf);
 
 	acc = lo_build_node(st, node->child[0]);
+	if (node->kind == LO_NODE_MINUS)
+	{
+		/*
+		 * A set taken away must be exact: one of more rows than its query's
+		 * would take away rows the clause keeps.  One that is not is dropped,
+		 * and the set left holds more than the NOT's rows: inexact, so the
+		 * walk rechecks the NOT on the row (lo_lion_recheck()).
+		 */
+		for (i = 1; i < node->nchild && acc->n > 0; i++)
+		{
+			bool		exact = st->exact;
+			LionTidSet *sub;
+
+			st->exact = true;
+			sub = lo_build_node(st, node->child[i]);
+			if (st->exact)
+				acc = lo_set_andnot(st, acc, sub);
+			else
+				lo_set_drop(st, sub);
+			st->exact = exact && st->exact;
+		}
+		return acc;
+	}
 	for (i = 1; i < node->nchild; i++)
 	{
 		/* an empty AND stays empty: the other children need not be read */
@@ -6840,7 +7169,7 @@ lo_lazy_ok(LionOrderedState *st)
 	int			i;
 	int			k;
 
-	if (st->noset)
+	if (st->noset || st->minus)
 		return false;
 	for (i = 0; i < st->nleaves; i++)
 	{
@@ -7458,6 +7787,12 @@ lo_decode_tree(LionOrderedState *st, List *tree, ListCell **pos,
 	*pos = lnext(tree, *pos);
 	node->kind = linitial_int(item);
 	node->nchild = lsecond_int(item);
+	if (node->kind == LO_NODE_MINUS)
+	{
+		if (node->nchild < 2)
+			elog(ERROR, "LionOrdered: malformed lion tree");
+		st->minus = true;
+	}
 
 	if (node->kind == LO_NODE_LEAF)
 	{
@@ -10351,6 +10686,20 @@ lion_ordered_init(void)
 							 "Lets LionOrdered evaluate its lion set only at the container keys its walk meets.",
 							 "Off, the set is built for the whole table before the walk starts.",
 							 &lion_enable_lazy_set,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §30.2, "A negated multi-key query": off, a restriction `NOT
+	 * (col op const)` of a multi-key column is left to a filter or a recheck,
+	 * as before - for comparing the two.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_not_sets",
+							 "Lets lion sets take away the rows of a negated multi-key query.",
+							 "Off, a NOT of an array, tsvector or jsonb query is tested on the row instead.",
+							 &lion_enable_not_sets,
 							 true,
 							 PGC_USERSET,
 							 0,

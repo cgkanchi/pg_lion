@@ -19525,6 +19525,30 @@ clause was lossy. The executor substitutes an `INDEX_VAR` Var for each index qua
 as `fix_indexqual_references()` would, and builds the scan keys with core's
 `ExecIndexBuildScanKeys()`, so a Param becomes a run-time key exactly as in an Index Scan.
 
+**A negated multi-key query.** Core makes no index path for `NOT (tags && '{x}')`: an index
+answers an operator, never its negation. So a walk or a nested loop's probe left the NOT to its
+filter, which reads the heap for every member, and a probe whose set answered the rest of the
+WHERE fetched each row it met for that one clause. `lo_lion_accesses()` therefore also offers each
+of core's accesses with such a restriction added to a leaf of the same lion index on the AND path
+from the root (`lo_not_paths()`): a restriction `NOT (col op const)`, col a multi-key column of
+the index, op a search strategy of its family under the column's collation, and const a non-NULL
+Const whose query the posting sets answer exactly (`lion_multikey_literal_mode()` KEYS, or NONE,
+a query that selects no row). The leaf's set less the query's rows and less the column's NULLs is
+the set of the NOT beside the leaf's clauses: every such operator is strict and returns no NULL
+for non-NULL inputs, so the clause is true exactly where the column is not NULL and the query is
+false. The leaf carries the NOT as an IndexClause whose `rinfo` is the restriction and whose one
+index qual is the query; its price adds the index's lookup of the query alone
+(`create_index_path()`) and its selectivity is multiplied by the NOT's. In custom_private the leaf
+becomes a MINUS node, `LO_NODE_MINUS`: the leaf's other clauses, then for each NOT a leaf of the
+query and a leaf of `col IS NULL`, all of the same index, and `lo_build_node()` takes the later
+children's sets from the first's (`lo_set_andnot()`). A set taken away must be exact; one whose
+source says it is not (`lion_source_exact()`) is dropped instead, and the set left, a superset of
+the NOT's rows, is rechecked on the row with the whole lion qual, as any inexact set is. A leaf
+with no other clause has no set to take from and is left alone, as is a NOT under an OR. The lazy
+set (§40.10) takes no MINUS. GUC `pg_lion.enable_not_sets` (default on) turns it off, for
+comparing. Tested in notsets.sql against a seq scan (NULL arrays, empty arrays, NULL elements,
+tsvector, jsonb, two NOTs, dead and moved rows, a nested loop's probe).
+
 No overlap with LionCount (§10) or the FK join (§27): those replace an aggregate at the upper rel;
 this is a scan path of the base rel.
 
