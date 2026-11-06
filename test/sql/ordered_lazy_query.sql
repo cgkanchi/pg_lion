@@ -28,7 +28,10 @@ SELECT i, (i::bigint * 7919 % 100003)::int,
   FROM generate_series(1, 100000) i;
 CREATE INDEX olq_k ON olq (k, id);
 CREATE INDEX olq_l ON olq USING lion (tsv, tags, doc jsonb_contains_ops);
+-- statistics from every row, so the plans do not turn on ANALYZE's sample
+SET default_statistics_target = 1000;
 VACUUM (FREEZE, ANALYZE) olq;
+RESET default_statistics_target;
 
 -- the plan's node and its set, for q, which must be a LionOrdered plan; then
 -- q's rows in order against the same query with the node off
