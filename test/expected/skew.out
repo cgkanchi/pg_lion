@@ -429,7 +429,6 @@ SELECT w.count AS want, g.count AS got FROM lsw_want w, lsw_got g;
 -- (its run cost grows by the same factor), and the count by lion, which
 -- reads the keys' containers, is the plan.  Off, core's scan is.  Group 1's
 -- ten keys hold 1,000 rows each.
-SET max_parallel_workers_per_gather = 0;
 INSERT INTO lsw_q VALUES
 	('arr_distinct', $q$SELECT count(DISTINCT f.fk), count(*) FROM lsw_fact f WHERE f.fk = ANY ((SELECT array_agg(id) FROM lsw_dim WHERE grp = 1)::int[])$q$),
 	('arr_group', $q$SELECT f.fk, count(*) FROM lsw_fact f WHERE f.fk = ANY ((SELECT array_agg(id) FROM lsw_dim WHERE grp = 1)::int[]) GROUP BY f.fk ORDER BY f.fk$q$),

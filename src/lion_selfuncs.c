@@ -7331,14 +7331,25 @@ lion_skew_clauses_factor(PlannerInfo *root, RelOptInfo *rel, List *clauses)
 
 /*
  * The factor clause - an IndexClause or a RestrictInfo - probes a skewed key
- * by; 1 below LION_SKEW_MIN_FACTOR or where it probes no key.
+ * by; 1 below LION_SKEW_MIN_FACTOR or where it probes no key.  With
+ * arrays_only, only an array's `= ANY` counts (lion_skew_reprice_lists()):
+ * a generic plan's scalar parameter beside it is one value, not keys met.
  */
 static double
-lion_skew_clause_factor(PlannerInfo *root, RelOptInfo *rel, Node *clause)
+lion_skew_clause_factor(PlannerInfo *root, RelOptInfo *rel, Node *clause,
+						bool arrays_only)
 {
-	Var		   *var = lion_skew_param_eq_var(root, rel, clause);
+	Node	   *bare = clause;
+	Var		   *var;
 	double		factor;
 
+	if (bare != NULL && IsA(bare, IndexClause))
+		bare = (Node *) ((IndexClause *) bare)->rinfo;
+	if (bare != NULL && IsA(bare, RestrictInfo))
+		bare = (Node *) ((RestrictInfo *) bare)->clause;
+	if (arrays_only && (bare == NULL || !IsA(bare, ScalarArrayOpExpr)))
+		return 1.0;
+	var = lion_skew_param_eq_var(root, rel, clause);
 	if (var == NULL)
 		return 1.0;
 	factor = lion_skew_param_factor(root, rel, var);
@@ -7347,14 +7358,16 @@ lion_skew_clause_factor(PlannerInfo *root, RelOptInfo *rel, Node *clause)
 
 /* The largest factor (above) of the skewed clauses an index path answers */
 static double
-lion_skew_index_factor(PlannerInfo *root, RelOptInfo *rel, IndexPath *ipath)
+lion_skew_index_factor(PlannerInfo *root, RelOptInfo *rel, IndexPath *ipath,
+					   bool arrays_only)
 {
 	double		factor = 1.0;
 	ListCell   *lc;
 
 	foreach(lc, ipath->indexclauses)
 		factor = Max(factor,
-					 lion_skew_clause_factor(root, rel, (Node *) lfirst(lc)));
+					 lion_skew_clause_factor(root, rel, (Node *) lfirst(lc),
+											 arrays_only));
 	return factor;
 }
 
@@ -7364,19 +7377,22 @@ lion_skew_index_factor(PlannerInfo *root, RelOptInfo *rel, IndexPath *ipath)
  * a skewed key for the OR to read more).
  */
 static double
-lion_skew_bitmap_factor(PlannerInfo *root, RelOptInfo *rel, Path *bitmapqual)
+lion_skew_bitmap_factor(PlannerInfo *root, RelOptInfo *rel, Path *bitmapqual,
+						bool arrays_only)
 {
 	double		factor;
 	ListCell   *lc;
 
 	if (IsA(bitmapqual, IndexPath))
-		return lion_skew_index_factor(root, rel, (IndexPath *) bitmapqual);
+		return lion_skew_index_factor(root, rel, (IndexPath *) bitmapqual,
+									  arrays_only);
 	if (IsA(bitmapqual, BitmapAndPath))
 	{
 		factor = 1.0;
 		foreach(lc, ((BitmapAndPath *) bitmapqual)->bitmapquals)
 			factor = Max(factor,
-						 lion_skew_bitmap_factor(root, rel, (Path *) lfirst(lc)));
+						 lion_skew_bitmap_factor(root, rel, (Path *) lfirst(lc),
+												 arrays_only));
 		return factor;
 	}
 	if (IsA(bitmapqual, BitmapOrPath))
@@ -7385,7 +7401,8 @@ lion_skew_bitmap_factor(PlannerInfo *root, RelOptInfo *rel, Path *bitmapqual)
 		foreach(lc, ((BitmapOrPath *) bitmapqual)->bitmapquals)
 		{
 			double		arm = lion_skew_bitmap_factor(root, rel,
-													  (Path *) lfirst(lc));
+													  (Path *) lfirst(lc),
+													  arrays_only);
 
 			factor = (factor < 0.0) ? arm : Min(factor, arm);
 		}
@@ -7403,7 +7420,7 @@ lion_skew_bitmap_factor(PlannerInfo *root, RelOptInfo *rel, Path *bitmapqual)
  */
 static Cost
 lion_skew_bitmap_more(PlannerInfo *root, RelOptInfo *rel, Path *bitmapqual,
-					  double scale)
+					  double scale, bool arrays_only)
 {
 	List	   *quals = NIL;
 	Cost		more = 0.0;
@@ -7411,14 +7428,16 @@ lion_skew_bitmap_more(PlannerInfo *root, RelOptInfo *rel, Path *bitmapqual,
 
 	if (IsA(bitmapqual, IndexPath))
 		return ((IndexPath *) bitmapqual)->indextotalcost *
-			(Min(lion_skew_index_factor(root, rel, (IndexPath *) bitmapqual),
+			(Min(lion_skew_index_factor(root, rel, (IndexPath *) bitmapqual,
+										arrays_only),
 				 scale) - 1.0);
 	if (IsA(bitmapqual, BitmapAndPath))
 		quals = ((BitmapAndPath *) bitmapqual)->bitmapquals;
 	else if (IsA(bitmapqual, BitmapOrPath))
 		quals = ((BitmapOrPath *) bitmapqual)->bitmapquals;
 	foreach(lc, quals)
-		more += lion_skew_bitmap_more(root, rel, (Path *) lfirst(lc), scale);
+		more += lion_skew_bitmap_more(root, rel, (Path *) lfirst(lc), scale,
+									  arrays_only);
 	return more;
 }
 
@@ -7427,16 +7446,19 @@ lion_skew_bitmap_more(PlannerInfo *root, RelOptInfo *rel, Path *bitmapqual,
  * clauses its own index answers; 1 where it answers none.
  */
 static double
-lion_skew_path_factor(PlannerInfo *root, RelOptInfo *rel, Path *path)
+lion_skew_path_factor(PlannerInfo *root, RelOptInfo *rel, Path *path,
+					  bool arrays_only)
 {
 	switch (path->pathtype)
 	{
 		case T_IndexScan:
 		case T_IndexOnlyScan:
-			return lion_skew_index_factor(root, rel, (IndexPath *) path);
+			return lion_skew_index_factor(root, rel, (IndexPath *) path,
+										  arrays_only);
 		case T_BitmapHeapScan:
 			return lion_skew_bitmap_factor(root, rel,
-										   ((BitmapHeapPath *) path)->bitmapqual);
+										   ((BitmapHeapPath *) path)->bitmapqual,
+										   arrays_only);
 		case T_CustomScan:
 			{
 				CustomPath *cpath = (CustomPath *) path;
@@ -7449,7 +7471,8 @@ lion_skew_path_factor(PlannerInfo *root, RelOptInfo *rel, Path *path)
 					return 1.0;
 				ipath = linitial(cpath->custom_private);
 				return IsA(ipath, IndexPath) ?
-					lion_skew_index_factor(root, rel, (IndexPath *) ipath) : 1.0;
+					lion_skew_index_factor(root, rel, (IndexPath *) ipath,
+										   arrays_only) : 1.0;
 			}
 		default:
 			return 1.0;
@@ -7644,7 +7667,7 @@ lion_skew_reprice_params(PlannerInfo *root, RelOptInfo *rel)
 				!lion_skew_path_answers(path, rel->baserestrictinfo))
 				path->total_cost = path->startup_cost +
 					(path->total_cost - path->startup_cost) *
-					Min(lion_skew_path_factor(root, rel, path), scale);
+					Min(lion_skew_path_factor(root, rel, path, false), scale);
 			if (IsA(path, BitmapHeapPath))
 			{
 				/*
@@ -7653,7 +7676,7 @@ lion_skew_reprice_params(PlannerInfo *root, RelOptInfo *rel)
 				 */
 				Cost		more = lion_skew_bitmap_more(root, rel,
 														 ((BitmapHeapPath *) path)->bitmapqual,
-														 scale);
+														 scale, false);
 
 				path->startup_cost += more;
 				path->total_cost += more;
@@ -7730,11 +7753,11 @@ lion_skew_reprice_lists(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 
 			if (path->param_info != NULL)
 				continue;
-			pf = Min(lion_skew_path_factor(root, rel, path), factor);
+			pf = Min(lion_skew_path_factor(root, rel, path, true), factor);
 			if (IsA(path, BitmapHeapPath))
 				more = lion_skew_bitmap_more(root, rel,
 											 ((BitmapHeapPath *) path)->bitmapqual,
-											 factor);
+											 factor, true);
 			if (pf <= 1.0 && more <= 0.0)
 				continue;
 			path->total_cost = path->startup_cost + more +
