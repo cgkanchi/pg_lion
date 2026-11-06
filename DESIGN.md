@@ -3847,6 +3847,17 @@ residual `100 / w > 20` raises nothing over a deleted row whose w is 0, as the o
 raises nothing. From PostgreSQL 17 the candidates' pages are read through a read stream over their
 blocks in order, as a bitmap heap scan reads its pages.
 
+**A TOASTed column read more than once.** Every operator call over a compressed or out-of-line
+datum fetches and decompresses it again: the executor keeps no detoasted copy between calls. A
+weighted score of twenty `a && '{x}'` terms over an array stored out of line, repeated in each WHEN of
+a tier CASE, so read the array some eighty times a row. A column the clauses reference more than once
+(`residonce[]`, counted in `lion_begin_residual()`) is therefore detoasted once, when the row's
+columns are copied into the slot, into the row's memory, which is reset after the test; a column
+read once is left as stored, so a clause that short-circuits before reaching it still never fetches
+it. The value is the same either way. Measured (1M rows, a 14 + 6 term score over two arrays, 20%
+of them stored out of line, 307k candidates, PostgreSQL 18.6, warm): 3.6 s to 2.1 s with four workers,
+the buffer hits from 11.0M to about 0.4M. Core's plan for the same WHERE pays every detoast (3.8 s).
+
 **Beside filtered counts** ("Filtered counts" above) the two are taken together. A residual clause
 is a clause of the WHERE, and the row filter that tests it is built again for every run's located
 WHERE (`lion_locate_where()`), so the WHERE's run and each filter's count only the rows that pass

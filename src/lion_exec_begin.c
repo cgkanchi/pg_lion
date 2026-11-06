@@ -1265,6 +1265,7 @@ lion_begin_residual(LionCountScanState *st, CustomScanState *node,
 		palloc(sizeof(AttrNumber) * Max(list_length(vars), 1));
 	st->residheapattno = (AttrNumber *)
 		palloc0(sizeof(AttrNumber) * Max(list_length(vars), 1));
+	st->residonce = (bool *) palloc0(sizeof(bool) * Max(list_length(vars), 1));
 	foreach(lc, vars)
 	{
 		Var		   *var = (Var *) lfirst(lc);
@@ -1281,7 +1282,10 @@ lion_begin_residual(LionCountScanState *st, CustomScanState *node,
 			elog(ERROR, "LionCount: a residual clause reads no column of the table");
 		for (j = 0; j < n; j++)
 			if (st->residslotcol[j] == var->varattno - 1)
+			{
+				st->residonce[j] = true;	/* a second reference */
 				dup = true;
+			}
 		if (dup)
 			continue;
 		st->residslotcol[n] = var->varattno - 1;

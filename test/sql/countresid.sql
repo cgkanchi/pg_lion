@@ -231,6 +231,41 @@ VACUUM ANALYZE crp;
 SELECT cr_q('SELECT count(*) FROM crp WHERE a = 2 AND p LIKE ''a%''');
 DROP TABLE crp;
 
+-- ---- a TOASTed column the clauses read more than once is detoasted once a
+-- row (DESIGN.md §10, "A TOASTed column read more than once"): out of line
+-- (EXTERNAL) and compressed in line (MAIN), NULLs, and rows deleted and
+-- updated after the VACUUM, whose old versions the test must not see ----
+CREATE TABLE crt (id int, a int, big text[], cmp text, one text[])
+	WITH (autovacuum_enabled = off);
+ALTER TABLE crt ALTER COLUMN big SET STORAGE EXTERNAL;
+ALTER TABLE crt ALTER COLUMN cmp SET STORAGE MAIN;
+INSERT INTO crt SELECT i, i % 5,
+	   CASE WHEN i % 11 = 0 THEN NULL ELSE
+	   ARRAY['k' || (i % 7), 'k' || (i % 13)] ||
+	   (SELECT array_agg(md5((i * 100 + g)::text)) FROM generate_series(1, 60 + i % 30) g)
+	   END,
+	   CASE WHEN i % 9 = 0 THEN NULL ELSE repeat('c' || (i % 4), 2000) END,
+	   ARRAY['k' || (i % 3)]
+  FROM generate_series(1, 3000) i;
+CREATE INDEX crt_a ON crt USING lion (a);
+VACUUM (FREEZE, ANALYZE) crt;
+DELETE FROM crt WHERE id % 37 = 0;
+UPDATE crt SET big = ARRAY['k1', 'k5'] WHERE id % 41 = 0;
+SELECT count(*) FILTER (WHERE pg_column_toast_chunk_id(big) IS NOT NULL) > 2000
+		   AS big_out_of_line,
+	   count(*) FILTER (WHERE pg_column_compression(cmp) IS NOT NULL) > 2000
+		   AS cmp_compressed
+  FROM crt;
+SELECT cr_plan('SELECT count(*) FROM crt WHERE a = 2 AND (big[1] = ''k1'' OR cardinality(big) > 80)');
+SELECT q, cr_q(q) FROM (VALUES
+	('SELECT count(*) FROM crt WHERE a = 2 AND (big[1] = ''k1'' OR cardinality(big) > 80)'),
+	('SELECT count(*) FROM crt WHERE a = 2 AND (CASE WHEN big && ''{k3}'' THEN 2 ELSE 0 END + CASE WHEN big && ''{k5}'' THEN 1 ELSE 0 END + CASE WHEN big @> ''{k1,k4}'' THEN 4 ELSE 0 END) % 3 = 0'),
+	('SELECT count(*) FROM crt WHERE a = 1 AND (length(cmp) = 4000 AND cmp LIKE ''c2%'')'),
+	('SELECT count(*) FROM crt WHERE a = 3 AND (big[2] = ''k3'' OR cmp LIKE ''c1%'' OR length(cmp) > 4000 OR one[1] = ''k2'')'),
+	('SELECT count(*) FROM crt WHERE a = 4 AND big[1] IS DISTINCT FROM ''k2'' AND cardinality(big) < 85')
+) v(q);
+DROP TABLE crt;
+
 -- ---- the planner's memory over a WHERE of many restrictions ----
 -- Each restriction is analysed beside a snapshot of the clause lists
 -- (lion_count_path_snapshot()), a copy as long as the lists are by then,
