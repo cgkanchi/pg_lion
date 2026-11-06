@@ -1606,10 +1606,11 @@ lion_arg_type_passed(Oid type, Oid declared)
  * pointers into the tuple, which the caller's pin keeps in place - and the
  * clauses evaluated over it, as the ordinary plan's scan evaluates its quals.
  *
- * A column the clauses read more than once (residonce[]) whose value is
- * compressed or stored out of line is detoasted here, once, into the row's
- * memory: every operator call over the TOASTed datum would otherwise fetch
- * and decompress it again - a score of twenty `arr && '{x}'` terms read the
+ * A column the clauses read more than once (residonce[]: an array, tsvector
+ * or jsonb, whose operators read a value whole) whose value is compressed or
+ * stored out of line is detoasted here, once, into the row's memory: every
+ * operator call over the TOASTed datum would otherwise fetch and decompress
+ * it again - a score of twenty `arr && '{x}'` terms read the
  * array twenty times a row (DESIGN.md §10, "Residual clauses", "A TOASTed
  * column read more than once").  The value is the same either way.
  */

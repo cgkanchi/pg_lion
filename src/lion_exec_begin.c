@@ -1221,6 +1221,22 @@ lion_begin_target_list(LionCountScanState *st, CustomScan *cscan,
 }
 
 /*
+ * Whether the type's operators read a value whole: arrays, tsvector and
+ * jsonb.  A column of such a type that the residual reads more than once is
+ * detoasted once a row (lion_resid_test()).  Text, bytea and the rest are
+ * left as stored: equality and length() over them can answer from the TOAST
+ * pointer's sizes without fetching the value, and detoasting it ahead of
+ * them would add the reads it is meant to save.
+ */
+static bool
+lion_resid_reads_whole(Oid type)
+{
+	type = getBaseType(type);
+	return OidIsValid(get_element_type(type)) ||
+		type == TSVECTOROID || type == JSONBOID;
+}
+
+/*
  * The residual clauses (DESIGN.md §10, "Residual clauses"): custom_exprs
  * past the clause values and the aggregates' arguments, initialised as the
  * ordinary plan's scan initialises its quals (ExecInitQual(), which checks
@@ -1283,7 +1299,8 @@ lion_begin_residual(LionCountScanState *st, CustomScanState *node,
 		for (j = 0; j < n; j++)
 			if (st->residslotcol[j] == var->varattno - 1)
 			{
-				st->residonce[j] = true;	/* a second reference */
+				/* a second reference, of a type whose operators read it whole */
+				st->residonce[j] = lion_resid_reads_whole(var->vartype);
 				dup = true;
 			}
 		if (dup)

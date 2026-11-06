@@ -3854,7 +3854,10 @@ a tier CASE, so read the array some eighty times a row. A column the clauses ref
 (`residonce[]`, counted in `lion_begin_residual()`) is therefore detoasted once, when the row's
 columns are copied into the slot, into the row's memory, which is reset after the test; a column
 read once is left as stored, so a clause that short-circuits before reaching it still never fetches
-it. The value is the same either way. Measured (1M rows, a 14 + 6 term score over two arrays, 20%
+it. Only arrays, tsvector and jsonb are taken, whose operators read a value whole. Text, bytea and
+other types are left as stored even when read more than once: equality and `length()` over them
+can answer from the TOAST pointer's sizes without fetching the value, so detoasting them ahead of
+the clauses could add reads. The value is the same either way. Measured (1M rows, a 14 + 6 term score over two arrays, 20%
 of them stored out of line, 307k candidates, PostgreSQL 18.6, warm): 3.6 s to 2.1 s with four workers,
 the buffer hits from 11.0M to about 0.4M. Core's plan for the same WHERE pays every detoast (3.8 s).
 
