@@ -25331,6 +25331,34 @@ visibility-map test per member and the values from the index tuple.
   join's 0.5 had been. test/sql/rangesource.sql's join of a ten-row dimension then planned the
   probe's loop over its count, 2.1 ms against 1.8; that section now runs with the walks off.
 
+**A complement set.** A WHERE that keeps nearly every row - `g <> 'v' OR g IS NULL`, `n IS NOT
+NULL`, `c NOT IN (...)` - has a set of nearly the whole table: `<>` is a walk of every entry of its
+column but one, and over a column of many values each entry brings a piece a member (§30.3), so the
+probe's build is priced, rightly, at about the table's rows, and on a large table the probe loses
+to core's Index Scan: at 10M rows its set alone took longer than the heap lookups it saved. Every
+entry the B-tree hands the probe is a row of the table, and a non-partial lion index holds every row,
+so the probe can build the rows the WHERE REJECTS instead - one entry, or two with the NULLs - and
+keep each entry not among them (`lo_compl_access()`, `LO_FLAG_COMPL`). Each restriction it takes
+(`lo_compl_rejects()`), with what it rejects:
+
+    c IS NOT NULL                c IS NULL
+    c <> v                       c = v, c IS NULL
+    c <> v OR c IS NULL          c = v
+    c <> ALL (array)             c = ANY (array), c IS NULL   (a non-empty constant, no NULL in it)
+    NOT (m op v)                 m op v, m IS NULL            (a multi-key query, §30.2)
+
+`c` a scalar column of a non-partial lion index under a deterministic collation, so that an `=`
+lookup is the operator's own test, `v` a non-NULL Const; every operator is strict and returns no NULL
+for non-NULL operands, so a NULL is rejected unless the clause keeps it. The set is the BitmapOr of
+those leaves, which lion must answer exactly at plan time; the restrictions it answers leave the
+filter. Priced by `lo_cost_set()` as the rejected rows' build and the rest as members. A set that
+turns out inexact at run time would turn away rows the WHERE keeps, so then every entry is a
+candidate and the WHERE is rechecked on the row. Never lazy (§30.4: the lazy set tests members, not
+non-members), never a LionOrderedJoin's side. `pg_lion.enable_complement_sets` (default on) turns
+it off. Measured (synthetic, 10M rows, a text column of 50,000 values, 'v' in 16%; 239,395 probes,
+four workers, PostgreSQL 18, warm): the kept set 480 ms, core's Index Scan 230 ms, the complement
+set 200 ms. Tested in complset.sql against a hash join over a seq scan.
+
 **Declined, and why.**
 
 - *A heap-mode probe* (a B-tree that does not cover): a scan would fetch every member's heap tuple,

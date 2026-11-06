@@ -118,6 +118,7 @@ bool		lion_enable_btree_scan = true;
 bool		lion_enable_heap_probe = false;
 bool		lion_enable_lazy_set = true;
 static bool lion_enable_not_sets = true;
+static bool lion_enable_compl_sets = true;
 static bool lion_enable_shared_set = true;
 static double lion_ordered_switch_ratio = 32.0;
 static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
@@ -317,6 +318,7 @@ static const char *const lo_lazy_why_names[LO_LAZY_NWHY] = {
 #define LO_FLAG_PROBE		0x0040	/* a nested loop's probe (§40.10) */
 #define LO_FLAG_SIDE		0x0080	/* a side of a LionOrderedJoin (§47) */
 #define LO_FLAG_KEYED		0x0100	/* ... its dimension, keyed by the join */
+#define LO_FLAG_COMPL		0x0200	/* the set is the rows the WHERE rejects */
 
 /*
  * A side of a LionOrderedJoin (DESIGN.md §47) is a LionOrdered path built
@@ -954,6 +956,7 @@ typedef struct LionOrderedState
 	/* the lion side; noset: none, every row the walk meets is fetched */
 	bool		noset;
 	bool		minus;			/* the tree has a MINUS node (never lazy) */
+	bool		compl;			/* the set is the rows the WHERE rejects */
 	LoNode	   *tree;
 	LoLeaf	   *leaves;
 	int			nleaves;
@@ -1993,11 +1996,12 @@ lo_lion_pages(Path *lion)
  * map does not call all-visible (a LionOrderedJoin's cold reads, §47.3).
  */
 static bool
-lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
-		List *lionrinfos, List *lionqual, List *residual, double rows,
-		bool indexonly, double loops, double scans, bool probebuild,
-		double keysel, Cost keybuild, int *workers, Cost *startup_p,
-		Cost *total_p, double *reads_p, double *fetches_p)
+lo_cost_set(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
+			bool compl, List *lionrinfos, List *lionqual, List *residual,
+			double rows, bool indexonly, double loops, double scans,
+			bool probebuild, double keysel, Cost keybuild, int *workers,
+			Cost *startup_p, Cost *total_p, double *reads_p,
+			double *fetches_p)
 {
 	Cost		lioncost;
 	Selectivity sel;
@@ -2007,6 +2011,7 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	double		tuples = Max(rel->tuples, 1.0);
 	double		pages = Max((double) rel->pages, 1.0);
 	double		members;
+	double		setmembers;
 	double		walked;
 	double		fetched;
 	double		candidates;
@@ -2095,6 +2100,21 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	members = Min(clamp_row_est(candsel * tuples), tuples);
 
 	/*
+	 * A complement set (DESIGN.md §40.10, "A complement set") holds the rows
+	 * the WHERE rejects, which lion answers exactly: it is built and takes
+	 * memory as those rows, and the walk keeps the rest.
+	 */
+	setmembers = members;
+	if (compl)
+	{
+		if (rechecked != NIL || keysel < 1.0)
+			elog(ERROR, "LionOrdered: an inexact or keyed complement set");
+		sel = Max(1.0 - sel, 0.0);
+		candsel = sel;
+		members = Min(clamp_row_est(candsel * tuples), tuples);
+	}
+
+	/*
 	 * the lookups, the copy of their answer into the set, and its spill - a
 	 * probe's share of them (§40.10) - and the key sets' lookups
 	 */
@@ -2105,7 +2125,7 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		double		setbytes;
 
 		startup = lioncost + keybuild +
-			lo_set_build_price(root, rel, lion, members, &setbytes) +
+			lo_set_build_price(root, rel, lion, setmembers, &setbytes) +
 			lo_spill_cost(setbytes);
 	}
 	if (calls > 1.0 && !rebuilt)
@@ -2300,6 +2320,20 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	*startup_p = startup;
 	*total_p = startup + run;
 	return true;
+}
+
+/* lo_cost_set() of a set of the rows lion access `lion` selects */
+static bool
+lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
+		List *lionrinfos, List *lionqual, List *residual, double rows,
+		bool indexonly, double loops, double scans, bool probebuild,
+		double keysel, Cost keybuild, int *workers, Cost *startup_p,
+		Cost *total_p, double *reads_p, double *fetches_p)
+{
+	return lo_cost_set(root, rel, ord, lion, false, lionrinfos, lionqual,
+					   residual, rows, indexonly, loops, scans, probebuild,
+					   keysel, keybuild, workers, startup_p, total_p, reads_p,
+					   fetches_p);
 }
 
 /*
@@ -2702,6 +2736,279 @@ lo_not_paths(PlannerInfo *root, RelOptInfo *rel, List *cands, List *nots)
 		}
 	}
 	return result;
+}
+
+static bool lo_where_exact(Path *cand, List **rinfos, List **qual);
+
+/*
+ * A complement set (DESIGN.md §40.10, "A complement set").  The index column
+ * of idx that expr, a plain Var of rel under RelabelTypes, is; -1 if none.
+ */
+static int
+lo_compl_col(RelOptInfo *rel, IndexOptInfo *idx, Node *expr)
+{
+	Var		   *var;
+	int			c;
+
+	while (IsA(expr, RelabelType))
+		expr = (Node *) ((RelabelType *) expr)->arg;
+	if (!IsA(expr, Var))
+		return -1;
+	var = (Var *) expr;
+	if ((Index) var->varno != rel->relid || var->varlevelsup != 0 ||
+		var->varattno <= 0)
+		return -1;
+	for (c = 0; c < idx->nkeycolumns; c++)
+		if (idx->indexkeys[c] == var->varattno)
+			return c;
+	return -1;
+}
+
+/*
+ * Does op, a strategy of idx's column c's family, compare under the column's
+ * collation - one whose equality is byte equality, so that an `=` lookup of
+ * the posting sets is the operator's own test?
+ */
+static bool
+lo_compl_coll_ok(IndexOptInfo *idx, int c, Oid inputcollid)
+{
+	if (OidIsValid(idx->indexcollations[c]) &&
+		idx->indexcollations[c] != inputcollid)
+		return false;
+	return !OidIsValid(inputcollid) ||
+		get_collation_isdeterministic(inputcollid);
+}
+
+/* The lion IndexPath of idx answering clause on its column c alone. */
+static IndexPath *
+lo_compl_leaf(PlannerInfo *root, IndexOptInfo *idx, int c, Expr *clause)
+{
+	IndexClause *iclause = makeNode(IndexClause);
+
+	iclause->rinfo = make_simple_restrictinfo(root, clause);
+	iclause->indexquals = list_make1(iclause->rinfo);
+	iclause->lossy = false;
+	iclause->indexcol = (AttrNumber) c;
+	iclause->indexcols = NIL;
+	return create_index_path(root, idx, list_make1(iclause), NIL, NIL, NIL,
+							 ForwardScanDirection, false, NULL, 1.0, false);
+}
+
+/* `key IS NULL`, over a copy of key */
+static Expr *
+lo_compl_isnull(Node *key)
+{
+	NullTest   *nt = makeNode(NullTest);
+
+	nt->arg = (Expr *) copyObject(key);
+	nt->nulltesttype = IS_NULL;
+	nt->argisrow = false;
+	nt->location = -1;
+	return (Expr *) nt;
+}
+
+/*
+ * `key <> const` on a scalar column c of idx, const not NULL: its equality
+ * (the negator, the family's LION_STRAT_EQUAL) over the same operands into
+ * *eq; false for anything else.
+ */
+static bool
+lo_compl_ne(RelOptInfo *rel, IndexOptInfo *idx, Node *clause, int *c,
+			Expr **eq)
+{
+	OpExpr	   *op;
+	Node	   *right;
+	Oid			eqop;
+
+	if (!IsA(clause, OpExpr) || list_length(((OpExpr *) clause)->args) != 2)
+		return false;
+	op = (OpExpr *) clause;
+	right = (Node *) lsecond(op->args);
+	while (IsA(right, RelabelType))
+		right = (Node *) ((RelabelType *) right)->arg;
+	if (!IsA(right, Const) || ((Const *) right)->constisnull)
+		return false;
+	*c = lo_compl_col(rel, idx, (Node *) linitial(op->args));
+	if (*c < 0 ||
+		lion_opfamily_is_multikey(idx->opfamily[*c], idx->opcintype[*c]) ||
+		get_op_opfamily_strategy(op->opno, idx->opfamily[*c]) != LION_STRAT_NE ||
+		!lo_compl_coll_ok(idx, *c, op->inputcollid))
+		return false;
+	eqop = get_negator(op->opno);
+	if (!OidIsValid(eqop) ||
+		get_op_opfamily_strategy(eqop, idx->opfamily[*c]) != LION_STRAT_EQUAL)
+		return false;
+	*eq = make_opclause(eqop, BOOLOID, false,
+						(Expr *) copyObject(linitial(op->args)),
+						(Expr *) copyObject(lsecond(op->args)),
+						InvalidOid, op->inputcollid);
+	return true;
+}
+
+/*
+ * The lion IndexPaths of idx whose rows are those restriction rinfo REJECTS -
+ * its rows false or NULL - and whose union lion answers exactly; NIL when it
+ * is none of the complements below.  Each operator is strict and returns no
+ * NULL for non-NULL operands, so a NULL column is rejected unless the clause
+ * keeps it:
+ *
+ *	`c IS NOT NULL`				rejects c IS NULL
+ *	`c <> v`					rejects c = v, c IS NULL
+ *	`c <> v OR c IS NULL`		rejects c = v
+ *	`c <> ALL (array)`			rejects c = ANY (array), c IS NULL - an array
+ *								constant, not empty, with no NULL element
+ *	`NOT (m op v)`				rejects m op v, m IS NULL - m a multi-key
+ *								column, its query exact (lo_not_column())
+ */
+static List *
+lo_compl_rejects(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+				 RestrictInfo *rinfo)
+{
+	Node	   *clause = (Node *) rinfo->clause;
+	Expr	   *eq;
+	int			c;
+
+	if (rinfo->pseudoconstant)
+		return NIL;
+	if (IsA(clause, NullTest))
+	{
+		NullTest   *nt = (NullTest *) clause;
+
+		if (nt->nulltesttype != IS_NOT_NULL || nt->argisrow ||
+			(c = lo_compl_col(rel, idx, (Node *) nt->arg)) < 0)
+			return NIL;
+		return list_make1(lo_compl_leaf(root, idx, c,
+										lo_compl_isnull((Node *) nt->arg)));
+	}
+	if (lo_compl_ne(rel, idx, clause, &c, &eq))
+		return list_make2(lo_compl_leaf(root, idx, c, eq),
+						  lo_compl_leaf(root, idx, c,
+										lo_compl_isnull(linitial(((OpExpr *) clause)->args))));
+	if (is_orclause(clause) && list_length(((BoolExpr *) clause)->args) == 2)
+	{
+		Node	   *a = (Node *) linitial(((BoolExpr *) clause)->args);
+		Node	   *b = (Node *) lsecond(((BoolExpr *) clause)->args);
+		NullTest   *nt;
+
+		if (IsA(a, NullTest))
+		{
+			Node	   *t = a;
+
+			a = b;
+			b = t;
+		}
+		if (!IsA(b, NullTest) || !lo_compl_ne(rel, idx, a, &c, &eq))
+			return NIL;
+		nt = (NullTest *) b;
+		if (nt->nulltesttype != IS_NULL || nt->argisrow ||
+			lo_compl_col(rel, idx, (Node *) nt->arg) != c)
+			return NIL;
+		return list_make1(lo_compl_leaf(root, idx, c, eq));
+	}
+	if (IsA(clause, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *sa = (ScalarArrayOpExpr *) clause;
+		ScalarArrayOpExpr *any;
+		Node	   *arr = (Node *) lsecond(sa->args);
+		Oid			eqop;
+		ArrayType  *a;
+
+		if (sa->useOr || !IsA(arr, Const) || ((Const *) arr)->constisnull)
+			return NIL;
+		c = lo_compl_col(rel, idx, (Node *) linitial(sa->args));
+		if (c < 0 ||
+			lion_opfamily_is_multikey(idx->opfamily[c], idx->opcintype[c]) ||
+			get_op_opfamily_strategy(sa->opno, idx->opfamily[c]) != LION_STRAT_NE ||
+			!lo_compl_coll_ok(idx, c, sa->inputcollid))
+			return NIL;
+		a = DatumGetArrayTypeP(((Const *) arr)->constvalue);
+		if (ArrayGetNItems(ARR_NDIM(a), ARR_DIMS(a)) == 0 || array_contains_nulls(a))
+			return NIL;
+		eqop = get_negator(sa->opno);
+		if (!OidIsValid(eqop) ||
+			get_op_opfamily_strategy(eqop, idx->opfamily[c]) != LION_STRAT_EQUAL)
+			return NIL;
+		any = makeNode(ScalarArrayOpExpr);
+		any->opno = eqop;
+		any->opfuncid = get_opcode(eqop);
+		any->hashfuncid = InvalidOid;
+		any->negfuncid = InvalidOid;
+		any->useOr = true;
+		any->inputcollid = sa->inputcollid;
+		any->args = copyObject(sa->args);
+		any->location = -1;
+		return list_make2(lo_compl_leaf(root, idx, c, (Expr *) any),
+						  lo_compl_leaf(root, idx, c,
+										lo_compl_isnull(linitial(sa->args))));
+	}
+	if (is_notclause(clause))
+	{
+		OpExpr	   *inner;
+
+		if ((c = lo_not_column(rel, idx, rinfo, &inner)) < 0)
+			return NIL;
+		return list_make2(lo_compl_leaf(root, idx, c, (Expr *) copyObject(inner)),
+						  lo_compl_leaf(root, idx, c,
+										lo_compl_isnull(linitial(inner->args))));
+	}
+	return NIL;
+}
+
+/*
+ * The complement set of rel (DESIGN.md §40.10, "A complement set"): the lion
+ * access whose rows are those rel's complement restrictions reject - a
+ * BitmapOr of lo_compl_rejects()'s leaves, over non-partial lion indexes,
+ * which hold every row - with those restrictions into *rinfos and their
+ * clauses into *qual.  A row of rel the set lacks passes them all.  NULL
+ * when rel has none, or lion would not answer the union exactly.
+ */
+static Path *
+lo_compl_access(PlannerInfo *root, RelOptInfo *rel, List *lionidx,
+				List **rinfos, List **qual)
+{
+	List	   *leaves = NIL;
+	Path	   *rej;
+	List	   *lrinfos = NIL;
+	List	   *lqual;
+	ListCell   *lc;
+	ListCell   *lc2;
+
+	*rinfos = NIL;
+	*qual = NIL;
+	if (!lion_enable_compl_sets)
+		return NULL;
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+		foreach(lc2, lionidx)
+		{
+			IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc2);
+			List	   *r;
+
+			if (idx->indpred != NIL || !idx->amhasgetbitmap)
+				continue;
+			r = lo_compl_rejects(root, rel, idx, rinfo);
+			if (r == NIL)
+				continue;
+			leaves = list_concat(leaves, r);
+			*rinfos = lappend(*rinfos, rinfo);
+			*qual = lappend(*qual, rinfo->clause);
+			break;
+		}
+	}
+	if (leaves == NIL)
+		return NULL;
+	rej = (list_length(leaves) == 1) ? (Path *) linitial(leaves) :
+		(Path *) create_bitmap_or_path(root, rel, leaves);
+	if (!lo_where_exact(rej, &lrinfos, &lqual) ||
+		!lion_ordered_set_exact(root, rej))
+	{
+		*rinfos = NIL;
+		*qual = NIL;
+		return NULL;
+	}
+	return rej;
 }
 
 /*
@@ -4291,6 +4598,9 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	List	   *ordpaths = NIL;
 	List	   *btpaths = NIL;
 	List	   *probepaths = NIL;
+	Path	   *compl = NULL;
+	List	   *complrinfos = NIL;
+	List	   *complqual = NIL;
 	List	   *lionidx = NIL;
 	List	   *cands = NIL;
 	List	   *knncands;
@@ -4670,6 +4980,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	 * Index Scan of the same B-tree, less the rows the set rejects, priced
 	 * by the same formula over the members' fetches.
 	 */
+	if (probepaths != NIL)
+		compl = lo_compl_access(root, rel, lionidx, &complrinfos, &complqual);
 	foreach(lc, probepaths)
 	{
 		IndexPath  *ipath = (IndexPath *) lfirst(lc);
@@ -4725,6 +5037,40 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			lo_add_path(rel, ppi, &lion_btree_path_methods, NIL,
 						list_make3(ipath, lion, iocols), ppi->ppi_rows,
 						startup, total, rel->consider_parallel, 0);
+		}
+
+		/*
+		 * ... and over the complement set, the rows the WHERE rejects (§40.10,
+		 * "A complement set"), index-only: custom_private's fourth and fifth
+		 * members are the restrictions it answers and their clauses.
+		 */
+		if (compl != NULL)
+		{
+			List	   *residual = lo_residual(clauses, ordrinfos, complrinfos,
+											   complqual);
+			List	   *iocols = NIL;
+			Cost		startup;
+			Cost		total;
+
+			if (enable_indexonlyscan &&
+				lo_index_only(ipath->indexinfo,
+							  lo_needed_attrs(rel, residual,
+											  ipath->indexclauses,
+											  complqual, false),
+							  &iocols))
+			{
+				lo_cost_set(root, rel, ipath, compl, true, complrinfos,
+							complqual, residual, ppi->ppi_rows, true, loops,
+							scans, true, 1.0, 0.0, NULL, &startup, &total,
+							NULL, NULL);
+				total += LO_PROBE_RESCAN_COST;
+				startup = Min(startup + ipath->path.startup_cost, total);
+				lo_add_path(rel, ppi, &lion_btree_path_methods, NIL,
+							list_make5(ipath, compl, iocols, complrinfos,
+									   complqual),
+							ppi->ppi_rows, startup, total,
+							rel->consider_parallel, 0);
+			}
 		}
 	}
 
@@ -5703,7 +6049,21 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			flags |= LO_FLAG_BUILD;
 	}
 
-	if (lion != NULL)
+	if (list_length(best_path->custom_private) == 5)
+	{
+		/*
+		 * A probe over the complement set (§40.10, "A complement set"): the
+		 * set is the rows the restrictions it answers reject, and the lion
+		 * qual - the recheck of a set that turns out inexact - is theirs.
+		 */
+		if ((flags & LO_FLAG_PROBE) == 0 || lion == NULL)
+			elog(ERROR, "LionOrdered: a complement set outside a probe");
+		lionrinfos = (List *) lfourth(best_path->custom_private);
+		lionqual = (List *) list_nth(best_path->custom_private, 4);
+		lo_lion_tree(lion, &tree, &leaves, &lionquals);
+		flags |= LO_FLAG_COMPL;
+	}
+	else if (lion != NULL)
 	{
 		lionqual = lo_lion_qual(lion, &lionrinfos, &lossy);
 		lo_lion_tree(lion, &tree, &leaves, &lionquals);
@@ -7169,7 +7529,7 @@ lo_lazy_ok(LionOrderedState *st)
 	int			i;
 	int			k;
 
-	if (st->noset || st->minus)
+	if (st->noset || st->minus || st->compl)
 		return false;
 	for (i = 0; i < st->nleaves; i++)
 	{
@@ -7852,6 +8212,10 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->knn = (priv.flags & LO_FLAG_KNN) != 0;
 	st->knnlimit = priv.limit;
 	st->probe = (priv.flags & LO_FLAG_PROBE) != 0;
+	st->compl = (priv.flags & LO_FLAG_COMPL) != 0;
+	if (st->compl && (!st->probe || priv.tree == NIL ||
+					  (priv.flags & (LO_FLAG_SIDE | LO_FLAG_LOSSY)) != 0))
+		elog(ERROR, "LionOrdered: malformed complement set");
 	st->side = (priv.flags & LO_FLAG_SIDE) != 0;
 	st->keyed = (priv.flags & LO_FLAG_KEYED) != 0;
 	st->nkeyleaves = priv.nkeyleaves;
@@ -9004,6 +9368,19 @@ lo_next(ScanState *ss)
 			st->distinct++;
 			st->hits++;
 		}
+		else if (st->compl)
+		{
+			/*
+			 * A complement set (§40.10, "A complement set"): a row the
+			 * WHERE rejects is turned away, the rest kept.  One that holds
+			 * more than those rows, inexact, would turn away rows the WHERE
+			 * keeps: then every row is a candidate, rechecked below.
+			 */
+			if (st->exact && lo_set_find(lo_walk_set(st), tid) >= 0)
+				continue;
+			st->distinct++;
+			st->hits++;
+		}
 		else if (!st->noset)
 		{
 			idx = lo_set_find(lo_walk_set(st), tid);
@@ -9635,6 +10012,9 @@ lo_explain_lines(LionOrderedState *st, List *ancestors, ExplainState *es,
 					lo_label(prefix, "Order By"), ancestors, es);
 	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs, LO_EXPR_LIONQUAL),
 					lo_label(prefix, "Lion Cond"), ancestors, es);
+	if (st->compl)
+		ExplainPropertyText(lo_label(prefix, "Lion Set Holds"),
+							"the rows the condition rejects", es);
 	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs,
 											LO_EXPR_VALUEQUAL),
 					lo_label(prefix, "Filter per Value"), ancestors, es);
@@ -10700,6 +11080,20 @@ lion_ordered_init(void)
 							 "Lets lion sets take away the rows of a negated multi-key query.",
 							 "Off, a NOT of an array, tsvector or jsonb query is tested on the row instead.",
 							 &lion_enable_not_sets,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §40.10, "A complement set": off, a nested loop's probe whose
+	 * WHERE is `<>`, `IS NOT NULL`, `NOT IN` or a NOT of a multi-key query
+	 * builds the rows it keeps, as before - for comparing the two.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_complement_sets",
+							 "Lets a nested loop's probe build the rows its WHERE rejects and keep the rest.",
+							 "Off, the probe's set is the rows the WHERE keeps.",
+							 &lion_enable_compl_sets,
 							 true,
 							 PGC_USERSET,
 							 0,

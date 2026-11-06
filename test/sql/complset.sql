@@ -1,0 +1,146 @@
+-- A nested loop's probe over a complement set (DESIGN.md §40.10, "A
+-- complement set"): where the WHERE is `<>`, `IS NOT NULL`, `NOT IN`,
+-- `c <> v OR c IS NULL` or a NOT of a multi-key query, the probe builds the
+-- rows it REJECTS - an entry or two - and keeps every B-tree entry not
+-- among them, instead of building nearly the whole table.  Every query is
+-- run through the probe (core's scans and joins pushed away) and through a
+-- seq scan and hash join, and the answers compared.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET max_parallel_workers_per_gather = 0;
+SET work_mem = '64MB';
+
+CREATE TABLE cs (
+	id int PRIMARY KEY,
+	g text,				-- 'v' in a sixth of the rows, NULL in some, else many
+	n int,				-- 7 in a tenth, NULL in some
+	tags text[],
+	pad text
+) WITH (autovacuum_enabled = off);
+INSERT INTO cs
+SELECT i,
+	   CASE WHEN i % 41 = 0 THEN NULL WHEN i % 6 = 0 THEN 'v'
+			ELSE 'g' || (i * 7919 % 3001) END,
+	   CASE WHEN i % 43 = 0 THEN NULL ELSE i % 10 + 2 END,
+	   CASE WHEN i % 13 = 0 THEN NULL WHEN i % 17 = 0 THEN '{}'::text[]
+			ELSE ARRAY['a' || (i % 3), 'b' || (i % 7)] END,
+	   repeat('p', 200)
+  FROM generate_series(1, 30000) i;
+CREATE INDEX cs_lion ON cs USING lion (g, n, tags);
+VACUUM (FREEZE, ANALYZE) cs;
+-- dead and moved rows the sets still hold entries of
+DELETE FROM cs WHERE id % 31 = 0;
+UPDATE cs SET g = 'v' WHERE id % 37 = 0;
+UPDATE cs SET g = 'w' WHERE id % 53 = 0;
+
+CREATE TABLE csd (id int PRIMARY KEY, w int);
+INSERT INTO csd SELECT i, i % 4 FROM generate_series(1, 30000, 3) i;
+ANALYZE csd;
+
+/*
+ * lion_cs() runs q with core's scans of cs and its other joins disabled, so
+ * that a nested loop's LionBtreeScan probe is the path left, and through a
+ * hash join over a seq scan with lion's nodes off; compares the two answers
+ * as multisets, and names the probe and whether its set is the complement.
+ */
+CREATE FUNCTION lion_cs(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	r record;
+	node text := 'no probe';
+	compl text := '';
+	a text[] := '{}';
+	b text[] := '{}';
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_material', 'off', true);
+	PERFORM set_config('enable_memoize', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_ordered_join', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionBtreeScan\) on cs' THEN
+			node := 'LionBtreeScan';
+		ELSIF ln ~ '^\s*Lion Set Holds: ' THEN
+			compl := ', complement';
+		END IF;
+	END LOOP;
+	FOR r IN EXECUTE q LOOP
+		a := a || r::text;
+	END LOOP;
+
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_btree_scan', 'off', true);
+	FOR r IN EXECUTE q LOOP
+		b := b || r::text;
+	END LOOP;
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_material', 'on', true);
+	PERFORM set_config('enable_memoize', 'on', true);
+	PERFORM set_config('pg_lion.enable_ordered_join', 'on', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_btree_scan', 'on', true);
+
+	SELECT coalesce(array_agg(e ORDER BY e), '{}') INTO a FROM unnest(a) e;
+	SELECT coalesce(array_agg(e ORDER BY e), '{}') INTO b FROM unnest(b) e;
+	IF a IS DISTINCT FROM b THEN
+		RETURN format('MISMATCH: %s rows through the probe, %s ordinary; first %s / %s',
+					  coalesce(array_length(a, 1), 0), coalesce(array_length(b, 1), 0),
+					  a[1], b[1]);
+	END IF;
+	RETURN format('%s%s, %s rows', node, compl, coalesce(array_length(a, 1), 0));
+END $$;
+
+-- the probe's plan
+SET pg_lion.pushdown_margin = 1000;
+EXPLAIN (COSTS OFF)
+SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id
+ WHERE csd.w = 1 AND (cs.g <> 'v' OR cs.g IS NULL);
+RESET pg_lion.pushdown_margin;
+
+SELECT q, lion_cs(q) FROM (VALUES
+	('SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id WHERE csd.w = 1 AND (cs.g <> ''v'' OR cs.g IS NULL)'),
+	('SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id WHERE csd.w = 1 AND (cs.g IS NULL OR cs.g <> ''v'')'),
+	('SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id WHERE csd.w = 2 AND cs.g <> ''v'''),
+	('SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id WHERE csd.w = 2 AND cs.g IS NOT NULL'),
+	('SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id WHERE csd.w = 3 AND cs.g NOT IN (''v'', ''w'', ''g7'')'),
+	('SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id WHERE csd.w = 3 AND cs.n <> 7 AND cs.g <> ''v'''),
+	('SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id WHERE csd.w = 0 AND (cs.n <> 7 OR cs.n IS NULL)'),
+	('SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id WHERE csd.w = 0 AND NOT (cs.tags && ''{a1}'')'),
+	('SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id WHERE csd.w = 0 AND cs.g <> ''nope'''),
+	-- a value no row has: the set is the NULLs alone
+	('SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id WHERE csd.w = 1 AND cs.n <> 1000'),
+	-- left to the kept set or the filter: NOT IN with a NULL, an empty
+	-- NOT IN, an OR of two values
+	('SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id WHERE csd.w = 1 AND cs.g NOT IN (''v'', NULL)'),
+	('SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id WHERE csd.w = 1 AND cs.g <> ALL (''{}''::text[])'),
+	('SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id WHERE csd.w = 1 AND (cs.g <> ''v'' OR cs.g = ''w'')'),
+	-- a complement beside a clause it does not answer, left to the filter
+	('SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id WHERE csd.w = 2 AND cs.g <> ''v'' AND cs.pad LIKE ''p%''')
+) v(q);
+
+-- off, the probe builds the rows it keeps, with the same answers
+SET pg_lion.enable_complement_sets = off;
+SELECT q, lion_cs(q) FROM (VALUES
+	('SELECT csd.id FROM csd JOIN cs ON cs.id = csd.id WHERE csd.w = 1 AND (cs.g <> ''v'' OR cs.g IS NULL)')
+) v(q);
+RESET pg_lion.enable_complement_sets;
+
+DROP TABLE cs, csd;
+DROP FUNCTION lion_cs(text);
