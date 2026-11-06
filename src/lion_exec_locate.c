@@ -2508,8 +2508,16 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 		 */
 		if (LION_TL_IS_CELLPRED(kind))
 		{
-			uint8		t = st->cells->truth[LION_TL_CELLPRED_NO(kind)];
+			int			p = LION_TL_CELLPRED_NO(kind);
+			uint8		t = st->cells->truth[p];
 
+			/* ... or a weighted sum's value in it ("Weighted sums") */
+			if (st->cells->pred[p].kind == LION_CELLPRED_SUM)
+			{
+				slot->tts_values[i] = st->cells->sumvalue[p];
+				slot->tts_isnull[i] = st->cells->sumisnull[p];
+				continue;
+			}
 			slot->tts_values[i] = BoolGetDatum(t == LION_TRUTH_TRUE);
 			slot->tts_isnull[i] = (t == LION_TRUTH_NULL);
 			continue;

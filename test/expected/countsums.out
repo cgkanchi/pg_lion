@@ -1,0 +1,433 @@
+-- Weighted sums in counts by cells (DESIGN.md §10, "Weighted sums").
+--
+-- A sum of terms `CASE WHEN leaf THEN w1 ELSE w0 END` or `leaf::int`, each
+-- leaf a test of a multi-key column - an array's overlap or containment, a
+-- jsonb's keys or containment, a text search - and of constants is one
+-- predicate of a count by cells: a score over tags, "matches at least k of".
+-- Each column its terms test is a dimension whose outcomes are the values
+-- its part of the sum may take, so the cells grow with the values, not with
+-- the terms.  Every query below is checked against a sequential scan with
+-- the pushdown off; lcs_check() says whether the cells ran, how many cells
+-- the plan bounds them by, and whether rows went to the heap.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+-- EXPLAIN in a form every supported release prints the same way (as
+-- test/sql/countcells.sql has it)
+CREATE OR REPLACE FUNCTION lion_explain_norm(q text, opts text DEFAULT 'COSTS OFF')
+RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	PERFORM set_config('enable_sort', 'off', true);
+	FOR l IN EXECUTE 'EXPLAIN (' || opts || ') ' || q LOOP
+		CONTINUE WHEN l ~ '^\s*Disabled: true$';
+		l := regexp_replace(l, '(InitPlan|SubPlan) (\d+)', '\1 expr_\2', 'g');
+		RETURN NEXT regexp_replace(l, 'rows=(\d+)\.00 ', 'rows=\1 ', 'g');
+	END LOOP;
+	PERFORM set_config('enable_sort', 'on', true);
+END
+$$;
+/*
+ * lcs_check() runs q with every scan of the heap disabled, so that a count by
+ * cells that is built at all is the plan, under EXPLAIN ANALYZE and again for
+ * its rows; then with the pushdown off and sequential scans only, and proves
+ * the two answers equal as multisets of their text - a numeric's display
+ * scale included.  It says whether the plan counted by cells, in parallel or
+ * not, the cells it bounds the count by, and whether rows were tested in the
+ * heap.
+ */
+CREATE FUNCTION lcs_check(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	cells bigint := -1;
+	par boolean := false;
+	rechecked bigint := 0;
+	nrows bigint;
+	ndiff bigint;
+	hashjoin text := current_setting('enable_hashjoin');
+	mergejoin text := current_setting('enable_mergejoin');
+	nestloop text := current_setting('enable_nestloop');
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF ln ~ '^\s*Cells: ' THEN
+			cells := substring(ln FROM 'Cells: (\d+)')::bigint;
+		ELSIF ln ~ 'Parallel Custom Scan \(LionCount\)' THEN
+			par := true;
+		ELSIF ln ~ 'Decoded Rows Rechecked: ' THEN
+			rechecked := rechecked + substring(ln FROM 'Decoded Rows Rechecked: (\d+)')::bigint;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lcs_on AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lcs_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_hashjoin', hashjoin, true);
+	PERFORM set_config('enable_mergejoin', mergejoin, true);
+	PERFORM set_config('enable_nestloop', nestloop, true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	SELECT count(*) INTO nrows FROM lcs_off;
+	SELECT (SELECT count(*) FROM (TABLE lcs_on EXCEPT ALL TABLE lcs_off) x) +
+		   (SELECT count(*) FROM (TABLE lcs_off EXCEPT ALL TABLE lcs_on) y)
+	  INTO ndiff;
+	DROP TABLE lcs_on, lcs_off;
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows%s',
+				  CASE WHEN cells < 0 THEN 'not cells'
+					   ELSE CASE WHEN par THEN 'parallel ' ELSE '' END ||
+							cells || ' cells' END,
+				  nrows,
+				  CASE WHEN rechecked > 0 THEN ', rows tested in the heap' ELSE '' END);
+END $$;
+-- n terms over tags, `(tags && '{v}')::int` for v from `first` on
+CREATE FUNCTION lcs_terms(n int, first int DEFAULT 0) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$
+SELECT string_agg(format('(tags && ''{%s}'')::int', first + i), ' + ' ORDER BY i)
+  FROM generate_series(0, n - 1) i
+$$;
+/*
+ * 40,000 rows: tags an int array - NULL, empty, or with a NULL element in
+ * some rows - of 100 values; labels a text array with NULLs; doc a jsonb of
+ * two keys of six, NULL or a bare string in some rows; w a text search
+ * vector; r a text of 5 values; n of 100 values; pad no lion index has.
+ */
+CREATE TABLE lcs (id int NOT NULL, tags int[], labels text[], doc jsonb,
+				  w tsvector, r text NOT NULL, n int NOT NULL, pad text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lcs
+SELECT i,
+	   CASE WHEN h % 17 = 0 THEN NULL
+			WHEN h % 19 = 0 THEN '{}'::int[]
+			WHEN h % 29 = 0 THEN ARRAY[NULL, (h / 3) % 40]
+			ELSE ARRAY[(h / 3) % 40, 40 + (h / 13) % 30, (h / 7) % 100] END,
+	   CASE WHEN h % 13 = 0 THEN NULL
+			ELSE ARRAY['l' || ((h / 11) % 9), 'l' || ((h / 101) % 9)] END,
+	   CASE WHEN h % 23 = 0 THEN NULL
+			WHEN h % 31 = 0 THEN '"scalar"'::jsonb
+			ELSE jsonb_build_object('k' || ((h / 5) % 6), 1,
+									'k' || ((h / 59) % 6), (h / 7) % 3) END,
+	   CASE WHEN h % 43 = 0 THEN NULL
+			ELSE to_tsvector('simple', 'a' || ((h / 47) % 6) || ' b' || ((h / 53) % 4)) END,
+	   'r' || ((h / 31) % 5),
+	   (h / 41) % 100,
+	   repeat('x', 20)
+  FROM (SELECT i, abs(hashint4(i)) AS h FROM generate_series(1, 40000) i) q;
+CREATE INDEX lcs_tags ON lcs USING lion (tags);
+CREATE INDEX lcs_labels ON lcs USING lion (labels);
+CREATE INDEX lcs_doc ON lcs USING lion (doc jsonb_contains_ops);
+CREATE INDEX lcs_w ON lcs USING lion (w) WITH (store_positions = false);
+CREATE INDEX lcs_rn ON lcs USING lion (r, n);
+VACUUM (FREEZE, ANALYZE) lcs;
+-- The score: an int sum over every multi-key column, its weights CASEs with
+-- an ELSE that is not zero, a negative weight, casts, and constants; a tier
+-- over it, which the plan computes once a cell.
+CREATE VIEW lcs_scored AS
+SELECT id, r, n,
+	   10 + CASE WHEN tags && '{1,2,3}' THEN 15 ELSE 0 END
+		  + CASE WHEN tags @> '{41}' THEN 7 ELSE 1 END
+		  + (tags && '{5}')::int
+		  + CASE WHEN labels && '{l1}' THEN 12 ELSE 0 END
+		  + CASE WHEN labels @> '{l2,l3}' THEN -4 ELSE 0 END
+		  + CASE WHEN doc ? 'k1' THEN 9 ELSE 0 END
+		  + CASE WHEN doc @> '{"k2": 2}' THEN 20 ELSE 0 END
+		  + CASE WHEN doc ?| '{k3,k4}' THEN 3 ELSE 0 END
+		  + CASE WHEN w @@ 'a1 | (a2 & b3)'::tsquery THEN 11 ELSE 0 END
+		  + CASE WHEN w @@ 'b2'::tsquery THEN 6 ELSE 0 END AS score
+  FROM lcs;
+CREATE VIEW lcs_tiered AS
+SELECT id, r, n, score,
+	   CASE WHEN score >= 45 THEN 'high'
+			WHEN score >= 25 THEN 'medium'
+			ELSE 'low' END AS tier
+  FROM lcs_scored;
+-- ---------- 1. the plan ----------
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SELECT * FROM lion_explain_norm(
+	'SELECT tier, count(*) FROM lcs_tiered GROUP BY tier') AS p("QUERY PLAN");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: CASE WHEN ((((((((((((10 + CASE WHEN (lcs.tags && '{1,2,3}'::integer[]) THEN 15 ELSE 0 END) + CASE WHEN (lcs.tags @> '{41}'::integer[]) THEN 7 ELSE 1 END) + ((lcs.tags && '{5}'::integer[]))::integer) + CASE WHEN (lcs.labels && '{l1}'::text[]) THEN 12 ELSE 0 END) + CASE WHEN (lcs.labels @> '{l2,l3}'::text[]) THEN '-4'::integer ELSE 0 END) + CASE WHEN (lcs.doc ? 'k1'::text) THEN 9 ELSE 0 END) + CASE WHEN (lcs.doc @> '{"k2": 2}'::jsonb) THEN 20 ELSE 0 END) + CASE WHEN (lcs.doc ?| '{k3,k4}'::text[]) THEN 3 ELSE 0 END) + CASE WHEN (lcs.w @@ '''a1'' | ''a2'' & ''b3'''::tsquery) THEN 11 ELSE 0 END) + CASE WHEN (lcs.w @@ '''b2'''::tsquery) THEN 6 ELSE 0 END)) >= 45) THEN 'high'::text WHEN ((((((((((((10 + CASE WHEN (lcs.tags && '{1,2,3}'::integer[]) THEN 15 ELSE 0 END) + CASE WHEN (lcs.tags @> '{41}'::integer[]) THEN 7 ELSE 1 END) + ((lcs.tags && '{5}'::integer[]))::integer) + CASE WHEN (lcs.labels && '{l1}'::text[]) THEN 12 ELSE 0 END) + CASE WHEN (lcs.labels @> '{l2,l3}'::text[]) THEN '-4'::integer ELSE 0 END) + CASE WHEN (lcs.doc ? 'k1'::text) THEN 9 ELSE 0 END) + CASE WHEN (lcs.doc @> '{"k2": 2}'::jsonb) THEN 20 ELSE 0 END) + CASE WHEN (lcs.doc ?| '{k3,k4}'::text[]) THEN 3 ELSE 0 END) + CASE WHEN (lcs.w @@ '''a1'' | ''a2'' & ''b3'''::tsquery) THEN 11 ELSE 0 END) + CASE WHEN (lcs.w @@ '''b2'''::tsquery) THEN 6 ELSE 0 END)) >= 25) THEN 'medium'::text ELSE 'low'::text END
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lcs_rn.r (r)
+         Group Strategy: Cells
+         Cell Columns: lcs_tags (tags), lcs_labels (labels), lcs_doc (doc), lcs_w (w)
+         Cell Predicates: ((((((((((10 + CASE WHEN (tags && '{1,2,3}'::integer[]) THEN 15 ELSE 0 END) + CASE WHEN (tags @> '{41}'::integer[]) THEN 7 ELSE 1 END) + ((tags && '{5}'::integer[]))::integer) + CASE WHEN (labels && '{l1}'::text[]) THEN 12 ELSE 0 END) + CASE WHEN (labels @> '{l2,l3}'::text[]) THEN '-4'::integer ELSE 0 END) + CASE WHEN (doc ? 'k1'::text) THEN 9 ELSE 0 END) + CASE WHEN (doc @> '{"k2": 2}'::jsonb) THEN 20 ELSE 0 END) + CASE WHEN (doc ?| '{k3,k4}'::text[]) THEN 3 ELSE 0 END) + CASE WHEN (w @@ '''a1'' | ''a2'' & ''b3'''::tsquery) THEN 11 ELSE 0 END) + CASE WHEN (w @@ '''b2'''::tsquery) THEN 6 ELSE 0 END)
+         Cells: 2025
+(8 rows)
+
+SELECT * FROM lion_explain_norm(
+	'SELECT count(*) FROM lcs WHERE (tags && ''{1}'')::int + (tags && ''{2}'')::int + (tags @> ''{41}'')::int + (tags && ''{50,51}'')::int >= 2') AS p("QUERY PLAN");
+                                                                                            QUERY PLAN                                                                                             
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Custom Scan (LionCount)
+         Filter: (((((((tags && '{1}'::integer[]))::integer + ((tags && '{2}'::integer[]))::integer) + ((tags @> '{41}'::integer[]))::integer) + ((tags && '{50,51}'::integer[]))::integer)) >= 2)
+         Lion Indexes: lcs_rn.r (r)
+         Group Strategy: Cells
+         Cell Columns: lcs_tags (tags)
+         Cell Predicates: (((((tags && '{1}'::integer[]))::integer + ((tags && '{2}'::integer[]))::integer) + ((tags @> '{41}'::integer[]))::integer) + ((tags && '{50,51}'::integer[]))::integer)
+         Cells: 6
+(8 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
+-- ---------- 2. int sums ----------
+SELECT left(q, 100) AS q, lcs_check(q) FROM (VALUES
+	('SELECT tier, count(*) FROM lcs_tiered GROUP BY tier'),
+	('SELECT score, count(*) FROM lcs_scored GROUP BY score'),
+	('SELECT count(*) FROM lcs_tiered WHERE tier = ''high'''),
+	('SELECT r, tier, count(*) FROM lcs_tiered GROUP BY r, tier'),
+	('SELECT tier, count(*) FROM lcs_tiered WHERE n < 30 GROUP BY tier'),
+	-- at least k of: casts, NULL where the column is NULL
+	('SELECT (tags && ''{1}'')::int + (tags && ''{2}'')::int + (tags && ''{41}'')::int AS m, count(*) FROM lcs GROUP BY 1'),
+	('SELECT count(*) FROM lcs WHERE (tags && ''{1}'')::int + (tags && ''{2}'')::int + (tags @> ''{41}'')::int + (tags && ''{50,51}'')::int >= 2'),
+	('SELECT count(*) FROM lcs WHERE (labels && ''{l1}'')::int + (labels && ''{l2}'')::int + (labels @> ''{l3,l4}'')::int >= 1'),
+	('SELECT (doc ? ''k1'')::int + (doc ? ''k2'')::int + (doc ?& ''{k3,k4}'')::int + (doc @> ''{"k5": 1}'')::int AS m, count(*) FROM lcs GROUP BY 1'),
+	('SELECT (w @@ ''a1''::tsquery)::int + (w @@ ''b2''::tsquery)::int + (w @@ ''a3 | b0''::tsquery)::int AS m, count(*) FROM lcs GROUP BY 1'),
+	-- one sum over several columns, casts and CASEs mixed
+	('SELECT (tags && ''{1,2}'')::int + (labels && ''{l1}'')::int + (doc ? ''k1'')::int + (w @@ ''a1''::tsquery)::int + CASE WHEN tags && ''{60}'' THEN 2 ELSE 0 END AS m, count(*) FROM lcs GROUP BY 1'),
+	-- a query that selects no row: never true, NULL of a NULL column
+	('SELECT (tags && ''{}'')::int + (tags && ''{3}'')::int AS m, count(*) FROM lcs GROUP BY 1'),
+	('SELECT CASE WHEN tags && ''{}'' THEN 5 ELSE 2 END + CASE WHEN tags && ''{3}'' THEN 1 ELSE 0 END AS m, count(*) FROM lcs GROUP BY 1'),
+	-- the same leaf in two terms, and two sums beside other predicates
+	('SELECT (tags && ''{1}'')::int + (tags && ''{1}'')::int AS m, (tags && ''{2}'')::int + (labels && ''{l2}'')::int AS m2, (r = ''r1'') AS b, count(*) FROM lcs GROUP BY 1, 2, 3'),
+	-- int8 and int2 sums
+	('SELECT CASE WHEN tags && ''{1}'' THEN 5000000000 ELSE 0::int8 END + CASE WHEN doc ? ''k1'' THEN 1::int8 ELSE -1::int8 END AS m, count(*) FROM lcs GROUP BY 1'),
+	('SELECT CASE WHEN tags && ''{1}'' THEN 3::int2 ELSE 0::int2 END + CASE WHEN tags && ''{2}'' THEN 4::int2 ELSE 1::int2 END AS m, count(*) FROM lcs GROUP BY 1'),
+	-- a sum an int2 could overflow (were a row in both): not a sum, its
+	-- terms' leaves predicates of their own
+	('SELECT CASE WHEN tags && ''{1}'' THEN 30000::int2 ELSE 0::int2 END + CASE WHEN labels && ''{zz}'' THEN 30000::int2 ELSE 0::int2 END AS m, count(*) FROM lcs GROUP BY 1'),
+	-- a WHERE that selects no row: no group
+	('SELECT (tags && ''{1}'')::int + (tags && ''{2}'')::int AS m, count(*) FROM lcs WHERE n = 1000 GROUP BY 1')
+) v(q);
+                                                  q                                                   |      lcs_check      
+------------------------------------------------------------------------------------------------------+---------------------
+ SELECT tier, count(*) FROM lcs_tiered GROUP BY tier                                                  | 2025 cells, 3 rows
+ SELECT score, count(*) FROM lcs_scored GROUP BY score                                                | 2025 cells, 66 rows
+ SELECT count(*) FROM lcs_tiered WHERE tier = 'high'                                                  | 2025 cells, 1 rows
+ SELECT r, tier, count(*) FROM lcs_tiered GROUP BY r, tier                                            | 2025 cells, 15 rows
+ SELECT tier, count(*) FROM lcs_tiered WHERE n < 30 GROUP BY tier                                     | 2025 cells, 3 rows
+ SELECT (tags && '{1}')::int + (tags && '{2}')::int + (tags && '{41}')::int AS m, count(*) FROM lcs G | 5 cells, 4 rows
+ SELECT count(*) FROM lcs WHERE (tags && '{1}')::int + (tags && '{2}')::int + (tags @> '{41}')::int + | 6 cells, 1 rows
+ SELECT count(*) FROM lcs WHERE (labels && '{l1}')::int + (labels && '{l2}')::int + (labels @> '{l3,l | 5 cells, 1 rows
+ SELECT (doc ? 'k1')::int + (doc ? 'k2')::int + (doc ?& '{k3,k4}')::int + (doc @> '{"k5": 1}')::int A | 6 cells, 4 rows
+ SELECT (w @@ 'a1'::tsquery)::int + (w @@ 'b2'::tsquery)::int + (w @@ 'a3 | b0'::tsquery)::int AS m,  | 5 cells, 4 rows
+ SELECT (tags && '{1,2}')::int + (labels && '{l1}')::int + (doc ? 'k1')::int + (w @@ 'a1'::tsquery):: | 135 cells, 7 rows
+ SELECT (tags && '{}')::int + (tags && '{3}')::int AS m, count(*) FROM lcs GROUP BY 1                 | 3 cells, 3 rows
+ SELECT CASE WHEN tags && '{}' THEN 5 ELSE 2 END + CASE WHEN tags && '{3}' THEN 1 ELSE 0 END AS m, co | 3 cells, 2 rows
+ SELECT (tags && '{1}')::int + (tags && '{1}')::int AS m, (tags && '{2}')::int + (labels && '{l2}'):: | 72 cells, 18 rows
+ SELECT CASE WHEN tags && '{1}' THEN 5000000000 ELSE 0::int8 END + CASE WHEN doc ? 'k1' THEN 1::int8  | 9 cells, 4 rows
+ SELECT CASE WHEN tags && '{1}' THEN 3::int2 ELSE 0::int2 END + CASE WHEN tags && '{2}' THEN 4::int2  | 4 cells, 3 rows
+ SELECT CASE WHEN tags && '{1}' THEN 30000::int2 ELSE 0::int2 END + CASE WHEN labels && '{zz}' THEN 3 | 9 cells, 2 rows
+ SELECT (tags && '{1}')::int + (tags && '{2}')::int AS m, count(*) FROM lcs WHERE n = 1000 GROUP BY 1 | 4 cells, 0 rows
+(18 rows)
+
+-- ---------- 3. numeric sums ----------
+-- Weights of several display scales: core's `+` gives the sum the largest
+-- of its operands', so 1.50 + 0 is 1.50 and 0 + 0 is 0; the text compared
+-- shows any difference.  A CASE of numerics, and a numeric over an int sum.
+SELECT left(q, 100) AS q, lcs_check(q) FROM (VALUES
+	('SELECT CASE WHEN tags && ''{1}'' THEN 1.50 ELSE 0 END + CASE WHEN tags && ''{2}'' THEN 2 ELSE 0 END + CASE WHEN doc ? ''k1'' THEN 0.125 ELSE 0 END AS m, count(*) FROM lcs GROUP BY 1'),
+	('SELECT CASE WHEN tags && ''{1}'' THEN 1.5 ELSE 0.0 END + CASE WHEN tags && ''{2}'' THEN -2 ELSE 0.0 END + 0.25 AS m, count(*) FROM lcs GROUP BY 1'),
+	('SELECT count(*) FROM lcs WHERE CASE WHEN tags && ''{1,2}'' THEN 0.7 ELSE 0 END + CASE WHEN labels && ''{l1}'' THEN 0.4 ELSE 0 END + CASE WHEN w @@ ''b2''::tsquery THEN 0.35 ELSE 0 END > 0.75'),
+	('SELECT round(0.6 * ((tags && ''{1}'')::int + (tags && ''{2}'')::int + (tags && ''{41}'')::int)) AS m, count(*) FROM lcs GROUP BY 1'),
+	-- w0s of different scales: not a sum, the terms leaves
+	('SELECT CASE WHEN tags && ''{1}'' THEN 1 ELSE 0.0 END + CASE WHEN tags && ''{2}'' THEN 1 ELSE 0 END AS m, count(*) FROM lcs GROUP BY 1')
+) v(q);
+                                                  q                                                   |    lcs_check     
+------------------------------------------------------------------------------------------------------+------------------
+ SELECT CASE WHEN tags && '{1}' THEN 1.50 ELSE 0 END + CASE WHEN tags && '{2}' THEN 2 ELSE 0 END + CA | 15 cells, 8 rows
+ SELECT CASE WHEN tags && '{1}' THEN 1.5 ELSE 0.0 END + CASE WHEN tags && '{2}' THEN -2 ELSE 0.0 END  | 5 cells, 4 rows
+ SELECT count(*) FROM lcs WHERE CASE WHEN tags && '{1,2}' THEN 0.7 ELSE 0 END + CASE WHEN labels && ' | 27 cells, 1 rows
+ SELECT round(0.6 * ((tags && '{1}')::int + (tags && '{2}')::int + (tags && '{41}')::int)) AS m, coun | 5 cells, 3 rows
+ SELECT CASE WHEN tags && '{1}' THEN 1 ELSE 0.0 END + CASE WHEN tags && '{2}' THEN 1 ELSE 0 END AS m, | 5 cells, 3 rows
+(5 rows)
+
+-- ---------- 4. many terms ----------
+-- Seventy terms of one key each (more keys than a mask holds), a hundred,
+-- and terms of several keys beside them, whose trees are over a mask.
+SELECT 'seventy', lcs_check('SELECT ' || lcs_terms(70) || ' AS m, count(*) FROM lcs GROUP BY 1');
+ ?column? |    lcs_check     
+----------+------------------
+ seventy  | 72 cells, 5 rows
+(1 row)
+
+SELECT 'a hundred, at least 2', lcs_check('SELECT count(*) FROM lcs WHERE ' || lcs_terms(100) || ' >= 2');
+       ?column?        |     lcs_check     
+-----------------------+-------------------
+ a hundred, at least 2 | 102 cells, 1 rows
+(1 row)
+
+SELECT 'with trees', lcs_check('SELECT ' || lcs_terms(60, 20) || ' + (tags @> ''{1,41}'')::int + (tags && ''{2,3,4}'')::int + 3 * 0 AS m, count(*) FROM lcs GROUP BY 1');
+  ?column?  |    lcs_check     
+------------+------------------
+ with trees | 64 cells, 5 rows
+(1 row)
+
+SELECT 'by r', lcs_check('SELECT r, ' || lcs_terms(70) || ' AS m, count(*) FROM lcs WHERE n < 60 GROUP BY 1, 2');
+ ?column? |     lcs_check     
+----------+-------------------
+ by r     | 72 cells, 25 rows
+(1 row)
+
+-- Weights of twelve powers of two: 4,097 outcomes, of which a row of three
+-- tags reaches few.  The bound on a sum's plan is the cells the rows can
+-- fill, not the product, so it is taken under a bound of 1,000 cells - the
+-- same twelve tests as booleans, 2^12 bit patterns, are not - and declined
+-- under one of 100.
+CREATE TEMP VIEW lcs_pow2 AS
+SELECT format('SELECT %s AS m, count(*) FROM lcs GROUP BY 1',
+			  string_agg(format('CASE WHEN tags && ''{%s}'' THEN %s ELSE 0 END', i, 1 << i), ' + ')) AS sumq,
+	   format('SELECT %s, count(*) FROM lcs GROUP BY %s',
+			  string_agg(format('tags && ''{%s}''', i), ', '),
+			  string_agg(i::text, ', ')) AS boolq
+  FROM generate_series(1, 12) i;
+SET pg_lion.count_cells_max = 1000;
+SELECT 'powers of two, bound 1000', lcs_check(sumq), lcs_check(boolq) FROM lcs_pow2;
+         ?column?          |      lcs_check      |     lcs_check      
+---------------------------+---------------------+--------------------
+ powers of two, bound 1000 | 4097 cells, 58 rows | not cells, 59 rows
+(1 row)
+
+SET pg_lion.count_cells_max = 100;
+SELECT 'powers of two, bound 100', lcs_check(sumq) FROM lcs_pow2;
+         ?column?         |     lcs_check      
+--------------------------+--------------------
+ powers of two, bound 100 | not cells, 58 rows
+(1 row)
+
+RESET pg_lion.count_cells_max;
+DROP VIEW lcs_pow2;
+-- ---------- 5. beside an anti join over a small inner side ----------
+-- the rows found taken from their cells, each one's sum evaluated on it
+CREATE INDEX lcs_id ON lcs (id);
+CREATE INDEX lcs_nb ON lcs (n);
+CREATE TABLE lcs_skip (a int);
+INSERT INTO lcs_skip SELECT i * 523 FROM generate_series(1, 30) i;
+INSERT INTO lcs_skip VALUES (7), (7), (11), (97), (40001), (NULL);
+VACUUM (ANALYZE) lcs, lcs_skip;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SELECT left(q, 100) AS q, lcs_check(q) FROM (VALUES
+	('SELECT tier, count(*) FROM lcs_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcs_skip s WHERE s.a = t.id) GROUP BY tier'),
+	('SELECT score, count(*) FROM lcs_scored t WHERE NOT EXISTS (SELECT 1 FROM lcs_skip s WHERE s.a = t.n) GROUP BY score'),
+	('SELECT count(*) FROM lcs c WHERE (tags && ''{1}'')::int + (tags && ''{2}'')::int + (doc ? ''k1'')::int >= 1 AND NOT EXISTS (SELECT 1 FROM lcs_skip s WHERE s.a = c.n)'),
+	('SELECT CASE WHEN tags && ''{1}'' THEN 1.50 ELSE 0 END + CASE WHEN doc ? ''k1'' THEN 0.125 ELSE 0 END AS m, count(*) FROM lcs c WHERE NOT EXISTS (SELECT 1 FROM lcs_skip s WHERE s.a = c.n) GROUP BY 1'),
+	('SELECT r, tier, count(*) FROM lcs_tiered t LEFT JOIN lcs_skip s ON s.a = t.n WHERE s.a IS NULL GROUP BY r, tier'),
+	('SELECT ' || lcs_terms(70) || ' AS m, count(*) FROM lcs c WHERE NOT EXISTS (SELECT 1 FROM lcs_skip s WHERE s.a = c.n) GROUP BY 1')
+) v(q);
+                                                  q                                                   |      lcs_check      
+------------------------------------------------------------------------------------------------------+---------------------
+ SELECT tier, count(*) FROM lcs_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcs_skip s WHERE s.a = t.id) | 2025 cells, 3 rows
+ SELECT score, count(*) FROM lcs_scored t WHERE NOT EXISTS (SELECT 1 FROM lcs_skip s WHERE s.a = t.n) | 2025 cells, 66 rows
+ SELECT count(*) FROM lcs c WHERE (tags && '{1}')::int + (tags && '{2}')::int + (doc ? 'k1')::int >=  | 12 cells, 1 rows
+ SELECT CASE WHEN tags && '{1}' THEN 1.50 ELSE 0 END + CASE WHEN doc ? 'k1' THEN 0.125 ELSE 0 END AS  | 9 cells, 4 rows
+ SELECT r, tier, count(*) FROM lcs_tiered t LEFT JOIN lcs_skip s ON s.a = t.n WHERE s.a IS NULL GROUP | 2025 cells, 15 rows
+ SELECT (tags && '{0}')::int + (tags && '{1}')::int + (tags && '{2}')::int + (tags && '{3}')::int + ( | 72 cells, 5 rows
+(6 rows)
+
+-- ... a join clause that reads the sum, from the cell's value
+SELECT lcs_check('SELECT (tags && ''{1}'')::int + (tags && ''{2}'')::int + (tags && ''{41}'')::int AS m, count(*) FROM lcs c WHERE NOT EXISTS (SELECT 1 FROM lcs_skip s WHERE s.a = c.n AND (c.tags && ''{1}'')::int + (c.tags && ''{2}'')::int + (c.tags && ''{41}'')::int < s.a % 3) GROUP BY 1');
+    lcs_check    
+-----------------
+ 5 cells, 4 rows
+(1 row)
+
+SELECT lcs_check('SELECT CASE WHEN tags && ''{1}'' THEN 1.50 ELSE 0 END + CASE WHEN doc ? ''k1'' THEN 0.125 ELSE 0 END AS m, count(*) FROM lcs c WHERE NOT EXISTS (SELECT 1 FROM lcs_skip s WHERE s.a = c.n AND CASE WHEN c.tags && ''{1}'' THEN 1.50 ELSE 0 END + CASE WHEN c.doc ? ''k1'' THEN 0.125 ELSE 0 END > s.a % 2) GROUP BY 1');
+    lcs_check    
+-----------------
+ 9 cells, 4 rows
+(1 row)
+
+-- ... and rescanned, for each outer row: the labels located again
+SELECT lcs_check('SELECT x, t.* FROM (VALUES (30), (60), (30)) v(x), LATERAL (SELECT (c.tags && ''{1}'')::int + (c.doc ? ''k1'')::int + (c.w @@ ''b2''::tsquery)::int AS m, count(*) FROM lcs c WHERE c.n < x AND NOT EXISTS (SELECT 1 FROM lcs_skip s WHERE s.a = c.n) GROUP BY 1) t');
+     lcs_check     
+-------------------
+ 27 cells, 15 rows
+(1 row)
+
+-- ... and beside a GROUP BY column, which drives
+SELECT lcs_check('SELECT n, (tags && ''{1}'')::int + (tags && ''{2}'')::int + (doc ? ''k1'')::int AS m, count(*) FROM lcs c WHERE NOT EXISTS (SELECT 1 FROM lcs_skip s WHERE s.a = c.id) GROUP BY 1, 2');
+     lcs_check      
+--------------------
+ 12 cells, 410 rows
+(1 row)
+
+-- ---------- 6. the rows changed ----------
+UPDATE lcs SET tags = '{1,2,41}' WHERE id IN (523, 1046, 1569);
+UPDATE lcs SET doc = NULL, labels = '{l1}' WHERE n = 7 AND id % 3 = 0;
+DELETE FROM lcs WHERE n = 11 AND id % 5 = 0;
+SELECT left(q, 100) AS q, lcs_check(q) FROM (VALUES
+	('SELECT tier, count(*) FROM lcs_tiered GROUP BY tier'),
+	('SELECT score, count(*) FROM lcs_scored t WHERE NOT EXISTS (SELECT 1 FROM lcs_skip s WHERE s.a = t.n) GROUP BY score')
+) v(q);
+                                                  q                                                   |                  lcs_check                   
+------------------------------------------------------------------------------------------------------+----------------------------------------------
+ SELECT tier, count(*) FROM lcs_tiered GROUP BY tier                                                  | 2025 cells, 3 rows, rows tested in the heap
+ SELECT score, count(*) FROM lcs_scored t WHERE NOT EXISTS (SELECT 1 FROM lcs_skip s WHERE s.a = t.n) | 2025 cells, 66 rows, rows tested in the heap
+(2 rows)
+
+VACUUM lcs;
+-- ---------- 7. in parallel ----------
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET pg_lion.parallel_range_keys = 1;
+SELECT left(q, 100) AS q, lcs_check(q) FROM (VALUES
+	('SELECT tier, count(*) FROM lcs_tiered GROUP BY tier'),
+	('SELECT r, score, count(*) FROM lcs_scored GROUP BY r, score'),
+	('SELECT ' || lcs_terms(70) || ' AS m, count(*) FROM lcs GROUP BY 1'),
+	('SELECT score, count(*) FROM lcs_scored t WHERE NOT EXISTS (SELECT 1 FROM lcs_skip s WHERE s.a = t.n) GROUP BY score')
+) v(q);
+                                                  q                                                   |           lcs_check           
+------------------------------------------------------------------------------------------------------+-------------------------------
+ SELECT tier, count(*) FROM lcs_tiered GROUP BY tier                                                  | parallel 2025 cells, 3 rows
+ SELECT r, score, count(*) FROM lcs_scored GROUP BY r, score                                          | parallel 2025 cells, 302 rows
+ SELECT (tags && '{0}')::int + (tags && '{1}')::int + (tags && '{2}')::int + (tags && '{3}')::int + ( | parallel 72 cells, 5 rows
+ SELECT score, count(*) FROM lcs_scored t WHERE NOT EXISTS (SELECT 1 FROM lcs_skip s WHERE s.a = t.n) | 2025 cells, 66 rows
+(4 rows)
+
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET pg_lion.parallel_range_keys;
+SET max_parallel_workers_per_gather = 0;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+DROP VIEW lcs_tiered;
+DROP VIEW lcs_scored;
+DROP TABLE lcs, lcs_skip;
+DROP FUNCTION lcs_terms(int, int);
+DROP FUNCTION lcs_check(text);

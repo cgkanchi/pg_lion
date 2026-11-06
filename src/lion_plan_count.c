@@ -5920,6 +5920,9 @@ lion_cells_candidate_walker(Node *node, void *context)
 	if (IsA(node, CaseExpr) || IsA(node, MinMaxExpr) ||
 		IsA(node, CoalesceExpr))
 		return true;
+	/* `leaf::int4`, a term of a weighted sum (DESIGN.md §10) */
+	if (IsA(node, FuncExpr) && ((FuncExpr *) node)->funcid == F_INT4_BOOL)
+		return true;
 	return expression_tree_walker(node, lion_cells_candidate_walker, context);
 }
 

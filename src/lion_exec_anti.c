@@ -212,6 +212,9 @@ lion_anti_cells_begin(LionAntiState *as, CustomScan *cscan,
 		palloc0(sizeof(ExprState *) * Max(as->npred, 1));
 	as->predpos = (int *) palloc0(sizeof(int) * Max(as->npred, 1));
 	as->predtruth = (uint8 *) palloc0(sizeof(uint8) * Max(as->npred, 1));
+	as->predsum = (bool *) palloc0(sizeof(bool) * Max(as->npred, 1));
+	as->predlen = (int16 *) palloc0(sizeof(int16) * Max(as->npred, 1));
+	as->predbyval = (bool *) palloc0(sizeof(bool) * Max(as->npred, 1));
 	foreach(lc, cscan->custom_scan_tlist)
 	{
 		TargetEntry *tle = (TargetEntry *) lfirst(lc);
@@ -224,6 +227,16 @@ lion_anti_cells_begin(LionAntiState *as, CustomScan *cscan,
 				elog(ERROR, "LionCount: cells predicate %d in the scan twice", p);
 			as->predstate[p] = ExecInitExpr(tle->expr, NULL);
 			as->predpos[p] = i;
+			if (priv->cellpred[p].kind == LION_CELLPRED_SUM)
+			{
+				as->predsum[p] = true;
+				get_typlenbyval(exprType((Node *) tle->expr),
+								&as->predlen[p], &as->predbyval[p]);
+				if (!as->predbyval[p] && as->sumcxt == NULL)
+					as->sumcxt = AllocSetContextCreate(CurrentMemoryContext,
+													   "LionCount anti join weighted sums",
+													   ALLOCSET_SMALL_SIZES);
+			}
 		}
 		i++;
 	}
@@ -1309,7 +1322,7 @@ lion_anti_subtract(LionCountScanState *st)
 
 		if (!as->predsread)
 			lion_anti_cells_truths(as);
-		code = lion_cells_code_of(st->cells, as->predtruth);
+		code = lion_cells_code_of(st->cells, as->predtruth, as->heapslot);
 
 		if (st->shared != NULL)
 			lion_anti_ranged_put(as,
@@ -1357,13 +1370,35 @@ lion_anti_cells_truths(LionAntiState *as)
 	int			p;
 
 	ResetExprContext(econtext);
+	if (as->sumcxt != NULL)
+		MemoryContextReset(as->sumcxt);
 	econtext->ecxt_scantuple = as->heapslot;
 	for (p = 0; p < as->npred; p++)
 	{
 		bool		isnull;
 		Datum		d = ExecEvalExprSwitchContext(as->predstate[p], econtext,
 												  &isnull);
-		bool		b = !isnull && DatumGetBool(d);
+		bool		b;
+
+		/*
+		 * a weighted sum's value, kept past the context's reset for the
+		 * clauses that read it; its cell is its column's (lion_cells_code_of())
+		 */
+		if (as->predsum[p])
+		{
+			if (!isnull && !as->predbyval[p])
+			{
+				MemoryContext oldcxt = MemoryContextSwitchTo(as->sumcxt);
+
+				d = datumCopy(d, false, as->predlen[p]);
+				MemoryContextSwitchTo(oldcxt);
+			}
+			es->tts_values[as->predpos[p]] = d;
+			es->tts_isnull[as->predpos[p]] = isnull;
+			as->predtruth[p] = LION_TRUTH_NULL;
+			continue;
+		}
+		b = !isnull && DatumGetBool(d);
 
 		as->predtruth[p] = isnull ? LION_TRUTH_NULL :
 			(b ? LION_TRUTH_TRUE : LION_TRUTH_FALSE);

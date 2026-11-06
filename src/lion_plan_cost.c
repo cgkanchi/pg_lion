@@ -6329,7 +6329,12 @@ lion_cost_cells_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 
 		if (d == cp->drv)
 			continue;
-		if (pv->kind == LION_CELLDIM_MULTI)
+		if (pv->kind == LION_CELLDIM_SUM)
+		{
+			sel = dp->sumsel;
+			n = dp->sumkeys;
+		}
+		else if (pv->kind == LION_CELLDIM_MULTI)
 		{
 			for (i = 0; i < pv->nbit; i++)
 			{
@@ -6358,12 +6363,18 @@ lion_cost_cells_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 		perkey = rows / nkeys;
 		sets = n * (1.0 - exp(-perkey / n));
 		labelkey += perkey * LION_DECODE_MEMBER_COST *
-			((pv->kind == LION_CELLDIM_MULTI) ? 2.0 : 1.0) +
+			((pv->kind != LION_CELLDIM_SCALAR) ? 2.0 : 1.0) +
 			sets * (LION_DECODE_CONTAINER_COST +
 					LION_PROBE_COST * (1.0 - keyfrac));
+		/*
+		 * ... the pages of the column's sets they are, its share of a
+		 * multicolumn index's (§24): not the whole index's by rows, which
+		 * charged each column of a ten-column index for all ten
+		 */
 		if (dp->idx != NULL)
-			labelpages += (double) dp->idx->pages *
-				Min(rows / Max(lion_index_rows(root, rel, dp->idx), 1.0), 1.0) *
+			labelpages += lion_column_set_pages(root, rel, dp->idx, dp->col,
+												rows,
+												n * Min(nkeys, rows / n)) *
 				keyfrac * lion_index_page_cost(root, (double) dp->idx->pages,
 											   seq_page_cost);
 	}

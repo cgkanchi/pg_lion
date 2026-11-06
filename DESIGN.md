@@ -3956,7 +3956,8 @@ the values a scalar dimension's driver reads.
 
 **The bound.** A cell is an outcome of every dimension, so the plan has at most the product of the
 dimensions' outcomes - the mixed radix the tally codes a cell in (§34) - and the planner declines
-more than `pg_lion.count_cells_max`, 2^27 = 134,217,728 by default. The product counts each column
+more than `pg_lion.count_cells_max`, 2^27 = 134,217,728 by default (with a weighted sum, more
+cells with rows: "Weighted sums" below). The product counts each column
 once whatever its predicates: the tier measured below - fifteen values of one column, eight
 overlaps of an array column and three more columns, two of them NOT NULL - is 2 x 17 x 257 x 3 x 2 =
 52,428 cells at most, and 7,000 to 13,000 with rows. The walk's time follows the cells with rows,
@@ -4168,6 +4169,103 @@ not: a row found that the WHERE rejects clears nothing, and `Rows Subtracted` co
 cleared. Exact because the walk counts a row at its root's TID once, and of a HOT chain the snapshot
 sees one member at most - the one the B-tree returned. In parallel every participant makes the sort
 whole, each range clearing its own rows.
+
+**Weighted sums** (2026-11-06). A score over tags, a document's words or a jsonb's keys - `CASE
+WHEN tags && '{a}' THEN 5 ELSE 0 END + CASE WHEN tags && '{b}' THEN 3 ELSE 0 END + ...` - and "at
+least k of" - `(tags && '{a}')::int + (labels @> '{b,c}')::int + (doc ? 'k')::int >= 2` - make each
+leaf a bit of its column's dimension above, `2^bits + 1` outcomes, at most ten leaves a column: a
+score of twenty tags declined, and one of ten made a thousand outcomes of what is a few dozen
+values. Such a sum is one predicate instead (`cells_sum_chain()`, lion_plan_cells.c): a tree of one
+`+` - int2, int4, int8 or numeric - whose operands are TERMS, `CASE WHEN leaf THEN w1 ELSE w0 END`
+with constant weights or `leaf::int4` (1 or 0, NULL where the column is), each leaf a multi-key one
+as above (a query that selects no row is a term never true), and constants; the walk meets the
+tree's top first, so the largest such tree is taken, and an operand of any other kind leaves the
+tree to be walked as before (`0.6 * (<sum>)` takes the sum inside; `<sum> + <scalar CASE>` takes
+the sum and the CASE's predicates apart). The sum may test several columns: each column's terms are
+a SUM dimension of their own (`LION_CELLDIM_SUM`), its outcomes the values its part of the sum may
+take, so the cells grow with the values, not the terms - seventy terms of `(tags && '{v}')::int`
+are 71 outcomes and NULL's. Its value in a cell is the constants' plus each of its dimensions'
+outcome's value, a `LION_CELLPRED_SUM` column of the sum's type (`lion_cells_sum_value()`), which
+setrefs.c matches as it matches a predicate - the sum is a subexpression of the query as written.
+
+*Exact.* The weights are integers in the sum's unit, a power of ten the largest display scale among
+its constants, and the sum is taken only where every prefix core adds stays within its type -
+every term's larger weight and every constant, in magnitude, summed within int2's, int4's or a
+quarter of int8's range - so that core raises no overflow the cells would not. A numeric's display
+scale is core's: `+` gives the larger of its operands', so `1.50 + 0` is `1.50` and `0 + 0` is `0`;
+each outcome is a value and the scale the constants picked give it, which needs every term's w0 of
+one scale in a column (else no sum). A term's leaf is NULL only in a NULL row - none of these
+operators returns NULL of a non-NULL value, an array's NULL elements included - so NULL's outcome
+is every term false, or NULL where a term is a cast.
+
+*Outcomes* (`cells_sum_dim()`). The values are found term by term, each step merging the values so
+far with w0 added and with w1 added, both lists staying in order: the values and scales a column's
+part may reach, at most `LION_CELLS_MAX_SUMOUTS` (4,096), each with its share of the rows - each
+leaf's selectivity taken as independent of the others - which the cells-with-rows estimate takes as
+a multi-key column's bit patterns. Outcome 0 is every term false, so a row of no key - an empty
+array, a document of none of the keys - is outcome 0 without a label, as before; NULL's is last.
+The leaves are read from one multi-key index on the column, at most `LION_CELLS_MAX_SUMKEYS`
+(1,024) keys and 1,024 terms; a SUM dimension never drives.
+
+*The bound* with a sum is on the cells the table's rows can fill (`lion_cells_nonempty()` of every
+row), not on the product: a sum's outcomes are every value its part may take, and twelve terms of
+weights 1, 2, 4, ... are 4,096 outcomes of which a row of three tags reaches few - a score of
+twenty and six overlaps over two array columns beside four scalar CASEs is a product past 2^27, and
+was declined, though a few thousand cells hold rows. The product stays within
+`LION_CELLS_MAX_SUMCODES` (2^52), the codes a tally takes with a GROUP BY column's batch. A plan
+with no sum keeps the product bound.
+
+*The price* counts a SUM dimension's labels as a multi-key column's: each key's set and NULL's. A
+label's pages are the column's share of the index (`lion_column_set_pages()`, §24), as every
+label's now are: the whole index's pages by the label's rows charged each column of a ten-column
+index for all ten, and a sum of twelve overlaps lost to the residual it beat 40 to 1.
+
+*The walk.* Its labels are its keys and its NULL entry. A term whose query is one key - `&&` or
+`@>` of one element, `?` of one key, one word - adds its increment where the key's set has the
+row: each label adds its key's terms' increments, their count and the largest scale of their w1s
+into the row's accumulators, so any number of such terms costs a store per member of each key's
+set. A term of several keys - `tags && '{1,2,3}'`, `doc ?& '{a,b}'`, `w @@ 'a1 & b2'` - is a tree
+over bits of a mask, as a multi-key dimension's leaves are, its keys at most 63 among them. After
+the dimension's last label each row touched gets its outcome (`lion_cells_sum_outcome()`): every
+w0, plus the increments, the tree terms evaluated, the value found among the outcomes by a binary
+search. *Beside the anti join* each row found gets its outcome from its own column's value, each
+term's operator called on it as core would (`lion_cells_code_of()`); a join clause that reads the
+sum reads the value the row's expression gives.
+
+*The plan* (shape 34, magic 0x52424922): a seventh member for each dimension of `LION_PRIV_CELLS`,
+a SUM dimension's own part - its predicate, whether NULL's value is NULL, its terms' operators,
+collations, queries, increments and w1 scales, every w0's sum and scale, and each outcome's value
+and scale (`lion_priv_encode_cellsum()`) - and, for the sum's predicate, its type, unit, and its
+constants' sum and scale. EXPLAIN lists the sum's columns among `Cell Columns` and the sum among
+`Cell Predicates`. LionProbeJoin's dimensions take no sums (`lion_cells_analyze(..., true)`).
+
+*Measured* on PostgreSQL 18, warm, on a synthetic table of 2 million rows - two text arrays of
+tokens, a Zipf-like one of 2 to 30 elements and one of 1 to 12, and scalar columns - a count under a
+tier over a score of N overlaps of the first array, six of the second, and four scalar CASEs
+(core's plan reads every row the WHERE's flags and one overlap select, about 420,000):
+
+| score | cells | core | |
+|---|---|---|---|
+| 6 + 6 overlaps | 104 ms | 3,882 ms | 37x |
+| 12 + 6 | 134 ms | 5,145 ms | 38x |
+| 12 + 6, top 10 groups | 393 ms | 5,106 ms | 13x |
+| 20 + 6 | 176 ms | 7,227 ms | 41x |
+| 40 + 6 | 175 ms | 11,181 ms | 64x |
+| 40 + 6, top 10 groups, LEFT JOIN anti | 406 ms | 11,341 ms | 28x |
+
+Before sums, twelve or more overlaps of a column were past the ten leaves a multi-key dimension
+takes, and those counts ran core's plan or the residual (4.9 s at twelve).
+
+*Tests.* `test/sql/countsums.sql`, against a sequential scan on 40,000 synthetic rows of int and
+text arrays with NULLs, empty arrays and NULL elements, a jsonb with NULLs and bare scalars, and a
+text search vector: a tier over a score of every kind of leaf and of weights - ELSE not zero, a
+negative one, casts, constants - its score, the WHERE form, beside a scalar column; "at least k"
+over each column kind; one sum over four columns; queries that select no row; int8 and int2 sums,
+and one an int2 could overflow (no sum); numeric weights of several scales, and w0s of two (no
+sum); seventy and a hundred one-key terms, and trees beside sixty; beside the anti join and its
+LEFT JOIN form, a join clause reading the sum, a rescan per outer row, a GROUP BY column; rows
+changed before VACUUM; in parallel; and the bound, a sum of 4,096 outcomes taken under a
+bound of 1,000 cells where the same tests as booleans are not.
 
 **Ranges** (not done). The analysis takes a range of a scalar column for LionProbeJoin (§46,
 "Ranges": the column's values in the index's order, the gaps between them and NULL its pieces,
