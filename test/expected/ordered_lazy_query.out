@@ -1,0 +1,240 @@
+-- The lazy set of a multi-key column's query (DESIGN.md §30.4, "The set,
+-- lazily"): a tsquery of plain lexemes under AND and OR, a prefix expanded
+-- to its lexemes, an array's or a jsonb document's containment - a tree of
+-- whole key sets, exactly the rows - is sought a container key at a time as
+-- the walk meets them, as an equality's sets are.  A query the key sets
+-- cannot answer exactly - a phrase, a weight, a NOT - is built, as before.
+-- EXPLAIN ANALYZE says which; every answer is compared, in order, with the
+-- same query with the node off.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+-- k: a permutation of the ids with a btree, in no heap order
+CREATE TABLE olq (id int PRIMARY KEY, k int NOT NULL, tsv tsvector,
+				  tags text[], doc jsonb, pad text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO olq
+SELECT i, (i::bigint * 7919 % 100003)::int,
+	   CASE WHEN i % 101 = 0 THEN NULL
+			ELSE setweight(to_tsvector('simple', 'w' || (i % 10)), 'A') ||
+				 to_tsvector('simple', 'x' || (i % 53) || ' y' || (i % 7)) END,
+	   ARRAY['t' || (i % 10), 'u' || (i % 37)],
+	   jsonb_build_object('a', i % 10, 'b', i % 13),
+	   repeat('p', 40)
+  FROM generate_series(1, 100000) i;
+CREATE INDEX olq_k ON olq (k, id);
+CREATE INDEX olq_l ON olq USING lion (tsv, tags, doc jsonb_contains_ops);
+-- statistics from every row, so the plans do not turn on ANALYZE's sample
+SET default_statistics_target = 1000;
+VACUUM (FREEZE, ANALYZE) olq;
+RESET default_statistics_target;
+-- the plan's node and its set, for q, which must be a LionOrdered plan; then
+-- q's rows in order against the same query with the node off
+CREATE FUNCTION olq_run(q text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	used bool := false;
+	r record;
+	a text := '';
+	b text := '';
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionOrdered\)' THEN
+			used := true;
+		ELSIF ln ~ 'Lion Set:' THEN
+			RETURN NEXT btrim(regexp_replace(ln, '[0-9]+ keys probed', 'N keys probed'));
+		END IF;
+	END LOOP;
+	IF NOT used THEN
+		RETURN NEXT 'not LionOrdered';
+	END IF;
+	FOR r IN EXECUTE q LOOP
+		a := md5(a || r::text);
+	END LOOP;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	FOR r IN EXECUTE q LOOP
+		b := md5(b || r::text);
+	END LOOP;
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
+	RETURN NEXT CASE WHEN a = b THEN 'same rows' ELSE 'MISMATCH' END;
+END $$;
+-- 1. Lazy, the walk in the primary key's order, which is the heap's: an
+--    AND of lexemes, an OR, both with an AND beside them, a
+--    prefix expanded to its lexemes, `@@ ANY` of two queries
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 & y3'::tsquery ORDER BY id LIMIT 20$$);
+               olq_run                
+--------------------------------------
+ Lion Set: lazy, N keys probed, exact
+ same rows
+(2 rows)
+
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 | x6'::tsquery ORDER BY id LIMIT 20$$);
+               olq_run                
+--------------------------------------
+ Lion Set: lazy, N keys probed, exact
+ same rows
+(2 rows)
+
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ '(x5 | x6) & (y1 | y2)'::tsquery ORDER BY id LIMIT 20$$);
+               olq_run                
+--------------------------------------
+ Lion Set: lazy, N keys probed, exact
+ same rows
+(2 rows)
+
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5:*'::tsquery ORDER BY id LIMIT 20$$);
+               olq_run                
+--------------------------------------
+ Lion Set: lazy, N keys probed, exact
+ same rows
+(2 rows)
+
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ ANY (ARRAY['x5 & y3', 'x6 & y4']::tsquery[]) ORDER BY id LIMIT 20$$);
+               olq_run                
+--------------------------------------
+ Lion Set: lazy, N keys probed, exact
+ same rows
+(2 rows)
+
+-- a lexeme no row has: nothing, at once
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 & nosuch'::tsquery ORDER BY id LIMIT 20$$);
+            olq_run            
+-------------------------------
+ Lion Set: 0 containers, exact
+ same rows
+(2 rows)
+
+-- the other multi-key columns: an array's containment and overlap, a jsonb
+-- document's containment, and two columns' queries ANDed
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tags @> ARRAY['t3', 'u5'] ORDER BY id LIMIT 20$$);
+               olq_run                
+--------------------------------------
+ Lion Set: lazy, N keys probed, exact
+ same rows
+(2 rows)
+
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tags && ARRAY['u5', 'u6'] ORDER BY id LIMIT 20$$);
+               olq_run                
+--------------------------------------
+ Lion Set: lazy, N keys probed, exact
+ same rows
+(2 rows)
+
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE doc @> '{"a": 3, "b": 4}' ORDER BY id LIMIT 20$$);
+               olq_run                
+--------------------------------------
+ Lion Set: lazy, N keys probed, exact
+ same rows
+(2 rows)
+
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'y3'::tsquery AND doc @> '{"b": 4}' ORDER BY id LIMIT 20$$);
+               olq_run                
+--------------------------------------
+ Lion Set: lazy, N keys probed, exact
+ same rows
+(2 rows)
+
+-- `IS NOT NULL` beside a query: the column's NULL entry taken away
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv IS NOT NULL AND tags @> ARRAY['u5'] ORDER BY id LIMIT 20$$);
+               olq_run                
+--------------------------------------
+ Lion Set: lazy, N keys probed, exact
+ same rows
+(2 rows)
+
+-- 2. Built: a phrase, a weight, a NOT - none of them a tree of whole sets
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 <-> y3'::tsquery ORDER BY id LIMIT 20$$);
+            olq_run             
+--------------------------------
+ Lion Set: 39 containers, exact
+ same rows
+(2 rows)
+
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'w3:A & x5'::tsquery ORDER BY id LIMIT 20$$);
+            olq_run             
+--------------------------------
+ Lion Set: 39 containers, exact
+ same rows
+(2 rows)
+
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 & !y3'::tsquery ORDER BY id LIMIT 20$$);
+            olq_run             
+--------------------------------
+ Lion Set: 39 containers, exact
+ same rows
+(2 rows)
+
+-- 3. A query known only at run time: a generic plan's parameter, lazy or
+--    built by its value
+PREPARE olq_p(tsquery) AS
+	SELECT id, k FROM olq WHERE tsv @@ $1 ORDER BY id LIMIT 20;
+SET plan_cache_mode = force_generic_plan;
+SELECT * FROM olq_run($$EXECUTE olq_p('x5 & y3')$$);
+               olq_run                
+--------------------------------------
+ Lion Set: lazy, N keys probed, exact
+ same rows
+(2 rows)
+
+SELECT * FROM olq_run($$EXECUTE olq_p('x5 <-> y3')$$);
+            olq_run             
+--------------------------------
+ Lion Set: 39 containers, exact
+ same rows
+(2 rows)
+
+RESET plan_cache_mode;
+DEALLOCATE olq_p;
+-- 4. A walk in k's order, which is not the heap's: the lazy set is built
+--    when its probes have cost what the build would, and the walk's answer
+--    is the same; one that goes far is built from the start
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 & y3'::tsquery ORDER BY k, id LIMIT 20$$);
+                              olq_run                               
+--------------------------------------------------------------------
+ Lion Set: 39 containers, exact, after N keys probed (probe budget)
+ same rows
+(2 rows)
+
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'y3 | y4'::tsquery ORDER BY k, id LIMIT 20000$$);
+            olq_run             
+--------------------------------
+ Lion Set: 39 containers, exact
+ same rows
+(2 rows)
+
+-- 5. With the lazy set off, built as before
+SET pg_lion.enable_lazy_set = off;
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 & y3'::tsquery ORDER BY id LIMIT 20$$);
+            olq_run             
+--------------------------------
+ Lion Set: 39 containers, exact
+ same rows
+(2 rows)
+
+RESET pg_lion.enable_lazy_set;
+-- 6. Rows the snapshot does not see: deleted after the build of the index,
+--    and a row whose tsvector changed (its old version still in the index)
+DELETE FROM olq WHERE id IN (SELECT id FROM olq WHERE tsv @@ 'x5 & y3'::tsquery ORDER BY id LIMIT 3);
+UPDATE olq SET tsv = to_tsvector('simple', 'x5 y3') WHERE id = 7;
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 & y3'::tsquery ORDER BY id LIMIT 20$$);
+               olq_run                
+--------------------------------------
+ Lion Set: lazy, N keys probed, exact
+ same rows
+(2 rows)
+
+DROP TABLE olq;
+DROP FUNCTION olq_run(text);

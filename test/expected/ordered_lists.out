@@ -403,13 +403,13 @@ SELECT * FROM ol_run($$SELECT id FROM lol
 
 SELECT * FROM ol_run($$SELECT id FROM lol
 	WHERE tags @> ARRAY['t2'] AND g IN ('g10', 'g11') ORDER BY g LIMIT 5$$);
-             ol_run             
---------------------------------
+                ol_run                
+--------------------------------------
  Index Entries Walked: 38
  Lion Keys Walked: 1
  Lion Set Hits: 5
  Heap Fetches: 5
- Lion Set: 35 containers, exact
+ Lion Set: lazy, 2 keys probed, exact
 (5 rows)
 
 SELECT ol_cmp($$SELECT id, g FROM lol

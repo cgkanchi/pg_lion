@@ -312,8 +312,8 @@ SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
 SELECT * FROM oj_run('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
 	WHERE f.grp = 3 AND f.tags @> ''{b4}'' AND d.lvl < 10 AND d.flag
 	ORDER BY f.score NULLS FIRST, f.id DESC LIMIT 30');
-                         oj_run                         
---------------------------------------------------------
+                                      oj_run                                       
+-----------------------------------------------------------------------------------
  Limit
    ->  Incremental Sort
          Sort Key: f.score NULLS FIRST, f.id DESC
@@ -330,7 +330,7 @@ SELECT * FROM oj_run('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk 
                Index Entries Walked: 3736
                Lion Set Hits: 411
                Heap Fetches: 411
-               Lion Set: 89 containers, exact
+               Lion Set: 89 containers, exact, after 19 keys probed (probe budget)
                Dimension Descents: 407
                Dimension Lion Set Hits: 48
                Dimension Heap Fetches: 48
@@ -403,8 +403,8 @@ SELECT oj('SELECT f.id, f.score, d.pk, d.tags FROM fact f JOIN dim d ON f.fk = d
 SELECT * FROM oj_run('SELECT f.id, f.score, d.pk, d.tags FROM fact f JOIN dim d ON f.fk = d.pk
 	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.tags <@ ''{t3,u5,t4}''
 	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
-                               oj_run                                
----------------------------------------------------------------------
+                                      oj_run                                       
+-----------------------------------------------------------------------------------
  Limit
    ->  Incremental Sort
          Sort Key: f.score DESC NULLS LAST, f.id
@@ -420,7 +420,7 @@ SELECT * FROM oj_run('SELECT f.id, f.score, d.pk, d.tags FROM fact f JOIN dim d 
                Index Entries Walked: 3948
                Lion Set Hits: 988
                Heap Fetches: 988
-               Lion Set: 89 containers, exact
+               Lion Set: 89 containers, exact, after 29 keys probed (probe budget)
                Dimension Descents: 970
                Dimension Lion Set Hits: 970
                Dimension Heap Fetches: 970
@@ -460,7 +460,7 @@ SELECT * FROM oj_run('SELECT f.id, f.score, f.ver, d.pk FROM fact f JOIN dim d O
                Lion Set Hits: 3300
                Heap Fetches: 3300
                Rows Removed by Filter: 2189
-               Lion Set: 89 containers, exact
+               Lion Set: 89 containers, exact, after 30 keys probed (probe budget)
                Dimension Descents: 1100
                Dimension Lion Set Hits: 98
                Dimension Heap Fetches: 98
@@ -552,7 +552,7 @@ SELECT * FROM oj_run('SELECT f.id, f.score, d.pk, x.x FROM fact f JOIN dim d ON 
                      Index Entries Walked: 2265
                      Lion Set Hits: 580
                      Heap Fetches: 580
-                     Lion Set: 89 containers, exact
+                     Lion Set: 89 containers, exact, after 29 keys probed (probe budget)
                      Dimension Descents: 569
                      Dimension Lion Set Hits: 7
                      Dimension Heap Fetches: 7
@@ -641,7 +641,7 @@ SELECT * FROM oj_run('SELECT v.l, s.* FROM (VALUES (3), (40), (40), (3)) v(l),
                      Index Entries Walked: 14388
                      Lion Set Hits: 3660
                      Heap Fetches: 3660
-                     Lion Set: 89 containers, exact
+                     Lion Set: 89 containers, exact, after 29 keys probed (probe budget)
                      Dimension Descents: 3594
                      Dimension Lion Set Hits: 40
                      Dimension Heap Fetches: 40
@@ -1113,7 +1113,7 @@ SELECT * FROM oj_run('SELECT f.score, f.fk, d.pk, d.lvl FROM fact f JOIN dim d O
                Index Entries Walked: 12837
                Lion Set Hits: 3239
                Heap Fetches: 0
-               Lion Set: 89 containers, exact
+               Lion Set: 89 containers, exact, after 29 keys probed (probe budget)
                Dimension Descents: 3195
                Dimension Lion Set Hits: 26
                Dimension Heap Fetches: 26

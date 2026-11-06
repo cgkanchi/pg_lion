@@ -532,7 +532,7 @@ SELECT * FROM os_run($$
  Lion Keys Walked: 131
  Lion Set Hits: 10
  Heap Fetches: 10
- Lion Set: 7 containers, exact
+ Lion Set: lazy, 7 keys probed, exact
 (7 rows)
 
 SET enable_sort = off;

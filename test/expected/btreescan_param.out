@@ -243,7 +243,7 @@ SELECT d.id, count(*) AS n FROM bsp_dim d JOIN bsp_fact f ON f.dim_id = d.id
  Index Entries Walked: 714
  Lion Set Hits: 135
  Heap Fetches: 0
- Lion Set: 48 containers, exact
+ Lion Set: 48 containers, exact, after 18 keys probed (probe budget)
 (9 rows)
 
 -- the switch off: core's plan
@@ -461,8 +461,8 @@ SELECT * FROM bsp_run('SELECT o.x, (SELECT count(*) FROM bsp_fact f JOIN bsp_dim
 			 WHERE f.tsv @@ ''w7 & x3''::tsquery AND f.id % 3 = o.x
 			   AND d.tags && ARRAY[''t1'', ''t3''] AND d.verified)
   FROM generate_series(0, 2) o(x)');
-                          bsp_run                          
------------------------------------------------------------
+                               bsp_run                               
+---------------------------------------------------------------------
  ->  Custom Scan (LionBtreeScan) on bsp_dim d
  Index: bsp_dim_pkey (index only)
  Index Cond: (d.id = f.dim_id)
@@ -471,7 +471,7 @@ SELECT * FROM bsp_run('SELECT o.x, (SELECT count(*) FROM bsp_fact f JOIN bsp_dim
  Index Entries Walked: 714
  Lion Set Hits: 106
  Heap Fetches: 0
- Lion Set: 48 containers, exact
+ Lion Set: 48 containers, exact, after 19 keys probed (probe budget)
 (9 rows)
 
 SELECT bsp('SELECT o.t, (SELECT count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
@@ -623,7 +623,7 @@ SELECT d.id, count(*) AS n FROM bsp_dim d JOIN bsp_fact f ON f.dim_id = d.id
  Index Entries Walked: > 0
  Lion Set Hits: > 0
  Heap Fetches: > 0
- Lion Set: 48 containers, exact
+ Lion Set: 48 containers, exact, after 18 keys probed (probe budget)
 (9 rows)
 
 COMMIT;
@@ -671,7 +671,7 @@ SELECT d.id, count(*) AS n FROM bsp_dim d JOIN bsp_fact f ON f.dim_id = d.id
  Index Entries Walked: > 0
  Lion Set Hits: > 0
  Heap Fetches: 0
- Lion Set: 48 containers, exact
+ Lion Set: 48 containers, exact, after 18 keys probed (probe budget)
 (9 rows)
 
 DROP TABLE bsp_met;

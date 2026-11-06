@@ -237,13 +237,13 @@ SELECT og_cmp($$SELECT id, k FROM ogn WHERE tags && ARRAY['t1', 's2'] ORDER BY k
 (1 row)
 
 SELECT * FROM og_run($$SELECT id FROM ogn WHERE tags && ARRAY['t1', 's2'] ORDER BY k, id LIMIT 5$$);
-                og_run                
---------------------------------------
+                og_run                 
+---------------------------------------
  ->  Custom Scan (LionOrdered) on ogn
  Index Entries Walked: 14
  Lion Set Hits: 5
  Heap Fetches: 5
- Lion Set: 72 containers, exact
+ Lion Set: lazy, 14 keys probed, exact
 (5 rows)
 
 -- 6. Two gathered leaves, ANDed.
