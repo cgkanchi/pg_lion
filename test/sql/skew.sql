@@ -21,12 +21,13 @@ SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
 
 -- lion_debug_key_skew(): what an index's meta page holds for each key
--- column, the rows counted over, the keys and the sum of the squares of
--- their rows; lion_debug_skew_rows(): plan a query and return, for each
--- column a probe was priced on, the rows a probed key meets and core's rows
--- per key
+-- column, the rows counted over, the keys, the sum of the squares of their
+-- rows and the sum of their containers; lion_debug_skew_rows(): plan a query
+-- and return, for each column a probe was priced on, the rows a probed key
+-- meets and core's rows per key
 CREATE FUNCTION lsw_key_skew(regclass, OUT col int2, OUT rows int8,
-							 OUT ndistinct int8, OUT sumsq numeric)
+							 OUT ndistinct int8, OUT sumsq numeric,
+							 OUT containers int8)
 	RETURNS SETOF record
 	AS '$libdir/pg_lion', 'lion_debug_key_skew' LANGUAGE C STRICT;
 CREATE FUNCTION lsw_skew_rows(text, OUT relid regclass, OUT attnum int2,
@@ -54,9 +55,10 @@ VACUUM ANALYZE lsw_s;
 \set lsw_probe 'SELECT count(*) FROM (VALUES (1), (2)) t(x) JOIN lsw_s s ON s.k = t.x'
 /* the meta page's figures, and the table's own */
 CREATE FUNCTION lsw_s_check() RETURNS TABLE (rows int8, ndistinct int8,
-											 sumsq numeric, exact boolean)
+											 sumsq numeric, containers int8,
+											 exact boolean)
 LANGUAGE sql AS $$
-	SELECT s.rows, s.ndistinct, s.sumsq,
+	SELECT s.rows, s.ndistinct, s.sumsq, s.containers,
 		   s.sumsq = (SELECT sum(n::numeric * n)
 						FROM (SELECT count(*) AS n FROM lsw_s GROUP BY k) g) AND
 		   s.ndistinct = (SELECT count(DISTINCT k) FROM lsw_s)
@@ -257,11 +259,9 @@ SELECT round((rows / :rows_off)::numeric) AS rows_factor,
 RESET pg_lion.enable_count_pushdown;
 RESET enable_hashjoin;
 RESET enable_mergejoin;
--- At core's rows the loop is the plan; at the rows the key meets, the
--- count, which reads no heap for the fact.
-SET pg_lion.enable_skew_estimate = off;
-SELECT lsw_plan(q) FROM lsw_q WHERE name = 'loop';
-SET pg_lion.enable_skew_estimate = on;
+-- At the rows the key meets, the count, which reads no heap for the fact.
+-- (At core's rows the two are about level: the count locates the fact
+-- filter once and reads only its key's containers of it.)
 SELECT lsw_plan(q) FROM lsw_q WHERE name = 'loop';
 DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lsw_got AS ' || (SELECT q FROM lsw_q WHERE name = 'loop'); END $$;
 
@@ -414,6 +414,54 @@ DROP FUNCTION lsw_arr_got(text);
 
 RESET random_page_cost;
 RESET effective_cache_size;
+
+-- ---------- 8. a key's containers ----------
+-- The same 200,000 rows of 2,000 keys twice: stored by key, the keys in no
+-- order (the column's correlation near zero), and spread over the heap.
+-- The build sums each column's container keys on the meta page: a key's
+-- rows stored together are in one, spread over the heap in nearly one each;
+-- the FK-side count over the first is priced at it, below the second; and a
+-- VACUUM that counts the keys again keeps their average per key.
+CREATE TABLE lsw_kd (id int PRIMARY KEY, grp int NOT NULL);
+INSERT INTO lsw_kd SELECT i, i % 50 FROM generate_series(1, 2000) i;
+CREATE TABLE lsw_kc (k int NOT NULL, t int NOT NULL, pad text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lsw_kc SELECT 1 + i % 2000, i % 7, repeat('p', 200)
+  FROM generate_series(1, 200000) i ORDER BY hashint4(1 + i % 2000), i;
+CREATE TABLE lsw_ks (LIKE lsw_kc) WITH (autovacuum_enabled = off);
+INSERT INTO lsw_ks SELECT 1 + i % 2000, i % 7, repeat('p', 200)
+  FROM generate_series(1, 200000) i ORDER BY hashint4(i);
+CREATE INDEX lsw_kc_l ON lsw_kc USING lion (k, t);
+CREATE INDEX lsw_ks_l ON lsw_ks USING lion (k, t);
+VACUUM ANALYZE lsw_kd, lsw_kc, lsw_ks;
+SELECT 'together' AS stored, col, ndistinct,
+	   round(containers::numeric / ndistinct) AS per_key
+  FROM lsw_key_skew('lsw_kc_l')
+UNION ALL
+SELECT 'spread', col, ndistinct, round(containers::numeric / ndistinct)
+  FROM lsw_key_skew('lsw_ks_l')
+ ORDER BY 1 DESC, 2;
+SELECT lsw_plan('SELECT count(*) FROM lsw_kd d JOIN lsw_kc f ON f.k = d.id WHERE d.grp = 1 AND f.t = 3') AS together,
+	   lsw_plan('SELECT count(*) FROM lsw_kd d JOIN lsw_ks f ON f.k = d.id WHERE d.grp = 1 AND f.t = 3') AS spread;
+CREATE FUNCTION lsw_top_cost(q text) RETURNS float8
+LANGUAGE plpgsql AS $$
+DECLARE
+	p json;
+BEGIN
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
+	RETURN (p->0->'Plan'->>'Total Cost')::float8;
+END $$;
+SELECT lsw_top_cost('SELECT count(*) FROM lsw_kd d JOIN lsw_kc f ON f.k = d.id WHERE d.grp = 1 AND f.t = 3') <
+	   lsw_top_cost('SELECT count(*) FROM lsw_kd d JOIN lsw_ks f ON f.k = d.id WHERE d.grp = 1 AND f.t = 3')
+	   AS together_cheaper;
+SELECT (SELECT count(*) FROM lsw_kd d JOIN lsw_kc f ON f.k = d.id WHERE d.grp = 1 AND f.t = 3) AS together,
+	   (SELECT count(*) FROM lsw_kd d JOIN lsw_ks f ON f.k = d.id WHERE d.grp = 1 AND f.t = 3) AS spread;
+DELETE FROM lsw_kc WHERE k > 1900;
+VACUUM lsw_kc;
+SELECT col, ndistinct, round(containers::numeric / ndistinct) AS per_key
+  FROM lsw_key_skew('lsw_kc_l') ORDER BY col;
+DROP TABLE lsw_kd, lsw_kc, lsw_ks;
+DROP FUNCTION lsw_top_cost(text);
 DROP TABLE lsw_fact, lsw_dim;
 DROP FUNCTION lsw_plan(text), lsw_names(json), lsw_find(json), lsw_node(text), lsw_total(text),
 	lsw_key_skew(regclass), lsw_skew_rows(text);

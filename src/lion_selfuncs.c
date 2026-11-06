@@ -5203,6 +5203,45 @@ lion_nd_index(LionNdistinctCache *cache, Oid indexoid)
 	return ent;
 }
 
+/*
+ * The containers a key of idx's column col (from 1) lies in, on average, as
+ * the meta page counted them (lion_key_containers_counted(), lion_count.h):
+ * the column's containers summed over its VALUE entries, divided by them.
+ * Only from a count taken over about the rows rel has now - within a factor
+ * of 2, as the key counts are (§33, "Stale counts") - and not for a
+ * multi-key column, whose entries are elements, nor a partial index's.
+ */
+double
+lion_key_containers_counted(PlannerInfo *root, RelOptInfo *rel,
+							IndexOptInfo *idx, AttrNumber col,
+							double *keyrows)
+{
+	LionNdistinctCache *cache;
+	LionNdistinctIndex *ent;
+	const LionMetaNdistinct *nd;
+	int			c = col - 1;
+	double		ratio;
+
+	*keyrows = 0.0;
+	if (idx == NULL || c < 0 || c >= idx->nkeycolumns ||
+		c >= LION_META_MAX_COLS || rel->tuples < 1.0)
+		return 0.0;
+	cache = lion_nd_cache_for(root);
+	if (idx->relam != cache->amoid || idx->hypothetical ||
+		idx->indpred != NIL)
+		return 0.0;
+	ent = lion_nd_index(cache, idx->indexoid);
+	nd = &ent->nd;
+	if (!ent->have || (nd->valid_cols & (((uint32) 1) << c)) == 0 ||
+		!LionMetaContsKnown(nd, c))
+		return 0.0;
+	ratio = rel->tuples / (double) nd->rows;
+	if (ratio < 0.5 || ratio > 2.0)
+		return 0.0;
+	*keyrows = (double) nd->rows / (double) nd->ndistinct[c];
+	return Max((double) nd->conts[c] / (double) nd->ndistinct[c], 1.0);
+}
+
 static LionNdistinctRow *
 lion_nd_row(LionNdistinctCache *cache, Oid relid, AttrNumber attnum)
 {

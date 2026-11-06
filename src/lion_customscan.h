@@ -4691,8 +4691,8 @@ extern Cost lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 								  List *whereclauses, List *wherekinds,
 								  List *ors, double dimrows, double found,
 								  bool exists, double rowbytes, int workers,
-								  bool *collect, bool *walk, bool force,
-								  double *reads, bool *unite);
+								  bool keysjoined, bool *collect, bool *walk,
+								  bool force, double *reads, bool *unite);
 
 /* lion_plan_fkjoin.c */
 extern bool lion_join_aggs_lookup(Oid *countfn, Oid *sumfn, Oid *mul2op,

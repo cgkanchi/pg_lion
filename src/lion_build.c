@@ -363,6 +363,8 @@ typedef struct LionBuilder
 	uint32		height;
 
 	uint32		nitems;			/* containers and segments (entry.ncontainers) */
+	uint32		nckeys;			/* the container keys among them, for §33's
+								 * conts (a segment holds several) */
 	uint64		ntids;
 
 	/*
@@ -504,7 +506,8 @@ typedef struct LionBuildState
 	int64		ndistinct;		/* entries written, for the §17 guard */
 	uint64	   *nvalues;		/* VALUE entries of each key column, */
 	uint64	   *sumsq;			/* ... the sum of the squares of their TIDs,
-								 * and */
+								 * of their container keys, */
+	uint64	   *conts;
 	uint64		rows;			/* ... the TIDs of the first scalar one's
 								 * entries: the key counts of §33 */
 	AttrNumber	rowcol;			/* that column (lion_index_row_column()) */
@@ -923,19 +926,22 @@ lion_build_level_add(LionBuildState *bs, LionBuildLevel *lv,
 }
 
 static void lion_build_colout_record(LionBuildState *bs, uint32 kind,
-									 uint32 arg, const void *data, Size len);
+									 uint32 arg, uint32 nckeys,
+									 const void *data, Size len);
 
 /*
- * One entry tuple, in directory order; a worker writing a column hands it to
- * the leader instead (see "Columns written by the workers").
+ * One entry tuple, in directory order, whose posting set spans nckeys
+ * container keys; a worker writing a column hands it to the leader instead
+ * (see "Columns written by the workers").
  */
 static void
-lion_build_add_entry(LionBuildState *bs, LionEntryTuple *entry, Size size)
+lion_build_add_entry(LionBuildState *bs, LionEntryTuple *entry, Size size,
+					 uint32 nckeys)
 {
 	if (bs->colout != NULL)
 	{
-		lion_build_colout_record(bs, LION_COLREC_ENTRY, (uint32) size, entry,
-								 size);
+		lion_build_colout_record(bs, LION_COLREC_ENTRY, (uint32) size, nckeys,
+								 entry, size);
 		return;
 	}
 
@@ -952,6 +958,7 @@ lion_build_add_entry(LionBuildState *bs, LionEntryTuple *entry, Size size)
 	{
 		bs->nvalues[entry->attno - 1]++;
 		lion_sumsq_add(&bs->sumsq[entry->attno - 1], lion_entry_ntids(entry));
+		bs->conts[entry->attno - 1] += nckeys;
 	}
 	if (entry->attno == bs->rowcol && !LionEntryIsDerived(entry))
 		bs->rows += lion_entry_ntids(entry);
@@ -1022,17 +1029,19 @@ typedef struct LionColRecord
 	uint32		kind;			/* LION_COLREC_* */
 	BlockNumber nblocks;		/* blocks the worker had handed out */
 	uint32		arg;			/* PAGE: its block; ENTRY: its size */
+	uint32		nckeys;			/* ENTRY: its container keys */
 } LionColRecord;
 
 static void
 lion_build_colout_record(LionBuildState *bs, uint32 kind, uint32 arg,
-						 const void *data, Size len)
+						 uint32 nckeys, const void *data, Size len)
 {
 	LionColRecord rec;
 
 	rec.kind = kind;
 	rec.nblocks = bs->nblocks;
 	rec.arg = arg;
+	rec.nckeys = nckeys;
 	BufFileWrite(bs->colout, &rec, sizeof(rec));
 	if (len > 0)
 		BufFileWrite(bs->colout, data, len);
@@ -1042,7 +1051,7 @@ static void
 lion_build_colout_page(LionBuildState *bs, BlockNumber blk,
 					   BulkWriteBuffer buf)
 {
-	lion_build_colout_record(bs, LION_COLREC_PAGE, blk, buf->data, BLCKSZ);
+	lion_build_colout_record(bs, LION_COLREC_PAGE, blk, 0, buf->data, BLCKSZ);
 	pfree(buf);
 }
 
@@ -1193,7 +1202,7 @@ lion_build_replay_column(LionBuildState *bs, BufFile *file)
 					 rec.arg);
 			BufFileReadExact(file, entry, rec.arg);
 			lion_build_renumber_entry(entry, &map);
-			lion_build_add_entry(bs, entry, rec.arg);
+			lion_build_add_entry(bs, entry, rec.arg, rec.nckeys);
 		}
 		else if (rec.kind == LION_COLREC_PAGE)
 		{
@@ -1716,6 +1725,7 @@ lion_builder_finish_group(LionBuildState *bs, LionBuilder *b)
 {
 	if (!b->hasgroup)
 		return;
+	b->nckeys++;
 
 	if (b->hascur)
 	{
@@ -1929,7 +1939,7 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 	if (b->haspos)
 		entry = lion_builder_add_positions(bs, b, entry, &size);
 
-	lion_build_add_entry(bs, entry, size);
+	lion_build_add_entry(bs, entry, size, b->nckeys);
 
 	pfree(entry);
 }
@@ -2678,6 +2688,8 @@ lion_build_state_init(LionBuildState *bs, Relation index, int memkb,
 													sizeof(uint64) * ncols);
 	bs->sumsq = (uint64 *) MemoryContextAllocZero(bs->buildctx,
 												  sizeof(uint64) * ncols);
+	bs->conts = (uint64 *) MemoryContextAllocZero(bs->buildctx,
+												  sizeof(uint64) * ncols);
 	bs->rows = 0;
 	bs->rowcol = lion_index_row_column(&bs->ix);
 
@@ -3075,7 +3087,7 @@ lion_parallel_write_columns(LionBuildShared *shared, LionBuildColumn *columns,
 		lion_build_column(&bs, c);
 		lion_spool_reader_end(bs.reader);
 		bs.reader = NULL;
-		lion_build_colout_record(&bs, LION_COLREC_END, 0, NULL, 0);
+		lion_build_colout_record(&bs, LION_COLREC_END, 0, 0, NULL, 0);
 		BufFileClose(bs.colout);
 		bs.colout = NULL;
 
@@ -3640,7 +3652,8 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	{
 		LionMetaNdistinct nd;
 
-		lion_meta_fill_ndistinct(&nd, &bs.ix, bs.nvalues, bs.sumsq, bs.rows);
+		lion_meta_fill_ndistinct(&nd, &bs.ix, bs.nvalues, bs.sumsq, bs.conts,
+								 bs.rows);
 		lion_meta_record_ndistinct((Page) metabuf->data, &nd);
 	}
 	smgr_bulk_write(bs.bulk, LION_METAPAGE_BLKNO, metabuf, true);

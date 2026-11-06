@@ -1214,16 +1214,20 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 				break;
 
 			case LION_OP_NDISTINCT:
-				if (op.len != sizeof(LionMetaNdistinct) || PageIsNew(page) ||
+				/* this build's counts, or an older one's without conts */
+				if ((op.len != sizeof(LionMetaNdistinct) &&
+					 op.len != LION_META_NDISTINCT_V1_SIZE) ||
+					PageIsNew(page) ||
 					PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
 					LionPageGetOpaque(page)->page_id != LION_PAGE_ID ||
 					!LionPageIsMeta(page))
 					elog(PANIC, "pg_lion: bad NDISTINCT payload on block %u",
 						 blkno);
-				memcpy(LionPageGetMetaNdistinct(page), payload,
-					   sizeof(LionMetaNdistinct));
-				if (((PageHeader) page)->pd_lower < LION_META_NDISTINCT_END)
-					((PageHeader) page)->pd_lower = LION_META_NDISTINCT_END;
+				memcpy(LionPageGetMetaNdistinct(page), payload, op.len);
+				if (((PageHeader) page)->pd_lower <
+					LION_META_NDISTINCT_OFFSET + op.len)
+					((PageHeader) page)->pd_lower =
+						LION_META_NDISTINCT_OFFSET + op.len;
 				break;
 
 			case LION_OP_DELETED:

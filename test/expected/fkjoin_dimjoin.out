@@ -429,8 +429,9 @@ SELECT * FROM lion_gj_explain('SELECT count(*) FROM lion_gj_d d WHERE NOT EXISTS
          Implied by Partition Bounds: (kind = 'b'::text)
          Join Type: Anti
          Join Key Lookups: in index order
+         Fact Filters: collected once
          ->  (the dimension's plan: a join)
-(8 rows)
+(9 rows)
 
 -- an inner join over the joined dimension, grouped by a dimension column
 SELECT * FROM lion_gj_explain('SELECT d.attr, count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk WHERE f2.y = 5 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) GROUP BY d.attr');
@@ -827,8 +828,9 @@ SELECT * FROM lion_gj_explain('SELECT d.grp, count(*) FROM lion_gj_d d WHERE EXI
                Implied by Partition Bounds: (kind = ANY ('{a,b}'::text[]))
                Join Type: Semi
                Join Key Lookups: in index order
+               Fact Filters: collected once
                ->  (the dimension's plan: a join)
-(11 rows)
+(12 rows)
 
 SELECT lion_gj('SELECT d.grp, count(*) FROM lion_gj_d d WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.kind IN (''a'', ''b'') AND f1.tags && ''{u2}'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.id % 3 = 0) GROUP BY d.grp', 'plan');
      lion_gj      
@@ -933,8 +935,9 @@ SELECT * FROM lion_gj_explain('EXECUTE lion_gj_q(5, ''eu'', 3)');
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_gj_f2_df.fk (fk = d.pk), lion_gj_f2_y (y = $1)
          Join Type: Semi
+         Fact Filters: collected once
          ->  (the dimension's plan: a join)
-(6 rows)
+(7 rows)
 
 CREATE TEMP TABLE lion_gj_g1 AS EXECUTE lion_gj_q(5, 'eu', 3);
 CREATE TEMP TABLE lion_gj_g2 AS EXECUTE lion_gj_q(NULL, 'eu', 3);

@@ -542,6 +542,13 @@ StaticAssertDecl(sizeof(LionMetaPageData) == 56,
  *				Param meets on a skewed column.  Saturates at
  *				PG_UINT64_MAX, which the planner takes for unknown, as it
  *				takes 0 (LionMetaSumsqKnown()).
+ *	conts		the sum over the same VALUE entries of each one's
+ *				container keys (§3): conts / ndistinct is how many a key's
+ *				rows are spread over, which the rows per key alone
+ *				cannot tell - a key's rows stored together, as a table
+ *				loaded or clustered by the key has them, fill one or two
+ *				whatever their order on the column (DESIGN.md §27, "A key's
+ *				containers").  Zero is unknown (LionMetaContsKnown()).
  *
  * A multi-key column has no bit in valid_cols, and the two words its keys do
  * not use hold what BM25 reads of it instead, when the column stores
@@ -568,17 +575,33 @@ typedef struct LionMetaNdistinct
 	uint64		rows;
 	uint64		ndistinct[LION_META_MAX_COLS];
 	uint64		sumsq[LION_META_MAX_COLS];
+	uint64		conts[LION_META_MAX_COLS];
 } LionMetaNdistinct;
 
 StaticAssertDecl(INDEX_MAX_KEYS <= LION_META_MAX_COLS,
 				 "lion's meta page counts the keys of at most 32 key columns");
-StaticAssertDecl(sizeof(LionMetaNdistinct) == 528,
+StaticAssertDecl(sizeof(LionMetaNdistinct) == 784,
 				 "the lion meta page's key counts must not change size");
+
+/*
+ * The counts as a build before conts wrote them: the same fields, without
+ * conts.  A LION_OP_NDISTINCT record of that size - an older server's, which
+ * a standby upgraded first replays - is applied as such (lion_redo_apply()),
+ * and the page reads as one without counts (LionMetaHasNdistinct()) until a
+ * VACUUM, ANALYZE or REINDEX writes them again.
+ */
+#define LION_META_NDISTINCT_V1_SIZE	offsetof(LionMetaNdistinct, conts)
+StaticAssertDecl(offsetof(LionMetaNdistinct, conts) == 528,
+				 "the older key counts are the first 528 bytes of these");
 
 /* Key column i's (from 0) Σn² of nd, when it is known. */
 #define LionMetaSumsqKnown(nd, i) \
 	((nd)->rows > 0 && (nd)->sumsq[i] != 0 && \
 	 (nd)->sumsq[i] != PG_UINT64_MAX)
+
+/* Key column i's (from 0) container keys summed over its keys, when known. */
+#define LionMetaContsKnown(nd, i) \
+	((nd)->rows > 0 && (nd)->ndistinct[i] > 0 && (nd)->conts[i] != 0)
 
 #define LION_META_NDISTINCT_OFFSET \
 	(MAXALIGN(SizeOfPageHeaderData) + MAXALIGN(sizeof(LionMetaPageData)))
@@ -2594,8 +2617,11 @@ extern void lion_meta_record_slices(LionMetaPageData *meta, uint32 cols);
 /*
  * The distinct keys of each key column (DESIGN.md §33).  Fill in a count of
  * ix's columns from the VALUE entries of each (nvalues[], one per key column),
- * the sum of the squares of their TIDs (sumsq[], one per key column) and the
- * rows under its first scalar column, taken now; put it on a meta page
+ * the sum of the squares of their TIDs (sumsq[], one per key column), the
+ * sum of their container keys (conts[], one per key column; NULL for none:
+ * only a build counts them, and a count after it carries their average per
+ * key, lion_meta_carry_conts()) and the rows under its first scalar column,
+ * taken now; put it on a meta page
  * image nothing else can see yet (ambuild); write it on the index's meta page
  * in a WAL record of its own (VACUUM and ANALYZE); read it back, false when the
  * meta page carries none.
@@ -2603,7 +2629,9 @@ extern void lion_meta_record_slices(LionMetaPageData *meta, uint32 cols);
 extern void lion_meta_fill_ndistinct(LionMetaNdistinct *nd,
 									 const LionIndexState *ix,
 									 const uint64 *nvalues,
-									 const uint64 *sumsq, uint64 rows);
+									 const uint64 *sumsq,
+									 const uint64 *conts, uint64 rows);
+extern void lion_meta_carry_conts(Relation index, LionMetaNdistinct *nd);
 extern void lion_meta_record_ndistinct(Page metapage,
 									   const LionMetaNdistinct *nd);
 extern void lion_meta_write_ndistinct(Relation index,

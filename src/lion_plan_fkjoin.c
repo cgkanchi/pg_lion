@@ -1278,7 +1278,8 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 								childfound,
 								jointype != LION_JOIN_INNER ||
 								(emitrows && !counts),
-								rowbytes, workers, &collect, &walk, false,
+								rowbytes, workers, IS_JOIN_REL(fj->dimchild),
+								&collect, &walk, false,
 								&reads, mayunite ? &unite : NULL);
 	lion_units_cold(&units, run, reads);
 	if (unique)
@@ -2610,8 +2611,8 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 	run = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar,
 								setup.joinclause, setup.whereclauses,
 								setup.wherekinds, ors, dimrows, dimrows, true,
-								rowbytes, 0, &collect, &walk, false, &reads,
-								NULL);
+								rowbytes, 0, IS_JOIN_REL(outerrel), &collect,
+								&walk, false, &reads, NULL);
 	lion_units_cold(&units, run, reads);
 
 	/*
@@ -2629,7 +2630,8 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 									 setup.joinclause,
 									 setup.whereclauses,
 									 setup.wherekinds, ors, firstrows,
-									 firstrows, true, rowbytes, 0, &collect,
+									 firstrows, true, rowbytes, 0,
+									 IS_JOIN_REL(outerrel), &collect,
 									 &walk, true, NULL, NULL);
 	run = lion_units_price(&units, run);
 	startrun = lion_units_price(&units, startrun);
@@ -2679,6 +2681,7 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 										setup.whereclauses,
 										setup.wherekinds, ors, childrows,
 										childrows, true, rowbytes, workers,
+										IS_JOIN_REL(outerrel),
 										&collect, &walk, false, NULL, NULL);
 			/* a participant's first batch, of its share of the child */
 			firstrows = (walk || partitioned) ? Min(perbatch, childrows) : 1.0;
@@ -2688,7 +2691,8 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 											 setup.whereclauses,
 											 setup.wherekinds, ors, firstrows,
 											 firstrows, true, rowbytes,
-											 workers, &collect, &walk, true,
+											 workers, IS_JOIN_REL(outerrel),
+											 &collect, &walk, true,
 											 NULL, NULL);
 			run = lion_units_price(&units, run);
 			startrun = lion_units_price(&units, startrun);

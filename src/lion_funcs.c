@@ -734,10 +734,11 @@ lion_index_stats(PG_FUNCTION_ARGS)
 
 /*
  * lion_debug_key_skew(idx regclass, OUT col int2, OUT rows int8,
- * OUT ndistinct int8, OUT sumsq numeric): what the meta page of idx holds
- * for each key column (DESIGN.md §33) - the rows the counts were taken over,
- * the column's distinct keys and the sum of the squares of their TIDs, NULL
- * where the page has none (a multi-key column, a page written before the
+ * OUT ndistinct int8, OUT sumsq numeric, OUT containers int8): what the meta
+ * page of idx holds for each key column (DESIGN.md §33) - the rows the counts
+ * were taken over, the column's distinct keys, the sum of the squares of
+ * their TIDs and the sum of their containers (§27, "A key's containers"),
+ * NULL where the page has none (a multi-key column, a page written before the
  * sums were kept, a sum that saturated).  A test function like
  * lion_debug_key_positions(): the tests create it from the library, and
  * lion_index_stats(), whose columns are the extension's, keeps showing the
@@ -771,8 +772,8 @@ lion_debug_key_skew(PG_FUNCTION_ARGS)
 
 	for (i = 0; i < ncols; i++)
 	{
-		Datum		values[4];
-		bool		nulls[4] = {false, false, false, false};
+		Datum		values[5];
+		bool		nulls[5] = {false, false, false, false, false};
 		bool		valid = have && i < LION_META_MAX_COLS &&
 			(nd.valid_cols & (((uint32) 1) << i)) != 0;
 
@@ -794,6 +795,10 @@ lion_debug_key_skew(PG_FUNCTION_ARGS)
 		}
 		else
 			nulls[3] = true;
+		if (valid && LionMetaContsKnown(&nd, i))
+			values[4] = Int64GetDatum((int64) nd.conts[i]);
+		else
+			nulls[4] = true;
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
 							 nulls);
 	}

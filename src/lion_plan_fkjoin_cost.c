@@ -194,8 +194,10 @@ lion_fkjoin_probe_one(double heap_pages, double members, double cfk)
  *	  each of them, a Parallel Hash's.  Its lookups stay each participant's:
  *	  every one of them locates the filters for itself.
  *
- * Either way the filters are located once for the whole scan, each one lookup
- * and one walk of its chain, as a single count prices them.
+ * Either way the filters are located once for the whole scan, a directory
+ * lookup each.  The walk of their chains is the collecting's alone: probed,
+ * each count reads only the containers of its own key's pages, which
+ * lion_fkjoin_probe_one() prices, never the whole chain.
  *
  * And the heap the visibility map cannot vouch for, exactly as §10 prices it:
  * the candidates are the fact rows the dimension rows reach, which is their
@@ -251,6 +253,41 @@ typedef struct LionFkJoinCost
 } LionFkJoinCost;
 
 /*
+ * How much cheaper probing the fact filters has to be priced than collecting
+ * them for a plan to probe (DESIGN.md §27, "Probed, then collected"), when
+ * the keys come from a join of several relations (`keysjoined`).  Core's
+ * estimate of such a join's rows is often many times too low - its filters'
+ * selectivities multiplied as if independent, an anti join's as a guess -
+ * and probing costs in proportion to the keys that do come, where collecting
+ * costs mostly its copy, made once.  A probing run that meets more keys than
+ * planned does switch, at about twice what collecting from the start costs,
+ * but a plan that collects from the start pays at most the copy beside a
+ * small probing run's few keys.  The factor, 3, collects where the two are
+ * within that of each other: measured on a synthetic key set from a
+ * three-table join with an anti join, estimated at 881 keys where 10,000
+ * came, it took a count from 49 ms (probed, then collected) to 36 ms and an
+ * EXISTS from 37 ms to core's merge join's 14, with no plan of a key set
+ * estimated right (a few hundred keys or fewer, probed at a tenth or less of
+ * collecting's price) changed.
+ *
+ * In a parallel plan the participants' share of the work bounds it from
+ * below: a run that switches does so in every participant, each making its
+ * own copy (lion_join_switch_reset()), where a plan that collects makes one
+ * among them.
+ */
+#define LION_FKJOIN_JOINED_KEYS_HEDGE	3.0
+
+static double
+lion_fkjoin_collect_hedge(int workers, bool keysjoined)
+{
+	double		hedge = keysjoined ? LION_FKJOIN_JOINED_KEYS_HEDGE : 1.0;
+
+	if (workers > 0)
+		hedge = Max(hedge, lion_parallel_divisor(workers));
+	return hedge;
+}
+
+/*
  * The share of the fact's rows the dimensions folded into fact filters leave
  * (DESIGN.md §27, "A second dimension that only filters"), which the fact
  * rel's own estimate knows nothing of: their clauses are the RestrictInfos
@@ -278,8 +315,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 					 List *wherecol, Var *fkvar, int joinclause,
 					 List *whereclauses, List *wherekinds, List *ors,
 					 double dimrows, double found, bool exists,
-					 double rowbytes, int workers, double copyroom,
-					 bool *collect, bool *walk, bool force,
+					 double rowbytes, int workers, bool keysjoined,
+					 double copyroom, bool *collect, bool *walk, bool force,
 					 LionFkJoinCost *parts)
 {
 	bool		wantcollect = force && *collect;
@@ -328,6 +365,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	Cost		located = 0;
 	Cost		probed = 0;
 	Cost		collected = 0;
+	double		chainpages = 0.0;
+	double		probeseeks = 0.0;
 	double		reads;
 	int			ci = 0;
 	int			sno;
@@ -346,6 +385,24 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	nd = lion_fkjoin_fk_ndistinct(root, rel, fkvar);
 	perkey = tuples / nd;
 	cfk = lion_containers_for(heap_pages, perkey);
+
+	/*
+	 * ... which lion_containers_for() takes as one each, up to the heap's
+	 * container keys - rows scattered - while a key's rows stored together,
+	 * as a table loaded or clustered by the key keeps them, fill one or two
+	 * whatever the order of the keys (DESIGN.md §27, "A key's containers").
+	 * The fk index's count of its keys' containers says which: the share
+	 * of the scattered figure its keys' average has, applied to this key's.
+	 */
+	{
+		double		keyrows;
+		double		counted = lion_key_containers_counted(root, rel, fkidx,
+														  fkcol, &keyrows);
+
+		if (counted > 0.0)
+			cfk = Max(1.0, cfk * Min(1.0, counted /
+									 lion_containers_for(heap_pages, keyrows)));
+	}
 
 	/*
 	 * An existence test stops at the first container that shows a row the
@@ -519,7 +576,11 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 									 Min(sel * nkeys, 1.0) : sel);
 		ci++;
 
-		/* Located once: a lookup per set, and the walk of their chains. */
+		/*
+		 * Located once: a lookup per set.  The pages of their chains are read
+		 * whole only to collect them (`chainpages`, below); probes read their
+		 * own containers.
+		 */
 		cshare = lion_index_column_share(root, rel, idx,
 										 (AttrNumber) lfirst_int(lc4));
 		cdir = lion_index_dir_pages(idx, &cheight);
@@ -530,9 +591,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 
 		located += Min(nkeys, Max(cdir * cshare, 1.0)) * random_page_cost +
 			nkeys * (cheight + 1.0) * LION_DESCENT_COST;
-		located += Max(Min(nkeys, cpages), cpages * sel) * seq_page_cost;
-		reads += Min(nkeys, Max(cdir * cshare, 1.0)) +
-			Max(Min(nkeys, cpages), cpages * sel);
+		reads += Min(nkeys, Max(cdir * cshare, 1.0));
+		chainpages += Max(Min(nkeys, cpages), cpages * sel);
 	}
 	run += located;
 
@@ -581,6 +641,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 			}
 			probed += found * seeks * readshare *
 				lion_fkjoin_probe_one(heap_pages, setm, cfk);
+			probeseeks += found * seeks * readshare;
 
 			/* ... and a range spilled to a file reads each one back */
 			if (srcspills[sno])
@@ -648,7 +709,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 										   filtered, 1.0);
 		collected += drive * LION_FKJOIN_COLLECT_CONTAINER_COST +
 			drive * (npositive - 1) * LION_FKJOIN_PROBE_COST +
-			copyckeys * LION_FKJOIN_COPY_CONTAINER_COST + poscollected;
+			copyckeys * LION_FKJOIN_COPY_CONTAINER_COST + poscollected +
+			chainpages * seq_page_cost;
 
 		/*
 		 * A copy past the memory it has SPILLS to a temporary file
@@ -686,8 +748,15 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		 * large for the memory is chosen as any other, spilled and priced
 		 * so.
 		 */
+		/*
+		 * Probed only where probing is cheaper by the hedge against too few
+		 * keys planned (lion_fkjoin_collect_hedge()): a key set from a join,
+		 * or a parallel plan, whose switch is each participant's own.
+		 */
 		if (force ? wantcollect :
-			(collected < probed && !RecoveryInProgress()))
+			(collected < probed * lion_fkjoin_collect_hedge(workers,
+															keysjoined) &&
+			 !RecoveryInProgress()))
 			*collect = true;
 		if (parts != NULL)
 		{
@@ -698,6 +767,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		}
 	}
 	run += *collect ? collected : probed;
+	reads += *collect ? chainpages : Min(chainpages, probeseeks);
 	if (parts != NULL)
 	{
 		parts->probed = probed;
@@ -856,8 +926,9 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 					  Var *fkvar, int joinclause,
 					  List *whereclauses,
 					  List *wherekinds, List *ors, double dimrows, double found,
-					  bool exists, double rowbytes, int workers, bool *collect,
-					  bool *walk, bool force, double *reads, bool *unite)
+					  bool exists, double rowbytes, int workers,
+					  bool keysjoined, bool *collect, bool *walk, bool force,
+					  double *reads, bool *unite)
 {
 	LionCountTarget *first = (LionCountTarget *) linitial(targets);
 	bool		wantcollect = force && *collect;
@@ -905,7 +976,8 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 								   first->wherecol, fkvar, joinclause,
 								   whereclauses, wherekinds, ors, dimrows,
 								   found, exists, rowbytes, workers,
-								   copylimit, collect, walk, force, &parts);
+								   keysjoined, copylimit, collect, walk,
+								   force, &parts);
 		if (reads != NULL)
 			*reads = parts.reads;
 
@@ -1001,7 +1073,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 		(void) lion_cost_fkjoin_rel(root, t->rel, tidx, tcol, leafvar,
 									tjoin,
 									tclauses, tkinds, tors, tdim, tfound,
-									exists, rowbytes, workers,
+									exists, rowbytes, workers, keysjoined,
 									Max(copylimit - copyheld, 0.0),
 									&tcollect, &twalk, false, &parts);
 
@@ -1074,7 +1146,9 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 	else
 	{
 		*walk = (walked < descents);
-		*collect = (copybytes > 0 && collected < probed &&
+		*collect = (copybytes > 0 &&
+					collected < probed *
+					lion_fkjoin_collect_hedge(workers, keysjoined) &&
 					!RecoveryInProgress());
 	}
 	if (mayunite && united < (*collect ? collected : probed))
