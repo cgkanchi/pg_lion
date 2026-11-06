@@ -14225,6 +14225,14 @@ or semi join has no row left, and an anti join's are every row, as when a filter
   that collects makes one copy among them. A key set from a multi-table join estimated at 1,140
   keys that holds 10,000 (synthetic, 20M-row fact stored by key, PostgreSQL 18, warm) probed and
   switched in all four participants, 169 ms; collected from the start, 33 ms.
+- **A key set from a join.** Core's estimate of a join's rows is often many times too low (its
+  filters multiplied as if independent, an anti join's a guess), and a serial run that probes
+  through many more keys than planned pays about twice what collecting from the start would, where
+  a plan that collects pays at most the copy beside a few keys' probes. So where the keys come from
+  a join of several relations (the child's rel a join rel), the plan probes only where probing is
+  priced at under a third of collecting (`lion_fkjoin_collect_hedge()`, the larger of that and the
+  parallel factor above). Key sets estimated at a few hundred keys or fewer are probed at a tenth
+  of collecting's price or less, and keep probing.
 - **Rescans.** Each run starts its account again (`lion_join_switch_reset()`, from
   `lion_reset_run()`); the copy of the run before is released with the run.
 - **EXPLAIN ANALYZE** prints `Fact Filters: probed, then collected` in place of nothing (a probing
@@ -14511,15 +14519,20 @@ K = 100; the fact filter a tsquery; PostgreSQL 18, warm, median of three):
 | count over the join, `s1 & f2` | 36 | 11.7 ms | 0.78 ms | LionCount (before: nested loop over LionBtreeScan) |
 | | 1,369 | 172 ms | 14.3 ms | LionCount |
 | `IN (key set)` | 36 | 8.8 ms | 0.75 ms | LionCount (before: nested loop over LionBtreeScan) |
-| | 10,000 | 36.8 ms | 48.9 ms | LionCount, probed, then collected |
+| | 10,000 | 36.8 ms | 35.6 ms | LionCount, collected (the key set a join: "Probed, then collected") |
 | `EXISTS` page of the key set | 36 | 6.5 ms | 0.66 ms | LionSemiJoin (before: nested loop over LionBtreeScan) |
-| | 10,000 | 11.9 ms | 37.1 ms | LionSemiJoin, probed, then collected (before: core's merge join) |
+| | 10,000 | 11.9 ms | 13.8 ms | core's merge join, as before |
 
-The losses are the key sets of 10,000 estimated at about 900: priced at the estimate, probing
-is the cheaper way, and the run switches ("Probed, then collected") after about 2,600 keys. At 361
-keys the loop is still chosen at its estimate of one key; the count forced (nested loops off) runs
-in 29 ms. The misses are core's estimates of the key set, which no per-key price undoes. Other
-shapes of the same repro - a constant list, an InitPlan's array, LATERAL - plan as before.
+The key sets of 10,000 are estimated at about 900. Priced at the estimate, probing was the cheaper
+way, and the runs switched ("Probed, then collected") after about 2,600 keys: 48.9 ms for the
+`IN`, and 37.1 ms for the `EXISTS`, whose LionSemiJoin had won over core's merge join on paper.
+Since the keys come from a join, the plan now probes only where probing is priced under a third of
+collecting ("Probed, then collected", "A key set from a join"), so both collect or leave the join to
+core, as the two rows show (measured in a later run; the rest of the 87 queries of the repro kept
+their plans). At 361 keys the loop is still chosen at its estimate of one key; the count forced
+(nested loops off) runs in 29 ms. That miss is core's estimate of the key set, which no per-key
+price undoes. Other shapes of the same repro - a constant list, an InitPlan's array, LATERAL - plan
+as before.
 
 ### The semi and anti join as a join path (2026-09-29)
 

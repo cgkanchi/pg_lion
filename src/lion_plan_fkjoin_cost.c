@@ -253,6 +253,41 @@ typedef struct LionFkJoinCost
 } LionFkJoinCost;
 
 /*
+ * How much cheaper probing the fact filters has to be priced than collecting
+ * them for a plan to probe (DESIGN.md §27, "Probed, then collected"), when
+ * the keys come from a join of several relations (`keysjoined`).  Core's
+ * estimate of such a join's rows is often many times too low - its filters'
+ * selectivities multiplied as if independent, an anti join's as a guess -
+ * and probing costs in proportion to the keys that do come, where collecting
+ * costs mostly its copy, made once.  A probing run that meets more keys than
+ * planned does switch, at about twice what collecting from the start costs,
+ * but a plan that collects from the start pays at most the copy beside a
+ * small probing run's few keys.  The factor, 3, collects where the two are
+ * within that of each other: measured on a synthetic key set from a
+ * three-table join with an anti join, estimated at 881 keys where 10,000
+ * came, it took a count from 49 ms (probed, then collected) to 36 ms and an
+ * EXISTS from 37 ms to core's merge join's 14, with no plan of a key set
+ * estimated right (a few hundred keys or fewer, probed at a tenth or less of
+ * collecting's price) changed.
+ *
+ * In a parallel plan the participants' share of the work bounds it from
+ * below: a run that switches does so in every participant, each making its
+ * own copy (lion_join_switch_reset()), where a plan that collects makes one
+ * among them.
+ */
+#define LION_FKJOIN_JOINED_KEYS_HEDGE	3.0
+
+static double
+lion_fkjoin_collect_hedge(int workers, bool keysjoined)
+{
+	double		hedge = keysjoined ? LION_FKJOIN_JOINED_KEYS_HEDGE : 1.0;
+
+	if (workers > 0)
+		hedge = Max(hedge, lion_parallel_divisor(workers));
+	return hedge;
+}
+
+/*
  * The share of the fact's rows the dimensions folded into fact filters leave
  * (DESIGN.md §27, "A second dimension that only filters"), which the fact
  * rel's own estimate knows nothing of: their clauses are the RestrictInfos
@@ -280,8 +315,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 					 List *wherecol, Var *fkvar, int joinclause,
 					 List *whereclauses, List *wherekinds, List *ors,
 					 double dimrows, double found, bool exists,
-					 double rowbytes, int workers, double copyroom,
-					 bool *collect, bool *walk, bool force,
+					 double rowbytes, int workers, bool keysjoined,
+					 double copyroom, bool *collect, bool *walk, bool force,
 					 LionFkJoinCost *parts)
 {
 	bool		wantcollect = force && *collect;
@@ -714,18 +749,13 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		 * so.
 		 */
 		/*
-		 * In a parallel plan a probing run that meets more keys than planned
-		 * collects the filters in EVERY participant, each its own copy
-		 * (lion_join_switch_reset()), where a plan that collects makes one
-		 * among them: the switch's bound of about twice the better way is
-		 * the bound per participant.  So it probes only where probing
-		 * beats collecting by the participants' share of the work - an
-		 * estimate of the dimension rows a few times too low, which is
-		 * what a join's often is, still collects.
+		 * Probed only where probing is cheaper by the hedge against too few
+		 * keys planned (lion_fkjoin_collect_hedge()): a key set from a join,
+		 * or a parallel plan, whose switch is each participant's own.
 		 */
 		if (force ? wantcollect :
-			(collected < probed * (workers > 0 ?
-								   lion_parallel_divisor(workers) : 1.0) &&
+			(collected < probed * lion_fkjoin_collect_hedge(workers,
+															keysjoined) &&
 			 !RecoveryInProgress()))
 			*collect = true;
 		if (parts != NULL)
@@ -896,8 +926,9 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 					  Var *fkvar, int joinclause,
 					  List *whereclauses,
 					  List *wherekinds, List *ors, double dimrows, double found,
-					  bool exists, double rowbytes, int workers, bool *collect,
-					  bool *walk, bool force, double *reads, bool *unite)
+					  bool exists, double rowbytes, int workers,
+					  bool keysjoined, bool *collect, bool *walk, bool force,
+					  double *reads, bool *unite)
 {
 	LionCountTarget *first = (LionCountTarget *) linitial(targets);
 	bool		wantcollect = force && *collect;
@@ -945,7 +976,8 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 								   first->wherecol, fkvar, joinclause,
 								   whereclauses, wherekinds, ors, dimrows,
 								   found, exists, rowbytes, workers,
-								   copylimit, collect, walk, force, &parts);
+								   keysjoined, copylimit, collect, walk,
+								   force, &parts);
 		if (reads != NULL)
 			*reads = parts.reads;
 
@@ -1041,7 +1073,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 		(void) lion_cost_fkjoin_rel(root, t->rel, tidx, tcol, leafvar,
 									tjoin,
 									tclauses, tkinds, tors, tdim, tfound,
-									exists, rowbytes, workers,
+									exists, rowbytes, workers, keysjoined,
 									Max(copylimit - copyheld, 0.0),
 									&tcollect, &twalk, false, &parts);
 
@@ -1114,7 +1146,9 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 	else
 	{
 		*walk = (walked < descents);
-		*collect = (copybytes > 0 && collected < probed &&
+		*collect = (copybytes > 0 &&
+					collected < probed * (keysjoined ?
+										  LION_FKJOIN_JOINED_KEYS_HEDGE : 1.0) &&
 					!RecoveryInProgress());
 	}
 	if (mayunite && united < (*collect ? collected : probed))

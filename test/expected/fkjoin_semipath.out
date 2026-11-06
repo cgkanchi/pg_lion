@@ -493,6 +493,7 @@ SELECT * FROM lion_sp_explain('SELECT d.pk FROM lion_sp_d d WHERE EXISTS (SELECT
    Lion Indexes: lion_sp_f2_df.fk (fk = d.pk), lion_sp_f2_y (y < 4)
    Join Key Lookups: in index order
    Join Rows: the outer rows with a match
+   Fact Filters: collected once
    ->  Custom Scan (LionAntiJoin)
          Partitions: lion_sp_f1_b
          Lion Indexes: (fk = d.pk), (x = 3)
@@ -500,7 +501,7 @@ SELECT * FROM lion_sp_explain('SELECT d.pk FROM lion_sp_d d WHERE EXISTS (SELECT
          Join Key Lookups: in index order
          Join Rows: the outer rows without a match
          ->  Seq Scan on lion_sp_d d
-(11 rows)
+(12 rows)
 
 -- the outer side's order kept: in key order, a batch at a time, and put back
 -- (sorts off: over one batch a Sort of the path's rows is as early and
@@ -560,20 +561,20 @@ DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggre
 -- the composition: the upper node over a dimension that is a join, whose
 -- child is the semi join path - (A) a dimension semi-joined to two facts
 SELECT * FROM lion_sp_explain('SELECT count(*) FROM lion_sp_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'' AND f1.ts >= now() - interval ''120 days'') AND EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w3 | w5'')');
-                                                 lion_sp_explain                                                 
------------------------------------------------------------------------------------------------------------------
+                                              lion_sp_explain                                              
+-----------------------------------------------------------------------------------------------------------
  Finalize Aggregate
    ->  Custom Scan (LionCount)
-         Partitions: lion_sp_f1_b
-         Lion Indexes: (fk = d.pk), (ts >= (now() - '@ 120 days'::interval))
-         Implied by Partition Bounds: (kind = 'b'::text)
+         Lion Indexes: lion_sp_f2_df.fk (fk = d.pk), lion_sp_f2_df.doc (doc @@ '''w3'' | ''w5'''::tsquery)
          Join Type: Semi
          Join Key Lookups: in index order
+         Fact Filters: collected once
          ->  Custom Scan (LionSemiJoin)
-               Lion Indexes: lion_sp_f2_df.fk (fk = d.pk), lion_sp_f2_df.doc (doc @@ '''w3'' | ''w5'''::tsquery)
+               Partitions: lion_sp_f1_b
+               Lion Indexes: (fk = d.pk), (ts >= (now() - '@ 120 days'::interval))
+               Implied by Partition Bounds: (kind = 'b'::text)
                Join Key Lookups: in index order
                Join Rows: the outer rows with a match
-               Fact Filters: collected once
                ->  Bitmap Heap Scan on lion_sp_d d
                      Recheck Cond: (region = 'eu'::text)
                      ->  Bitmap Index Scan on lion_sp_d_rg
