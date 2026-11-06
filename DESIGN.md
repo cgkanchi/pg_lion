@@ -6892,6 +6892,20 @@ column, two (the nested loop, where a lexeme takes the decoded walk) and three, 
 count(DISTINCT), in the FK-side join, in a filtered count and beside a residual clause, serially and
 in parallel, and the same beside a parameter's query.
 
+**A plain or bitmap scan's price of such a value** (`lion_cost_estimated_value()`, lion_amcost.c,
+2026-11-06). The scan prices a multi-key query by the mode its value would be answered in
+(`lion_cost_qual_is_full()`), and a value that is not a Const was priced as the expensive shape - a
+walk of the whole column emitting every row for the heap to recheck, the table's every row as its
+estimate - which put a sequential scan ahead of the index for `tsv @@ phraseto_tsquery('word')`,
+whose one-argument form is STABLE (it reads `default_text_search_config`): 540 ms against 25 on
+3M rows. The value is now first folded as core's selectivity functions fold one,
+`estimate_expression_value()`: a STABLE call over constants, or a custom plan's parameter inside
+one, is priced at the query it comes to. Only the price reads the folded value - the scan takes its
+mode from the value it evaluates at run time, and `lion_path_rechecked_quals()`, which tells a walk
+what its set leaves to the recheck, still folds nothing - so a value that changes between planning
+and execution costs speed, never rows. A generic plan's bare `$1` does not fold, and is priced as
+before. `tsvector.sql` checks the plans and compares the rows with a sequential scan.
+
 ### Literal queries through the superset (2026-10-07)
 
 Until now a LITERAL phrase, weight mask or `a & !b` was extracted exactly, came out ALL, and every

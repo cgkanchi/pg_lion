@@ -752,6 +752,60 @@ EXPLAIN (COSTS OFF) EXECUTE lion_tsc_p('rare500');
 
 RESET plan_cache_mode;
 DEALLOCATE lion_tsc_p;
+-- a STABLE call over constants is priced at the value it folds to, as core's
+-- selectivity functions estimate it: phraseto_tsquery(text) reads the session's
+-- text search configuration.  One word is one lexeme, exact; two words are a
+-- phrase, a superset rechecked in the heap, planned as the constant phrase is.
+SET default_text_search_config = 'simple';
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc
+	WHERE tsv @@ phraseto_tsquery('rare500');
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Aggregate
+   ->  Index Scan using lion_tsc_tsv on lion_tsc
+         Index Cond: (tsv @@ phraseto_tsquery('rare500'::text))
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc
+	WHERE tsv @@ phraseto_tsquery('common w1');
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on lion_tsc
+         Recheck Cond: (tsv @@ phraseto_tsquery('common w1'::text))
+         ->  Bitmap Index Scan on lion_tsc_tsv
+               Index Cond: (tsv @@ phraseto_tsquery('common w1'::text))
+(5 rows)
+
+-- a custom plan's parameter inside the call folds the same way
+PREPARE lion_tsc_s(text) AS SELECT sum(id) FROM lion_tsc
+	WHERE tsv @@ phraseto_tsquery($1);
+SET plan_cache_mode = force_custom_plan;
+EXPLAIN (COSTS OFF) EXECUTE lion_tsc_s('rare500');
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Aggregate
+   ->  Index Scan using lion_tsc_tsv on lion_tsc
+         Index Cond: (tsv @@ phraseto_tsquery('rare500'::text))
+(3 rows)
+
+RESET plan_cache_mode;
+DEALLOCATE lion_tsc_s;
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ phraseto_tsquery('rare500')$$);
+     lion_tscmp     
+--------------------
+ index scan, 1 rows
+(1 row)
+
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ phraseto_tsquery('common w1')$$);
+      lion_tscmp       
+-----------------------
+ index scan, 1000 rows
+(1 row)
+
+RESET default_text_search_config;
 -- and the answers are the same whichever plan runs
 SELECT lion_tscmp($$SELECT count(*) FROM lion_tsc WHERE tsv @@ 'rare50:*'::tsquery$$);
      lion_tscmp      

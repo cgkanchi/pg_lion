@@ -346,6 +346,27 @@ SET plan_cache_mode = force_generic_plan;
 EXPLAIN (COSTS OFF) EXECUTE lion_tsc_p('rare500');
 RESET plan_cache_mode;
 DEALLOCATE lion_tsc_p;
+-- a STABLE call over constants is priced at the value it folds to, as core's
+-- selectivity functions estimate it: phraseto_tsquery(text) reads the session's
+-- text search configuration.  One word is one lexeme, exact; two words are a
+-- phrase, a superset rechecked in the heap, planned as the constant phrase is.
+SET default_text_search_config = 'simple';
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc
+	WHERE tsv @@ phraseto_tsquery('rare500');
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc
+	WHERE tsv @@ phraseto_tsquery('common w1');
+-- a custom plan's parameter inside the call folds the same way
+PREPARE lion_tsc_s(text) AS SELECT sum(id) FROM lion_tsc
+	WHERE tsv @@ phraseto_tsquery($1);
+SET plan_cache_mode = force_custom_plan;
+EXPLAIN (COSTS OFF) EXECUTE lion_tsc_s('rare500');
+RESET plan_cache_mode;
+DEALLOCATE lion_tsc_s;
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ phraseto_tsquery('rare500')$$);
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ phraseto_tsquery('common w1')$$);
+RESET default_text_search_config;
 -- and the answers are the same whichever plan runs
 SELECT lion_tscmp($$SELECT count(*) FROM lion_tsc WHERE tsv @@ 'rare50:*'::tsquery$$);
 SELECT lion_tscmp($$SELECT count(*) FROM lion_tsc
