@@ -3847,9 +3847,9 @@ residual `100 / w > 20` raises nothing over a deleted row whose w is 0, as the o
 raises nothing. From PostgreSQL 17 the candidates' pages are read through a read stream over their
 blocks in order, as a bitmap heap scan reads its pages.
 
-**A TOASTed column read more than once.** Every operator call that reads a compressed or
-out-of-line datum's contents fetches and decompresses it again: the executor keeps no detoasted
-copy between calls. A
+**A TOASTed column read more than once.** Every operator call that needs the whole value of a
+compressed or out-of-line datum fetches it again, and decompresses it if compressed: the executor
+keeps no detoasted copy between calls. A
 weighted score of twenty `a && '{x}'` terms over an array stored out of line, repeated in each WHEN of
 a tier CASE, so read the array some eighty times a row. A column the clauses reference more than once
 (`residonce[]`, counted in `lion_begin_residual()`) is therefore detoasted once, when the row's
