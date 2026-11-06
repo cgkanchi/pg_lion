@@ -178,7 +178,7 @@ static void
 lion_add_parallel_count_path(PlannerInfo *root, RelOptInfo *rel,
 							 RelOptInfo *output_rel, CustomPath *serial,
 							 Cost serialrun, const LionRangeCost *rc,
-							 List *having, Path *child, Cost once)
+							 List *having, List *children, Cost once)
 {
 	PathTarget *partialtarget;
 	CustomPath *cpath;
@@ -232,10 +232,16 @@ lion_add_parallel_count_path(PlannerInfo *root, RelOptInfo *rel,
 		once;
 	cpath->path.startup_cost = cpath->path.total_cost;
 #if PG_VERSION_NUM >= 180000
-	cpath->path.disabled_nodes = (child != NULL) ? child->disabled_nodes : 0;
+	cpath->path.disabled_nodes = 0;
+	{
+		ListCell   *dl;
+
+		foreach(dl, children)
+			cpath->path.disabled_nodes += ((Path *) lfirst(dl))->disabled_nodes;
+	}
 #endif
 	cpath->flags = serial->flags;
-	cpath->custom_paths = (child != NULL) ? list_make1(child) : NIL;
+	cpath->custom_paths = children;
 #if PG_VERSION_NUM >= 170000
 	cpath->custom_restrictinfo = NIL;
 #endif
@@ -483,6 +489,7 @@ typedef struct LionCountPathBuild
 	bool		cells;			/* a count by cells (§10, "Counts by
 								 * cells") is being built */
 	List	   *cellexprs;		/* ... its GROUP BY's expressions */
+	Var		   *cellgroupvar;	/* ... and its GROUP BY column, or NULL */
 	List	   *cellquals;		/* ... the WHERE's clauses over predicates */
 	LionCellsPlan *cellplan;	/* ... its dimensions and driver */
 	double		cellwhererows;	/* ... and the rows the posting sets select */
@@ -4803,7 +4810,44 @@ lion_count_path_anti(LionCountPathBuild *cx)
 		a->groupsort[g] = groupsort[g];
 	}
 	a->exprs = list_concat(list_concat(keyexprs, joinclauses), restrictions);
+
+	/* ... and each further arm's keys' values and join clauses (§27) */
+	a->narm = cx->antiplan.narm;
+	if (a->narm != 1 + list_length(anti->arms) ||
+		list_length(cx->antiplan.armkeyexprs) != a->narm - 1 ||
+		list_length(cx->antiplan.armclauses) != a->narm - 1)
+		elog(ERROR, "LionCount: an anti join's arms without their keys");
+	if (a->narm > 1 && a->njoin != a->nkey)
+		elog(ERROR, "LionCount: an anti join's arms with join clauses beyond their keys");
+	{
+		ListCell   *lk;
+		ListCell   *lj;
+
+		forboth(lk, cx->antiplan.armkeyexprs, lj, cx->antiplan.armclauses)
+			a->exprs = list_concat(list_concat(a->exprs,
+											   (List *) lfirst(lk)),
+								   (List *) lfirst(lj));
+	}
 	return true;
+}
+
+/*
+ * The children of the anti join over a small inner side (§27): each arm's
+ * inner side's cheapest path, the first arm's first.  NIL without one.
+ */
+static List *
+lion_count_anti_children(const LionSmallAnti *anti)
+{
+	List	   *children;
+	ListCell   *lc;
+
+	if (anti == NULL)
+		return NIL;
+	children = list_make1(anti->innerpath);
+	foreach(lc, anti->arms)
+		children = lappend(children,
+						   ((const LionSmallAnti *) lfirst(lc))->innerpath);
+	return children;
 }
 
 /*
@@ -4908,9 +4952,8 @@ lion_count_path_make(LionCountPathBuild *cx)
 	}
 	cpath->flags = 0;
 
-	/* the anti join's inner side is the node's child (§27) */
-	cpath->custom_paths = (cx->anti != NULL) ?
-		list_make1(cx->anti->innerpath) : NIL;
+	/* the anti join's inner sides are the node's children (§27) */
+	cpath->custom_paths = lion_count_anti_children(cx->anti);
 #if PG_VERSION_NUM >= 170000
 	cpath->custom_restrictinfo = NIL;
 #endif
@@ -5340,42 +5383,61 @@ static Cost
 lion_count_anti_price(const LionCountPathBuild *cx, const LionUnits *units,
 					  CustomPath *cpath)
 {
-	Path	   *child;
 	Cost		lookups;
+	ListCell   *lc;
 
 	if (cx->anti == NULL)
 		return 0.0;
-	child = cx->anti->innerpath;
 	lookups = lion_units_price(units, cx->antiplan.cost);
-	cpath->path.startup_cost += lookups + child->total_cost;
-	cpath->path.total_cost += lookups + child->total_cost;
+	cpath->path.startup_cost += lookups;
+	cpath->path.total_cost += lookups;
 #if PG_VERSION_NUM >= 180000
-	cpath->path.disabled_nodes = child->disabled_nodes;
+	cpath->path.disabled_nodes = 0;
 #endif
+	foreach(lc, lion_count_anti_children(cx->anti))
+	{
+		Path	   *child = (Path *) lfirst(lc);
+
+		cpath->path.startup_cost += child->total_cost;
+		cpath->path.total_cost += child->total_cost;
+#if PG_VERSION_NUM >= 180000
+		cpath->path.disabled_nodes += child->disabled_nodes;
+#endif
+	}
 	return lookups;
 }
 
 /*
- * ... and of its parallel form: the child a participant runs
- * (lion_anti_parallel_child()), where the join's expressions may be
- * evaluated in a worker and the inner side has one, and into *run the price
- * of a participant's run - `lookups`, the lookups' price, and that
- * child's price.  NULL, and *run 0, when there is none.
+ * ... and of its parallel form: the children a participant runs
+ * (lion_anti_parallel_child()), one an arm, where the join's expressions may
+ * be evaluated in a worker and every inner side has one, and into *run the
+ * price of a participant's run - `lookups`, the lookups' price, and the
+ * children's prices.  NIL, and *run 0, when there are none.
  */
-static Path *
+static List *
 lion_count_anti_parallel(const LionCountPathBuild *cx, Cost lookups,
 						 Cost *run)
 {
-	Path	   *child;
+	List	   *children = NIL;
+	Cost		price = lookups;
+	ListCell   *lc;
 
 	*run = 0.0;
 	if (cx->anti == NULL ||
 		!is_parallel_safe(cx->root, (Node *) cx->priv.anti.exprs))
-		return NULL;
-	child = lion_anti_parallel_child(cx->anti->innerrel);
-	if (child != NULL)
-		*run = lookups + child->total_cost;
-	return child;
+		return NIL;
+	foreach(lc, lion_count_anti_children(cx->anti))
+	{
+		Path	   *child;
+
+		child = lion_anti_parallel_child(((Path *) lfirst(lc))->parent);
+		if (child == NULL)
+			return NIL;
+		children = lappend(children, child);
+		price += child->total_cost;
+	}
+	*run = price;
+	return children;
 }
 
 /*
@@ -5520,7 +5582,7 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	Cost		serialrun;		/* the serial node's price, without HAVING */
 	Cost		antilookups;	/* the anti join's lookups (§27) */
 	Cost		antirun;		/* ... and a participant's run of them */
-	Path	   *antichild;		/* ... and the child it runs */
+	List	   *antichild;		/* ... and the children it runs */
 	LionUnits	units;			/* the competitor's (§39) */
 
 	lion_units_for(root, output_rel, &units);
@@ -5817,7 +5879,7 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 		cx->topkn == 0 && !cx->decode && cx->groupcoal == NULL &&
 		input_rel->consider_parallel && output_rel->consider_parallel &&
 		is_parallel_safe(root, (Node *) cx->priv.consts) &&
-		(cx->anti == NULL || antichild != NULL) &&
+		(cx->anti == NULL || antichild != NIL) &&
 		extra != NULL && (extra->flags & GROUPING_CAN_PARTIAL_AGG) != 0 &&
 		!RecoveryInProgress())
 		lion_add_parallel_count_path(root, input_rel, output_rel, cpath,
@@ -5862,11 +5924,14 @@ lion_cells_candidate_walker(Node *node, void *context)
 }
 
 /*
- * The GROUP BY's expressions, none of them a bare column - whose groups are
- * the walk's own - on one plain table whose counts core may add up; or no
- * GROUP BY at all, when the WHERE has a clause the cells may test.  The
- * table is the query's only one, or the one an anti join over a small inner
- * side counts (§27), whose rows found the cells lose
+ * The GROUP BY's expressions, on one plain table whose counts core may add
+ * up; or no GROUP BY at all, when the WHERE has a clause the cells may test.
+ * One of the expressions may be a bare column of the table (cellgroupvar,
+ * "A GROUP BY column beside the cells"), whose entries the walk then drives
+ * by, each its own group - with a WHERE the cells test, or other expressions
+ * over predicates, beside it: a GROUP BY of that column alone is the plain
+ * walk's.  The table is the query's only one, or the one an anti join over a
+ * small inner side counts (§27), whose rows found the cells lose
  * (lion_count_path_anti()): not the fact of an FK-side join.
  */
 static bool
@@ -5913,19 +5978,48 @@ lion_count_cells_group_by(LionCountPathBuild *cx)
 		if (tle == NULL)
 			return false;
 		e = (Node *) tle->expr;
+		if (IsA(e, Var))
+		{
+			Var		   *v = (Var *) e;
+
+			/* the one plain column of the table: the driver's */
+			if (cx->cellgroupvar != NULL || v->varno != (int) cx->rti ||
+				v->varattno <= 0 || v->varlevelsup != 0)
+				return false;
+			cx->cellgroupvar = v;
+			continue;
+		}
 		if (lion_strip(e) == NULL || IsA(lion_strip(e), Var) ||
 			!lion_cells_shape_ok(root, cx->input_rel, cx->rti, e))
 			return false;
 		cx->cellexprs = lappend(cx->cellexprs, e);
 	}
+	if (cx->cellgroupvar != NULL && cx->cellexprs == NIL)
+	{
+		ListCell   *lr;
+		bool		any = false;
+
+		/* ... and a clause over predicates beside it, which needs cells */
+		foreach(lr, cx->input_rel->baserestrictinfo)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lr);
+
+			if (IsA(rinfo, RestrictInfo) &&
+				lion_cells_candidate_walker((Node *) rinfo->clause, NULL) &&
+				lion_cells_shape_ok(root, cx->input_rel, cx->rti,
+									(Node *) rinfo->clause))
+				any = true;
+		}
+		return any;
+	}
 	return true;
 }
 
 /*
- * The target list and the HAVING: the GROUP BY's expressions, and counts the
- * node answers - count(*), and the count(col) of a column every row counted
- * has non-NULL, or NULL - and expressions over them; no column outside the
- * GROUP BY's expressions, which the cells do not keep.
+ * The target list and the HAVING: the GROUP BY's expressions and column, and
+ * counts the node answers - count(*), the count(col) of a column every row
+ * counted has non-NULL, or NULL, and of the GROUP BY column - and expressions
+ * over them; no column outside the GROUP BY, which the cells do not keep.
  */
 static bool
 lion_count_cells_outputs(LionCountPathBuild *cx)
@@ -5942,7 +6036,8 @@ lion_count_cells_outputs(LionCountPathBuild *cx)
 		List	   *vars;
 		ListCell   *lv;
 
-		if (list_member(cx->cellexprs, node))
+		if (list_member(cx->cellexprs, node) ||
+			(cx->cellgroupvar != NULL && equal(node, cx->cellgroupvar)))
 			continue;
 		if (contain_subplans(node) || contain_window_function(node))
 			return false;
@@ -5952,12 +6047,16 @@ lion_count_cells_outputs(LionCountPathBuild *cx)
 		{
 			Aggref	   *agg = (Aggref *) lfirst(lv);
 
+			if (cx->cellgroupvar != NULL && equal(agg, cx->cellgroupvar))
+				continue;
 			if (!IsA(agg, Aggref) ||
 				agg->aggdistinct != NIL || agg->aggorder != NIL ||
 				agg->aggfilter != NULL || agg->aggsplit != AGGSPLIT_SIMPLE ||
 				!lion_agg_is_count(cx->root, agg, cx->rti, cx->input_rel,
-								   NULL, 0, cx->nonnullattnos,
-								   cx->nullattnos))
+								   cx->cellgroupvar != NULL ?
+								   &cx->cellgroupvar->varattno : NULL,
+								   cx->cellgroupvar != NULL ? 1 : 0,
+								   cx->nonnullattnos, cx->nullattnos))
 				return false;
 			haveagg = true;
 		}
@@ -6022,7 +6121,7 @@ lion_count_cells_strategy(LionCountPathBuild *cx)
 static void
 lion_add_parallel_cells_path(LionCountPathBuild *cx, CustomPath *serial,
 							 Cost serialrun, Cost perrange,
-							 const AggClauseCosts *costs, Path *child,
+							 const AggClauseCosts *costs, List *children,
 							 Cost once)
 {
 	PlannerInfo *root = cx->root;
@@ -6067,10 +6166,16 @@ lion_add_parallel_cells_path(LionCountPathBuild *cx, CustomPath *serial,
 	cpath->path.total_cost = cpath->path.startup_cost +
 		rows * cpu_tuple_cost;
 #if PG_VERSION_NUM >= 180000
-	cpath->path.disabled_nodes = (child != NULL) ? child->disabled_nodes : 0;
+	cpath->path.disabled_nodes = 0;
+	{
+		ListCell   *dl;
+
+		foreach(dl, children)
+			cpath->path.disabled_nodes += ((Path *) lfirst(dl))->disabled_nodes;
+	}
 #endif
 	cpath->flags = serial->flags;
-	cpath->custom_paths = (child != NULL) ? list_make1(child) : NIL;
+	cpath->custom_paths = children;
 #if PG_VERSION_NUM >= 170000
 	cpath->custom_restrictinfo = NIL;
 #endif
@@ -6112,7 +6217,7 @@ lion_count_cells_add(LionCountPathBuild *cx, CustomPath *cpath)
 	Cost		serialrun;
 	Cost		antilookups;
 	Cost		antirun;
-	Path	   *antichild;
+	List	   *antichild;
 
 	lion_units_for(root, output_rel, &units);
 	if (lion_where_query_unknown(cx->whereclauses, cx->wherekinds,
@@ -6156,7 +6261,7 @@ lion_count_cells_add(LionCountPathBuild *cx, CustomPath *cpath)
 		is_parallel_safe(root, (Node *) cx->cellplan->predexprs) &&
 		is_parallel_safe(root, (Node *) cx->cellquals) &&
 		is_parallel_safe(root, (Node *) cpath->path.pathtarget->exprs) &&
-		(cx->anti == NULL || antichild != NULL))
+		(cx->anti == NULL || antichild != NIL))
 		lion_add_parallel_cells_path(cx, cpath, serialrun, perrange,
 									 &agg_final_costs, antichild, antirun);
 
@@ -6210,21 +6315,55 @@ lion_try_count_cells(const LionCountPathBuild *cxp)
 							false);
 	if (cp == NULL)
 		return;
-	fallback = lion_count_all_driver(&cx);
+	/* ... the GROUP BY column, which drives, or a column of the walk's choice */
+	fallback = (cx.cellgroupvar != NULL) ? cx.cellgroupvar :
+		lion_count_all_driver(&cx);
 	if (fallback != NULL)
 		fbentries = estimate_num_groups(root, list_make1(fallback),
 										Max(rel->tuples, 1.0), NULL, NULL) +
 			1.0;
-	if (!lion_cells_choose_driver(root, rel, cp, fallback, fbentries))
+	if (!lion_cells_choose_driver(root, rel, cp, fallback, fbentries,
+								  cx.cellgroupvar != NULL))
 		return;
 
-	/* ... the decoded walk's one column, which groups nothing */
+	/*
+	 * ... the decoded walk's one column, which groups nothing - or is the
+	 * GROUP BY column, its key each row's under its equality
+	 */
 	cx.groupvar[0] = cp->drvvar;
 	cx.groupattno[0] = cp->drvvar->varattno;
-	cx.groupeqop[0] = (cp->drv >= 0) ? cp->dims[cp->drv].priv.eqop : InvalidOid;
-	cx.groupcoll[0] = (cp->drv >= 0) ?
-		cp->dims[cp->drv].priv.collation : InvalidOid;
-	cx.groupvalueout[0] = false;
+	if (cx.cellgroupvar != NULL)
+	{
+		SortGroupClause *sgc = NULL;
+		ListCell   *lg;
+
+		foreach(lg, root->processed_groupClause)
+		{
+			SortGroupClause *one = (SortGroupClause *) lfirst(lg);
+			TargetEntry *tle = get_sortgroupclause_tle(one,
+													   root->processed_tlist);
+
+			if (tle != NULL && equal(tle->expr, cx.cellgroupvar))
+				sgc = one;
+		}
+		if (sgc == NULL ||
+			(cp->drv >= 0 &&
+			 (cp->dims[cp->drv].priv.eqop != sgc->eqop ||
+			  cp->dims[cp->drv].priv.collation !=
+			  exprCollation((Node *) cx.cellgroupvar))))
+			return;
+		cx.groupeqop[0] = sgc->eqop;
+		cx.groupcoll[0] = exprCollation((Node *) cx.cellgroupvar);
+		cx.groupvalueout[0] = true;
+	}
+	else
+	{
+		cx.groupeqop[0] = (cp->drv >= 0) ? cp->dims[cp->drv].priv.eqop :
+			InvalidOid;
+		cx.groupcoll[0] = (cp->drv >= 0) ?
+			cp->dims[cp->drv].priv.collation : InvalidOid;
+		cx.groupvalueout[0] = false;
+	}
 	cx.ngroup = 1;
 	cx.decode = true;
 	cx.driveattno = cx.groupattno[0];
@@ -6252,11 +6391,30 @@ lion_try_count_cells(const LionCountPathBuild *cxp)
 									 clauselist_selectivity(root, quals,
 															cx.rti,
 															JOIN_INNER, NULL));
-	cx.outrows = clamp_row_est(lion_cells_nonempty(cp, cx.cellwhererows));
-	cx.numgroups = (cx.cellexprs != NIL) ?
-		clamp_row_est(Min(estimate_num_groups(root, cx.cellexprs,
-											  cx.cellwhererows, NULL, NULL),
-						  cx.outrows)) : 1.0;
+	if (cx.cellgroupvar != NULL)
+	{
+		/* ... the cells of each group's share of the rows, a group a value */
+		double		ngrp = Max(cp->drventries, 1.0);
+
+		cx.outrows = clamp_row_est(Min(ngrp *
+									   lion_cells_nonempty(cp,
+														   cx.cellwhererows / ngrp),
+									   cx.cellwhererows));
+		cx.numgroups = clamp_row_est(Min(estimate_num_groups(root,
+															 lappend(list_copy(cx.cellexprs),
+																	 cx.cellgroupvar),
+															 cx.cellwhererows,
+															 NULL, NULL),
+										 cx.outrows));
+	}
+	else
+	{
+		cx.outrows = clamp_row_est(lion_cells_nonempty(cp, cx.cellwhererows));
+		cx.numgroups = (cx.cellexprs != NIL) ?
+			clamp_row_est(Min(estimate_num_groups(root, cx.cellexprs,
+												  cx.cellwhererows, NULL, NULL),
+							  cx.outrows)) : 1.0;
+	}
 	cx.partialtarget = lion_make_partial_target(root,
 												cx.output_rel->reltarget,
 												cx.having);
@@ -6265,6 +6423,9 @@ lion_try_count_cells(const LionCountPathBuild *cxp)
 	if (cx.priv.vcols != NIL)
 		return;					/* an expression column: not beside cells */
 	lion_cells_fill_priv(cp, &cx.priv, cx.cellquals);
+	cx.priv.cellgroup = (cx.cellgroupvar != NULL);
+	if (cx.priv.cellgroup)
+		cx.priv.groupattno = cx.cellgroupvar->varattno;
 
 	/*
 	 * The predicates' functions, which core's plan would call computing the

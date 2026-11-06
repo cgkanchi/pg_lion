@@ -694,12 +694,15 @@ lion_priv_decode_cells(List *priv, LionPrivStage stage, LionCountPriv *out)
 	hdr = (List *) linitial(m);
 	dims = (List *) lsecond(m);
 	preds = (List *) lthird(m);
-	if (hdr == NIL || !IsA(hdr, IntList) || list_length(hdr) != 3 ||
+	if (hdr == NIL || !IsA(hdr, IntList) || list_length(hdr) != 4 ||
 		dims == NIL || !IsA(dims, List) || preds == NIL || !IsA(preds, List))
 		elog(ERROR, "LionCount: malformed CELLS member of custom_private");
 	out->ncelldim = linitial_int(hdr);
 	out->ncellpred = lsecond_int(hdr);
 	out->celldrv = lthird_int(hdr);
+	if (lfourth_int(hdr) != 0 && lfourth_int(hdr) != 1)
+		elog(ERROR, "LionCount: malformed CELLS member of custom_private");
+	out->cellgroup = (lfourth_int(hdr) != 0);
 	if (out->ncelldim < 1 || out->ncelldim > LION_CELLS_MAX_DIMS ||
 		out->ncelldim != list_length(dims) ||
 		out->ncellpred < 1 || out->ncellpred > LION_CELLS_MAX_PREDS ||
@@ -851,10 +854,11 @@ lion_priv_decode_cells(List *priv, LionPrivStage stage, LionCountPriv *out)
  * The anti join over a small inner side (DESIGN.md §27, "The anti join over a
  * small inner side"): its counts, each scan key's column, operator, collation
  * and order, the GROUP BY's equalities and their orders - one where there is
- * the other - and at the PATH stage its expressions, as many as the counts
- * say.  Each count is bounded, and so is
- * their sum, by what a List holds (LION_MAX_ANTI_EXPRS): the executor takes
- * that many expressions off the end of custom_exprs.
+ * the other, its arms - each past the first one with join clauses that are
+ * only its scan keys - and at the PATH stage its expressions, as many as the
+ * counts say.  Each count is bounded, and so is their sum, by what a List
+ * holds (LION_MAX_ANTI_EXPRS): the executor takes that many expressions off
+ * the end of custom_exprs.
  */
 static void
 lion_priv_decode_anti(List *priv, LionPrivStage stage, LionCountPriv *out)
@@ -871,17 +875,21 @@ lion_priv_decode_anti(List *priv, LionPrivStage stage, LionCountPriv *out)
 							(stage == LION_PRIV_STAGE_PLAN) ? 2 : 3);
 	ints = (List *) linitial(m);
 	oids = (List *) lsecond(m);
-	if (ints == NIL || !IsA(ints, IntList) || list_length(ints) < 3 ||
+	if (ints == NIL || !IsA(ints, IntList) || list_length(ints) < 4 ||
 		oids == NIL || !IsA(oids, OidList))
 		elog(ERROR, "LionCount: malformed ANTI member of custom_private");
 	a->nkey = linitial_int(ints);
 	a->njoin = lsecond_int(ints);
 	a->nrestrict = lthird_int(ints);
+	a->narm = lfourth_int(ints);
 	if (a->nkey < 1 || a->nkey > LION_MAX_ANTI_KEYS ||
 		a->njoin < a->nkey || a->njoin > LION_MAX_ANTI_EXPRS ||
 		a->nrestrict < 0 || a->nrestrict > LION_MAX_ANTI_EXPRS ||
-		a->nkey + a->njoin + a->nrestrict > LION_MAX_ANTI_EXPRS ||
-		list_length(ints) != 3 + a->nkey ||
+		a->narm < 1 || a->narm > LION_MAX_ANTI_ARMS ||
+		(a->narm > 1 && a->njoin != a->nkey) ||
+		a->nkey + a->njoin + a->nrestrict + 2 * a->nkey * (a->narm - 1) >
+		LION_MAX_ANTI_EXPRS ||
+		list_length(ints) != 4 + a->nkey ||
 		list_length(oids) != 1 + 3 * a->nkey + 6)
 		elog(ERROR, "LionCount: malformed ANTI member of custom_private");
 	a->idxoid = linitial_oid(oids);
@@ -889,7 +897,7 @@ lion_priv_decode_anti(List *priv, LionPrivStage stage, LionCountPriv *out)
 		elog(ERROR, "LionCount: malformed ANTI member of custom_private");
 	for (i = 0; i < a->nkey; i++)
 	{
-		a->keycol[i] = (AttrNumber) list_nth_int(ints, 3 + i);
+		a->keycol[i] = (AttrNumber) list_nth_int(ints, 4 + i);
 		a->keyop[i] = list_nth_oid(oids, 1 + i);
 		a->keycoll[i] = list_nth_oid(oids, 1 + a->nkey + i);
 		a->keysort[i] = list_nth_oid(oids, 1 + 2 * a->nkey + i);
@@ -912,7 +920,8 @@ lion_priv_decode_anti(List *priv, LionPrivStage stage, LionCountPriv *out)
 		return;
 	a->exprs = (List *) lthird(m);
 	if (!lion_priv_is(a->exprs, T_List) ||
-		list_length(a->exprs) != a->nkey + a->njoin + a->nrestrict)
+		list_length(a->exprs) != a->nkey + a->njoin + a->nrestrict +
+		2 * a->nkey * (a->narm - 1))
 		elog(ERROR, "LionCount: malformed ANTI member of custom_private");
 }
 
@@ -1329,7 +1338,8 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 				one = lappend_int(one, (int) pp->truth[j]);
 			preds = lappend(preds, one);
 		}
-		m = list_make3(list_make3_int(p->ncelldim, p->ncellpred, p->celldrv),
+		m = list_make3(list_make4_int(p->ncelldim, p->ncellpred, p->celldrv,
+									  p->cellgroup ? 1 : 0),
 					   dims, preds);
 		if (stage == LION_PRIV_STAGE_PATH)
 			m = lappend(lappend(m, p->cellexprs), p->cellquals);
@@ -1341,7 +1351,8 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 	if (p->hasanti)
 	{
 		const LionCountPrivAnti *a = &p->anti;
-		List	   *aints = list_make3_int(a->nkey, a->njoin, a->nrestrict);
+		List	   *aints = list_make4_int(a->nkey, a->njoin, a->nrestrict,
+											 a->narm);
 		List	   *aoids = list_make1_oid(a->idxoid);
 
 		for (i = 0; i < a->nkey; i++)
@@ -1779,16 +1790,16 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	/*
 	 * The anti join over a small inner side (DESIGN.md §27, "The anti join
 	 * over a small inner side") is a count of one plain table, ungrouped,
-	 * grouped by its own columns or by cells, less the rows its one child's
-	 * rows match: never the FK-side join, partitions, a count(DISTINCT)
-	 * walked, the aggregates over keys, a top k, filtered counts, a coalesce
-	 * group or expression columns.  Its GROUP BY columns have their
-	 * equalities, and only they; the decoded walk and a parallel GROUP BY are
-	 * a count by cells', whose walked column groups nothing.  A plan without
-	 * one has no child but a join's.
+	 * grouped by its own columns or by cells, less the rows its children's
+	 * rows match - a child an arm: never the FK-side join, partitions, a
+	 * count(DISTINCT) walked, the aggregates over keys, a top k, filtered
+	 * counts, a coalesce group or expression columns.  Its GROUP BY columns
+	 * have their equalities, and only they; the decoded walk and a parallel
+	 * GROUP BY are a count by cells', whose walked column groups nothing.  A
+	 * plan without one has no child but a join's.
 	 */
 	if (p->hasanti &&
-		(p->hasjoin || ncustom_plans != 1 || p->npart > 0 ||
+		(p->hasjoin || ncustom_plans != p->anti.narm || p->npart > 0 ||
 		 p->distattno != 0 || p->nwcol > 0 || p->topkn > 0 ||
 		 p->nfilter > 0 || p->coalconst != NULL || p->vcols != NIL ||
 		 (p->ncelldim > 0 ?
@@ -1802,7 +1813,8 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 		elog(ERROR, "LionCount: a child without a join");
 	for (i = 0; i < p->ntl; i++)
 	{
-		if (LION_TL_IS_ANTI(p->tlkind[i]) && !p->hasanti)
+		if (LION_TL_IS_ANTI(p->tlkind[i]) &&
+			(!p->hasanti || LION_TL_ANTI_ARM(p->tlkind[i]) >= p->anti.narm))
 			elog(ERROR, "LionCount: an inner column without an anti join");
 	}
 
@@ -1999,7 +2011,10 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	 * aggregate over keys, a top k, a residual clause or a complement OR -
 	 * and, beside an anti join, the columns its clauses read, which nothing
 	 * prints.  The driver is a dimension's column, or a column no predicate
-	 * reads.  A complement OR is refused for the decoded walk below.
+	 * reads.  A complement OR is refused for the decoded walk below.  Of a
+	 * GROUP BY column beside the cells (cellgroup) the driver's column is
+	 * that column, whose key each row carries, and whose count(col) it may
+	 * be asked.
 	 */
 	if (p->ncelldim > 0)
 	{
@@ -2019,6 +2034,8 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 		if (LION_TL_IS_CELLPRED(kind) ? p->ncelldim == 0 :
 			(p->ncelldim > 0 &&
 			 kind != LION_TL_COUNT && kind != LION_TL_COUNT_ZERO &&
+			 !(p->cellgroup &&
+			   (kind == LION_TL_GROUPKEY || kind == LION_TL_COUNT_GROUPCOL)) &&
 			 !(p->hasanti &&
 			   (LION_TL_IS_RESID(kind) || LION_TL_IS_ANTI(kind)))))
 			elog(ERROR, "LionCount: target list kind %d in a count %s cells",

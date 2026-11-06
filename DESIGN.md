@@ -4062,8 +4062,9 @@ set a participant.
 **The plan.** custom_private member 23, `LION_PRIV_CELLS` (shape 28): each dimension's kind, column,
 index, outcomes, NULL's outcome, the values with their outcomes or the leaves' operators and
 queries; each predicate's dimension and its truth in each outcome - a table for a scalar
-dimension's, a bit for a leaf, the two truths of a null test of a multi-key column; and the driver's
-dimension, or -1. The anti join's ANTI member (24, §27) and TLKINDS (25) follow it: 26 members, the
+dimension's, a bit for a leaf, the two truths of a null test of a multi-key column; the driver's
+dimension, or -1; and (shape 33, magic 0x52424921) whether the driver's column is a GROUP BY column
+too ("A GROUP BY column beside the cells" below). The anti join's ANTI member (24, §27) and TLKINDS (25) follow it: 26 members, the
 magic 0x5242491d. At the path stage the member also carries the predicates and the clauses over
 them, which `lion_plan_custom_path()` makes custom_scan_tlist's columns and the plan's qual.
 `LION_FLAG_DECODE` with the driver as the one GROUPN column.
@@ -4138,6 +4139,35 @@ VACUUM; enum columns and a domain over one; and parallel plans, with rows the he
 list on the driver's column - short, of no value with rows, a Param's past a batch, beside the anti
 join - and the WHEREs that stay serial: a range source, a Param's multi-key query, a literal
 prefix too common to expand, a tsquery's or a jsonpath's.
+
+**A GROUP BY column beside the cells** (2026-11-05). `SELECT c, count(*) FROM t WHERE <tier over
+predicates> GROUP BY c ORDER BY 2 DESC LIMIT 10` - the top values of a column among the rows of a
+tier - has a bare column of t beside the predicates' expressions (or none of them: a WHERE over
+predicates is enough). The column is the driver (`lion_cells_choose_driver(..., grouped)`, which
+takes no other dimension and the column whatever the work), and the walk codes each row as
+`cell * G + v`: `v` the driver entry's place in its pass, G the pass's capacity, the cell's
+dimensions' weights scaled by G (`lion_cells_grouped_scale()`). Each pass of entries is one tally
+(`lion_next_cells_grouped()`), emitted as a row per non-empty (entry, cell) with the entry's key as
+the column's value - NULL's entry its group's - and core's Finalize Aggregate above adds the cells
+of a group up, as it adds the cells of a CASE's value. `count(c)` is the group's count but in the
+NULL group (`LION_TL_COUNT_GROUPCOL`); a column the predicates test too is both the driver and a
+dimension, as a driver may be. The planner takes it only where the GROUP BY's equality and
+collation are the column's dimension's (a different collation would merge entries the walk keeps
+apart), and prices the passes as the decoded walk's; the groups out are those of the column the
+WHERE leaves. In parallel the participants claim ranges of container keys, a range all passes
+(`lion_cells_grouped_range()`), and the Finalize Aggregate adds their partial counts. EXPLAIN says
+`Group Strategy: Cells, by the grouping column` and `Cells` counts the predicates' cells, a
+group's. *Beside the anti join* (§27, "Counts by cells beside the anti join"): the rows found are
+not taken from cells after the count but left out of the walk. Each row found is put into a sort
+by the code of the TID the indexes have of it - a heap-only tuple's chain root, which the B-tree's
+fetch followed to the member it returns (`heap_get_root_tuples()` under the page's share lock and
+the slot's pin) - and each pass reads the sort again from its start (`lion_anti_exclude_rewind()`),
+clearing each row's bit from the WHERE's rows at its container key before they are coded
+(`LionCellsExclude`, `lion_count_cells()`). The bit is the row's whether the walk would count it or
+not: a row found that the WHERE rejects clears nothing, and `Rows Subtracted` counts the bits
+cleared. Exact because the walk counts a row at its root's TID once, and of a HOT chain the snapshot
+sees one member at most - the one the B-tree returned. In parallel every participant makes the sort
+whole, each range clearing its own rows.
 
 **Ranges** (not done). The analysis takes a range of a scalar column for LionProbeJoin (§46,
 "Ranges": the column's values in the index's order, the gaps between them and NULL its pieces,
@@ -15158,6 +15188,26 @@ column, or a strict qual on it) and its operator is a B-tree's or a hash index's
 NULL for values that are not: then NOT IN and NOT EXISTS are the same join, a sublink anti join with
 its own join entry, and the node takes it as it takes the NOT EXISTS - its answer is core's. A NOT
 IN over a side that may be NULL stays a SubPlan there too.
+
+**Several anti joins** (2026-11-05). `... AND NOT EXISTS (SELECT 1 FROM s1 WHERE s1.a = t.k) AND NOT
+EXISTS (SELECT 1 FROM s2 WHERE s2.b = t.k)`, either spelled as a LEFT JOIN as above, is t's rows that
+neither side matches: C less the union of the two Ms. Each anti join is an ARM: a special join whose
+min_lefthand is t alone, the arms' inner sides disjoint and together every other table of the join
+rel, every other special join inside one of them, and up to `LION_MAX_ANTI_ARMS` (8) of them
+(`lion_fkjoin_recognize_small_anti()`; t is the one table no join's syn_righthand holds). Each arm's
+clauses are found as one arm's are (`lion_small_anti_arm()`), and each of t's join clauses must be
+exactly one arm's. The node takes them where every arm's keys are the same scan keys of the same
+B-tree - the same column, operator, collation and key type - and no arm has a join clause but its
+keys (`lion_anti_choose()`, `lion_anti_arm_keys()`): then a row found by a key is in M for every arm
+whose child gave that key, the arms' keys go into the one sort, and the lookup of each distinct key
+once takes away each row once, however many arms gave its key. Each arm's child is a child of the
+node; the collection reads them one after another (`lion_anti_collect()`), each key's expressions
+evaluated over its own arm's row (`LION_TL_ANTI(arm, resno)` columns, a column's arm in its kind).
+Arms on different columns, or with further join clauses, are core's: their union would need each
+row found tested against every arm's clauses, or a lookup per column. The price is one arm's with the
+keys of all (`lion_anti_price()`: the lookups the sum of each arm's distinct keys, a bound on the
+union's, the sort the arms' rows together); the parallel form needs a parallel-safe child for every
+arm. EXPLAIN prints the arms' conditions ORed in `Join Cond`, and each child below the node.
 
 **The B-tree** (`lion_anti_choose()`, lion_plan_anti.c): a B-tree of t's own that has
 `amgettuple`, not hypothetical, whole or partial with a predicate t's restrictions imply (`predOK`:

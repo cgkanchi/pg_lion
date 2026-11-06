@@ -782,13 +782,16 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	 * truth of each predicate in a cell, first in custom_scan_tlist, which
 	 * setrefs.c matches the GROUP BY's expressions and the clauses over the
 	 * predicates against, top down, so that the node's projection computes
-	 * them from the truths and its qual tests them once a cell.
+	 * them from the truths and its qual tests them once a cell.  A GROUP BY
+	 * column beside them is emitted, the walked entry's key (DESIGN.md §10,
+	 * "A GROUP BY column beside the cells").
 	 */
 	if (priv.ncelldim > 0)
 	{
 		int			i = 0;
 
-		groupattno = groupattno2 = 0;
+		groupattno = priv.cellgroup ? priv.groupattno : 0;
+		groupattno2 = 0;
 		foreach(lc, priv.cellexprs)
 		{
 			ctlist = lappend(ctlist,
@@ -846,7 +849,9 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		if (IsA(sexpr, Aggref) ||
 			(priv.ncelldim == 0 &&
 			 (IsA(sexpr, Var) ||
-			  lion_plan_is_group_coalesce(sexpr, &priv))))
+			  lion_plan_is_group_coalesce(sexpr, &priv))) ||
+			(priv.cellgroup && IsA(sexpr, Var) &&
+			 ((Var *) sexpr)->varattno == priv.groupattno))
 		{
 			want = lappend(want, tle);
 			continue;
@@ -1111,19 +1116,18 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	 * The columns the anti join over a small inner side reads (DESIGN.md
 	 * §27, "The anti join over a small inner side"), each once: the table's
 	 * as the residual clauses' are, a column the target list prints already
-	 * or a LION_TL_RESID one, and the inner side's as LION_TL_ANTI columns
-	 * of its child's target list, which the node fills from each child row.
-	 * Its keys' values, join clauses and restrictions then read them.
+	 * or a LION_TL_RESID one, and an inner side's as LION_TL_ANTI columns
+	 * of its arm's child's target list, which the node fills from each of
+	 * its rows - the arm whose inner side has the column's table.  Its keys'
+	 * values, join clauses and restrictions then read them.
 	 */
 	if (priv.hasanti)
 	{
-		Plan	   *child;
 		List	   *vars;
 
-		if (list_length(custom_plans) != 1 ||
-			list_length(best_path->custom_paths) != 1)
-			elog(ERROR, "LionCount: an anti join needs one child plan");
-		child = (Plan *) linitial(custom_plans);
+		if (list_length(custom_plans) != priv.anti.narm ||
+			list_length(best_path->custom_paths) != priv.anti.narm)
+			elog(ERROR, "LionCount: an anti join needs a child plan an arm");
 		vars = pull_var_clause((Node *) priv.anti.exprs, 0);
 		foreach(lc, vars)
 		{
@@ -1131,10 +1135,24 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			ListCell   *l2;
 			bool		dup = false;
 			bool		outer;
+			int			arm = 0;
 
 			if (!IsA(var, Var) || var->varattno <= 0)
 				elog(ERROR, "LionCount: an anti join reads more than columns");
 			outer = (var->varno == (int) priv.scanrelid);
+			if (!outer)
+			{
+				foreach(l2, best_path->custom_paths)
+				{
+					if (bms_is_member(var->varno,
+									  ((Path *) lfirst(l2))->parent->relids))
+						break;
+					arm++;
+				}
+				if (arm >= priv.anti.narm)
+					elog(ERROR, "LionCount: column %d of relation %d is in no anti join's inner side",
+						 (int) var->varattno, (int) var->varno);
+			}
 			foreach(l2, ctlist)
 			{
 				Node	   *e = (Node *) ((TargetEntry *) lfirst(l2))->expr;
@@ -1153,9 +1171,16 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 							 makeTargetEntry((Expr *) copyObject(var),
 											 list_length(ctlist) + 1,
 											 NULL, true));
-			kinds = lappend_int(kinds, outer ?
-								LION_TL_RESID(var->varattno) :
-								LION_TL_ANTI(lion_child_resno(child, var)));
+			if (outer)
+				kinds = lappend_int(kinds, LION_TL_RESID(var->varattno));
+			else
+			{
+				Plan	   *child = (Plan *) list_nth(custom_plans, arm);
+
+				kinds = lappend_int(kinds,
+									LION_TL_ANTI(arm,
+												 lion_child_resno(child, var)));
+			}
 		}
 		list_free(vars);
 	}

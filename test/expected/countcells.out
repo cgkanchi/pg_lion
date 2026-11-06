@@ -399,9 +399,8 @@ SELECT q, lcc_check(q) FROM (VALUES
 	-- a volatile function, and a stable one
 	('SELECT CASE WHEN k = 1 AND random() < 2 THEN 1 END AS v, count(*) FROM lcc GROUP BY 1'),
 	('SELECT CASE WHEN k = 1 THEN now() > ''2000-01-01'' END AS v, count(*) FROM lcc GROUP BY 1'),
-	-- a CASE with an argument, and a column of the GROUP BY by itself
+	-- a CASE with an argument
 	('SELECT CASE k WHEN 1 THEN ''a'' ELSE ''b'' END AS v, count(*) FROM lcc GROUP BY 1'),
-	('SELECT k, (f IS TRUE) AS v, count(*) FROM lcc GROUP BY 1, 2'),
 	-- a count the cells do not answer, and an aggregate other than count
 	('SELECT (k = 1) AS v, count(s) FROM lcc GROUP BY 1'),
 	('SELECT (k = 1) AS v, sum(n) FROM lcc GROUP BY 1'),
@@ -420,13 +419,12 @@ SELECT q, lcc_check(q) FROM (VALUES
  SELECT CASE WHEN k = 1 AND random() < 2 THEN 1 END AS v, count(*) FROM lcc GROUP BY 1   | not cells, 2 rows
  SELECT CASE WHEN k = 1 THEN now() > '2000-01-01' END AS v, count(*) FROM lcc GROUP BY 1 | not cells, 2 rows
  SELECT CASE k WHEN 1 THEN 'a' ELSE 'b' END AS v, count(*) FROM lcc GROUP BY 1           | not cells, 2 rows
- SELECT k, (f IS TRUE) AS v, count(*) FROM lcc GROUP BY 1, 2                             | not cells, 32 rows
  SELECT (k = 1) AS v, count(s) FROM lcc GROUP BY 1                                       | not cells, 3 rows
  SELECT (k = 1) AS v, sum(n) FROM lcc GROUP BY 1                                         | not cells, 3 rows
  SELECT (n < 10) AS v, count(*) FROM lcc GROUP BY 1                                      | not cells, 2 rows
  SELECT (w @@ 'a3 | !b1'::tsquery) AS v, count(*) FROM lcc GROUP BY 1                    | not cells, 3 rows
  SELECT tier, count(*) FROM lcc_tiered WHERE f IS NOT NULL GROUP BY tier                 | not cells, 4 rows
-(12 rows)
+(11 rows)
 
 -- more cells than pg_lion.count_cells_max
 SET pg_lion.count_cells_max = 20;
@@ -1410,6 +1408,238 @@ DROP VIEW lcc_e_scored;
 DROP TABLE lcc_e, lcc_e_skip;
 DROP DOMAIN lcc_dmood;
 DROP TYPE lcc_mood, lcc_tone;
+-- ---------- 11. a GROUP BY column beside the cells ----------
+-- A column of the table grouped by itself, beside predicates: the cells
+-- walk it, a pass of its entries at a time, and a row counts in its entry's
+-- group of the cell its truths make (DESIGN.md §10, "A GROUP BY column beside
+-- the cells").  k is a column the score tests too, s one of NULLs, n one of
+-- 100 values, r the column that gates the score and g a boolean.
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SELECT * FROM lcc_plan(
+	'SELECT k, count(*) FROM lcc_tiered WHERE tier = ''high'' GROUP BY k') AS p("QUERY PLAN");
+                                                                                                                                                                  QUERY PLAN                                                                                                                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   ->  Custom Scan (LionCount)
+         Filter: (...)
+         Lion Indexes: lcc_ks.k (k)
+         Group Strategy: Cells, by the grouping column
+         Cell Columns: lcc_r (r), lcc_ks.k (k), lcc_tags (tags), lcc_ks.s (s), lcc_fg.f (f), lcc_w (w), lcc_z (z)
+         Cell Predicates: ((r = 'r1'::text) OR (r = 'r3'::text) OR (r = 'r4'::text)), (k = ANY ('{1,2,3}'::integer[])), (k = ANY ('{4,5}'::integer[])), ((k = 6) OR (k = 7)), (k IS NULL), (tags && '{1,2}'::integer[]), (tags && '{9,10}'::integer[]), (s = 's2'::text), (s IS NULL), f, (w @@ '''a1'' | ''a2'' & ''b3'''::tsquery), (z = 9)
+         Cells: 4050
+(8 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT k, count(*) FROM lcc_tiered WHERE tier = ''high'' GROUP BY k'),
+	('SELECT s, count(*) FROM lcc_tiered WHERE tier IN (''high'', ''medium'') GROUP BY s'),
+	('SELECT n, count(*) FROM lcc_tiered WHERE n < 50 AND tier = ''medium'' GROUP BY n'),
+	('SELECT r, count(*) FROM lcc_tiered WHERE tier <> ''none'' GROUP BY r'),
+	('SELECT g, count(*), count(g) FROM lcc_tiered WHERE tier = ''low'' GROUP BY g'),
+	('SELECT s, count(s) FROM lcc_tiered WHERE tier = ''high'' GROUP BY s'),
+	('SELECT k, count(*) FROM lcc_tiered WHERE tier = ''high'' GROUP BY k HAVING count(*) > 100'),
+	('SELECT n, count(*) FROM lcc_tiered WHERE tier = ''high'' GROUP BY n ORDER BY 2 DESC, 1 LIMIT 5'),
+	('SELECT k, tier, count(*) FROM lcc_tiered GROUP BY k, tier'),
+	('SELECT k, (f IS TRUE) AS v, count(*) FROM lcc GROUP BY 1, 2'),
+	-- a WHERE that selects no row: no group
+	('SELECT k, count(*) FROM lcc_tiered WHERE n = 1000 AND tier = ''high'' GROUP BY k')
+) v(q);
+                                              q                                               |      lcc_check      
+----------------------------------------------------------------------------------------------+---------------------
+ SELECT k, count(*) FROM lcc_tiered WHERE tier = 'high' GROUP BY k                            | 4050 cells, 16 rows
+ SELECT s, count(*) FROM lcc_tiered WHERE tier IN ('high', 'medium') GROUP BY s               | 4050 cells, 7 rows
+ SELECT n, count(*) FROM lcc_tiered WHERE n < 50 AND tier = 'medium' GROUP BY n               | 4050 cells, 50 rows
+ SELECT r, count(*) FROM lcc_tiered WHERE tier <> 'none' GROUP BY r                           | 4050 cells, 3 rows
+ SELECT g, count(*), count(g) FROM lcc_tiered WHERE tier = 'low' GROUP BY g                   | 4050 cells, 2 rows
+ SELECT s, count(s) FROM lcc_tiered WHERE tier = 'high' GROUP BY s                            | 4050 cells, 7 rows
+ SELECT k, count(*) FROM lcc_tiered WHERE tier = 'high' GROUP BY k HAVING count(*) > 100      | 4050 cells, 0 rows
+ SELECT n, count(*) FROM lcc_tiered WHERE tier = 'high' GROUP BY n ORDER BY 2 DESC, 1 LIMIT 5 | 4050 cells, 5 rows
+ SELECT k, tier, count(*) FROM lcc_tiered GROUP BY k, tier                                    | 4050 cells, 64 rows
+ SELECT k, (f IS TRUE) AS v, count(*) FROM lcc GROUP BY 1, 2                                  | 2 cells, 32 rows
+ SELECT k, count(*) FROM lcc_tiered WHERE n = 1000 AND tier = 'high' GROUP BY k               | not cells, 0 rows
+(11 rows)
+
+-- ... beside anti joins over a small inner side, whose rows found the walk
+-- leaves out: by id a row a key, by n some 400; NOT EXISTS, the LEFT JOIN
+-- form, a join clause besides the key, and two of them
+CREATE TABLE lcc_gskip (a int, b int);
+INSERT INTO lcc_gskip
+SELECT i * 523, CASE WHEN i % 4 = 0 THEN 0 ELSE i * 523 END FROM generate_series(1, 30) i;
+INSERT INTO lcc_gskip VALUES (7, 7), (7, 7), (11, 11), (40001, 1), (NULL, 3), (-2, -2);
+CREATE TABLE lcc_gskip2 (a int);
+INSERT INTO lcc_gskip2 SELECT i * 211 FROM generate_series(1, 40) i;
+INSERT INTO lcc_gskip2 VALUES (7), (13), (NULL);
+VACUUM (ANALYZE) lcc_gskip, lcc_gskip2;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SELECT * FROM lcc_plan(
+	'SELECT k, count(*) FROM lcc_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.n) GROUP BY k') AS p("QUERY PLAN");
+                                                                                                                                                                  QUERY PLAN                                                                                                                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   ->  Custom Scan (LionCount)
+         Filter: (...)
+         Lion Indexes: lcc_ks.k (k)
+         Join Type: Anti
+         Join Rows: the rows counted, less those with a match
+         Join Lookup Index: lcc_nb
+         Join Cond: (s.a = n)
+         Group Strategy: Cells, by the grouping column
+         Cell Columns: lcc_r (r), lcc_ks.k (k), lcc_tags (tags), lcc_ks.s (s), lcc_fg.f (f), lcc_w (w), lcc_z (z)
+         Cell Predicates: ((r = 'r1'::text) OR (r = 'r3'::text) OR (r = 'r4'::text)), (k = ANY ('{1,2,3}'::integer[])), (k = ANY ('{4,5}'::integer[])), ((k = 6) OR (k = 7)), (k IS NULL), (tags && '{1,2}'::integer[]), (tags && '{9,10}'::integer[]), (s = 's2'::text), (s IS NULL), f, (w @@ '''a1'' | ''a2'' & ''b3'''::tsquery), (z = 9)
+         Cells: 4050
+         ->  Seq Scan on lcc_gskip s
+(13 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT k, count(*) FROM lcc_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.id) GROUP BY k'),
+	('SELECT k, count(*) FROM lcc_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.n) GROUP BY k'),
+	('SELECT s, count(*) FROM lcc_tiered t LEFT JOIN lcc_gskip g ON g.a = t.n WHERE t.tier <> ''none'' AND g.a IS NULL GROUP BY s'),
+	('SELECT r, count(*) FROM lcc_tiered t WHERE t.tier IN (''low'', ''medium'') AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.n AND s.b > t.k) GROUP BY r'),
+	('SELECT n, count(*) FROM lcc_tiered t WHERE t.tier = ''medium'' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.n) GROUP BY n ORDER BY 2 DESC, 1 LIMIT 5'),
+	('SELECT k, count(*) FROM lcc_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.id) AND NOT EXISTS (SELECT 1 FROM lcc_gskip2 s2 WHERE s2.a = t.id) GROUP BY k'),
+	('SELECT g, count(*) FROM lcc_tiered t LEFT JOIN lcc_gskip s ON s.a = t.n LEFT JOIN lcc_gskip2 s2 ON s2.a = t.n WHERE t.tier <> ''high'' AND s.a IS NULL AND s2.a IS NULL GROUP BY g'),
+	-- keys of no row: nothing left out
+	('SELECT k, count(*) FROM lcc_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.id AND s.a < 0) GROUP BY k')
+) v(q);
+                                                                                                q                                                                                                 |      lcc_check      
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------
+ SELECT k, count(*) FROM lcc_tiered t WHERE t.tier = 'high' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.id) GROUP BY k                                                                | 4050 cells, 16 rows
+ SELECT k, count(*) FROM lcc_tiered t WHERE t.tier = 'high' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.n) GROUP BY k                                                                 | 4050 cells, 16 rows
+ SELECT s, count(*) FROM lcc_tiered t LEFT JOIN lcc_gskip g ON g.a = t.n WHERE t.tier <> 'none' AND g.a IS NULL GROUP BY s                                                                        | 4050 cells, 7 rows
+ SELECT r, count(*) FROM lcc_tiered t WHERE t.tier IN ('low', 'medium') AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.n AND s.b > t.k) GROUP BY r                                       | 4050 cells, 3 rows
+ SELECT n, count(*) FROM lcc_tiered t WHERE t.tier = 'medium' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.n) GROUP BY n ORDER BY 2 DESC, 1 LIMIT 5                                    | 4050 cells, 5 rows
+ SELECT k, count(*) FROM lcc_tiered t WHERE t.tier = 'high' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.id) AND NOT EXISTS (SELECT 1 FROM lcc_gskip2 s2 WHERE s2.a = t.id) GROUP BY k | 4050 cells, 16 rows
+ SELECT g, count(*) FROM lcc_tiered t LEFT JOIN lcc_gskip s ON s.a = t.n LEFT JOIN lcc_gskip2 s2 ON s2.a = t.n WHERE t.tier <> 'high' AND s.a IS NULL AND s2.a IS NULL GROUP BY g                 | 4050 cells, 2 rows
+ SELECT k, count(*) FROM lcc_tiered t WHERE t.tier = 'high' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.id AND s.a < 0) GROUP BY k                                                    | 4050 cells, 16 rows
+(8 rows)
+
+-- ... and rescanned, for each outer row: the rows found again, and the walk
+SELECT lcc_check('SELECT x, t.* FROM (VALUES (30), (60), (30), (100)) v(x), LATERAL (SELECT c.k, count(*) FROM lcc_tiered c WHERE c.n < x AND c.tier <> ''none'' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = c.n) GROUP BY c.k) t');
+      lcc_check      
+---------------------
+ 4050 cells, 64 rows
+(1 row)
+
+SELECT lcc_check('SELECT x, t.* FROM (VALUES (30), (60), (30)) v(x), LATERAL (SELECT c.s, count(*) FROM lcc_tiered c WHERE c.n < x AND c.tier = ''high'' GROUP BY c.s) t');
+      lcc_check      
+---------------------
+ 4050 cells, 21 rows
+(1 row)
+
+-- the rows changed, before VACUUM and in this very transaction
+UPDATE lcc SET k = 1, tags = '{1}' WHERE id IN (523, 1046, 1569);
+UPDATE lcc SET f = NULL, z = 9 WHERE n = 7 AND id % 3 = 0;
+DELETE FROM lcc WHERE n = 11 AND id % 5 = 0;
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT k, count(*) FROM lcc_tiered WHERE tier = ''high'' GROUP BY k'),
+	('SELECT k, count(*) FROM lcc_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.n) GROUP BY k')
+) v(q);
+                                                                q                                                                 |                  lcc_check                   
+----------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------
+ SELECT k, count(*) FROM lcc_tiered WHERE tier = 'high' GROUP BY k                                                                | 4050 cells, 16 rows, rows tested in the heap
+ SELECT k, count(*) FROM lcc_tiered t WHERE t.tier = 'high' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.n) GROUP BY k | 4050 cells, 16 rows, rows tested in the heap
+(2 rows)
+
+BEGIN;
+UPDATE lcc SET k = 2, s = NULL WHERE id IN (2092, 2615) OR (n = 7 AND id % 4 = 0);
+SELECT lcc_check('SELECT s, count(*) FROM lcc_tiered t WHERE t.tier <> ''none'' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.n) GROUP BY s');
+                  lcc_check                  
+---------------------------------------------
+ 4050 cells, 7 rows, rows tested in the heap
+(1 row)
+
+ROLLBACK;
+VACUUM lcc;
+/*
+ * Heap-only tuples: a row the B-tree finds of a chain updated in place has
+ * the chain member's TID, and the lion index the root's, which is what the
+ * walk leaves out.  A table whose pages have room, its rows updated in a
+ * column no index has, twice, and once more after a VACUUM that prunes the
+ * chains to their roots' redirects.
+ */
+CREATE TABLE lcc_h (id int NOT NULL, k int NOT NULL, s text, pad text)
+	WITH (fillfactor = 40, autovacuum_enabled = off);
+INSERT INTO lcc_h
+SELECT i, i % 7, CASE WHEN i % 5 = 0 THEN NULL ELSE 's' || (i % 4) END, 'p'
+  FROM generate_series(1, 3000) i;
+CREATE INDEX lcc_h_ks ON lcc_h USING lion (k, s);
+CREATE INDEX lcc_h_id ON lcc_h (id);
+CREATE TABLE lcc_hskip (a int);
+INSERT INTO lcc_hskip SELECT i * 3 FROM generate_series(1, 400) i;
+VACUUM (FREEZE, ANALYZE) lcc_h, lcc_hskip;
+UPDATE lcc_h SET pad = 'q' WHERE id % 3 = 0;
+UPDATE lcc_h SET pad = 'r' WHERE id % 6 = 0;
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT s, count(*) FROM lcc_h t WHERE CASE WHEN k IN (1, 2) THEN ''a'' WHEN k = 3 THEN ''b'' ELSE ''c'' END <> ''b'' AND NOT EXISTS (SELECT 1 FROM lcc_hskip x WHERE x.a = t.id) GROUP BY s'),
+	('SELECT k, count(*) FROM lcc_h t WHERE CASE WHEN s = ''s1'' THEN 1 WHEN k = 4 THEN 2 ELSE 0 END > 0 AND NOT EXISTS (SELECT 1 FROM lcc_hskip x WHERE x.a = t.id) GROUP BY k')
+) v(q);
+                                                                                          q                                                                                          |                lcc_check                 
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+------------------------------------------
+ SELECT s, count(*) FROM lcc_h t WHERE CASE WHEN k IN (1, 2) THEN 'a' WHEN k = 3 THEN 'b' ELSE 'c' END <> 'b' AND NOT EXISTS (SELECT 1 FROM lcc_hskip x WHERE x.a = t.id) GROUP BY s | 3 cells, 5 rows, rows tested in the heap
+ SELECT k, count(*) FROM lcc_h t WHERE CASE WHEN s = 's1' THEN 1 WHEN k = 4 THEN 2 ELSE 0 END > 0 AND NOT EXISTS (SELECT 1 FROM lcc_hskip x WHERE x.a = t.id) GROUP BY k             | 6 cells, 7 rows, rows tested in the heap
+(2 rows)
+
+VACUUM lcc_h;
+UPDATE lcc_h SET pad = 's' WHERE id % 9 = 0;
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT s, count(*) FROM lcc_h t WHERE CASE WHEN k IN (1, 2) THEN ''a'' WHEN k = 3 THEN ''b'' ELSE ''c'' END <> ''b'' AND NOT EXISTS (SELECT 1 FROM lcc_hskip x WHERE x.a = t.id) GROUP BY s'),
+	('SELECT k, count(*) FROM lcc_h t WHERE CASE WHEN s = ''s1'' THEN 1 WHEN k = 4 THEN 2 ELSE 0 END > 0 AND NOT EXISTS (SELECT 1 FROM lcc_hskip x WHERE x.a = t.id) GROUP BY k')
+) v(q);
+                                                                                          q                                                                                          |                lcc_check                 
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+------------------------------------------
+ SELECT s, count(*) FROM lcc_h t WHERE CASE WHEN k IN (1, 2) THEN 'a' WHEN k = 3 THEN 'b' ELSE 'c' END <> 'b' AND NOT EXISTS (SELECT 1 FROM lcc_hskip x WHERE x.a = t.id) GROUP BY s | 3 cells, 5 rows, rows tested in the heap
+ SELECT k, count(*) FROM lcc_h t WHERE CASE WHEN s = 's1' THEN 1 WHEN k = 4 THEN 2 ELSE 0 END > 0 AND NOT EXISTS (SELECT 1 FROM lcc_hskip x WHERE x.a = t.id) GROUP BY k             | 6 cells, 7 rows, rows tested in the heap
+(2 rows)
+
+-- in parallel: a participant's groups of the ranges it counts, every
+-- participant leaving out every row found (without the leader, as above)
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET pg_lion.parallel_range_keys = 1;
+SET parallel_leader_participation = off;
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT k, count(*) FROM lcc_tiered WHERE tier = ''high'' GROUP BY k'),
+	('SELECT n, count(*) FROM lcc_tiered WHERE g AND tier <> ''none'' GROUP BY n'),
+	('SELECT k, count(*) FROM lcc_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.n) GROUP BY k'),
+	('SELECT s, count(*) FROM lcc_tiered t LEFT JOIN lcc_gskip g ON g.a = t.id WHERE t.tier <> ''none'' AND g.a IS NULL GROUP BY s'),
+	('SELECT s, count(*) FROM lcc_h t WHERE CASE WHEN k IN (1, 2) THEN ''a'' WHEN k = 3 THEN ''b'' ELSE ''c'' END <> ''b'' AND NOT EXISTS (SELECT 1 FROM lcc_hskip x WHERE x.a = t.id) GROUP BY s')
+) v(q);
+                                                                                          q                                                                                          |                     lcc_check                     
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------------------
+ SELECT k, count(*) FROM lcc_tiered WHERE tier = 'high' GROUP BY k                                                                                                                   | parallel 4050 cells, 16 rows
+ SELECT n, count(*) FROM lcc_tiered WHERE g AND tier <> 'none' GROUP BY n                                                                                                            | parallel 4050 cells, 100 rows
+ SELECT k, count(*) FROM lcc_tiered t WHERE t.tier = 'high' AND NOT EXISTS (SELECT 1 FROM lcc_gskip s WHERE s.a = t.n) GROUP BY k                                                    | parallel 4050 cells, 16 rows
+ SELECT s, count(*) FROM lcc_tiered t LEFT JOIN lcc_gskip g ON g.a = t.id WHERE t.tier <> 'none' AND g.a IS NULL GROUP BY s                                                          | parallel 4050 cells, 7 rows
+ SELECT s, count(*) FROM lcc_h t WHERE CASE WHEN k IN (1, 2) THEN 'a' WHEN k = 3 THEN 'b' ELSE 'c' END <> 'b' AND NOT EXISTS (SELECT 1 FROM lcc_hskip x WHERE x.a = t.id) GROUP BY s | parallel 3 cells, 5 rows, rows tested in the heap
+(5 rows)
+
+RESET parallel_leader_participation;
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET pg_lion.parallel_range_keys;
+SET max_parallel_workers_per_gather = 0;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+DROP TABLE lcc_gskip, lcc_gskip2, lcc_h, lcc_hskip;
 DROP VIEW lcc_tiered;
 DROP VIEW lcc_scored;
 DROP TABLE lcc;

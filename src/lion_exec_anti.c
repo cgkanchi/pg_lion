@@ -32,6 +32,7 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"
 #include "access/tableam.h"
 #include "common/hashfn.h"
 #include "executor/nodeIndexscan.h"
@@ -43,18 +44,24 @@
 
 static void lion_anti_cells_truths(LionAntiState *as);
 
-/* How many of the node's expressions are the anti join's (LION_PRIV_ANTI). */
+/*
+ * How many of the node's expressions are the anti join's (LION_PRIV_ANTI):
+ * the first arm's keys' values, join clauses and restrictions, then each
+ * further arm's keys' values and join clauses.
+ */
 int
 lion_anti_nexprs(const LionCountPriv *priv)
 {
 	if (!priv->hasanti)
 		return 0;
-	return priv->anti.nkey + priv->anti.njoin + priv->anti.nrestrict;
+	return priv->anti.nkey + priv->anti.njoin + priv->anti.nrestrict +
+		2 * priv->anti.nkey * (priv->anti.narm - 1);
 }
 
 /*
  * Where each column the anti join's expressions read comes from: a column of
- * the inner side, read from the child's row at its LION_TL_ANTI position, or
+ * an inner side, read from its arm's child's row at its LION_TL_ANTI
+ * position, or
  * one of the table's, read from each row a key finds at the attnum its place
  * in custom_scan_tlist names - a LION_TL_RESID column or one the target list
  * prints.  Positions in the scan tuple, which evalslot has the descriptor of.
@@ -73,6 +80,7 @@ lion_anti_columns(LionAntiState *as, CustomScanState *node,
 	ListCell   *lc;
 
 	as->innerpos = (int *) palloc(sizeof(int) * nvar);
+	as->innerarm = (int *) palloc(sizeof(int) * nvar);
 	as->innerresno = (AttrNumber *) palloc(sizeof(AttrNumber) * nvar);
 	as->innerlen = (int16 *) palloc(sizeof(int16) * nvar);
 	as->innerbyval = (bool *) palloc(sizeof(bool) * nvar);
@@ -113,6 +121,7 @@ lion_anti_columns(LionAntiState *as, CustomScanState *node,
 			Form_pg_attribute att = TupleDescAttr(desc, pos);
 
 			as->innerpos[as->ninner] = pos;
+			as->innerarm[as->ninner] = LION_TL_ANTI_ARM(kind);
 			as->innerresno[as->ninner] = LION_TL_ANTI_RESNO(kind);
 			as->innerlen[as->ninner] = att->attlen;
 			as->innerbyval[as->ninner] = att->attbyval;
@@ -400,7 +409,9 @@ lion_begin_anti(LionCountScanState *st, CustomScanState *node,
 	as->keyop = (Oid *) palloc(sizeof(Oid) * a->nkey);
 	as->keycoll = (Oid *) palloc(sizeof(Oid) * a->nkey);
 	as->keysort = (Oid *) palloc(sizeof(Oid) * a->nkey);
-	as->keystate = (ExprState **) palloc(sizeof(ExprState *) * a->nkey);
+	as->narm = a->narm;
+	as->keystate = (ExprState **) palloc(sizeof(ExprState *) * a->nkey *
+										 a->narm);
 	as->keylen = (int16 *) palloc(sizeof(int16) * a->nkey);
 	as->keybyval = (bool *) palloc(sizeof(bool) * a->nkey);
 
@@ -418,8 +429,29 @@ lion_begin_anti(LionCountScanState *st, CustomScanState *node,
 						&as->keybyval[i]);
 	}
 	as->joinexprs = list_copy_head(list_copy_tail(mine, a->nkey), a->njoin);
-	as->restrictexprs = list_copy_tail(mine, a->nkey + a->njoin);
+	as->restrictexprs = list_copy_head(list_copy_tail(mine,
+													  a->nkey + a->njoin),
+									   a->nrestrict);
 	as->restrictqual = ExecInitQual(as->restrictexprs, &node->ss.ps);
+
+	/*
+	 * each further arm's keys' values, and its join clauses - its scan
+	 * keys', true of every row a lookup finds, and for EXPLAIN only
+	 */
+	for (i = 1; i < a->narm; i++)
+	{
+		int			at = a->nkey + a->njoin + a->nrestrict +
+			2 * a->nkey * (i - 1);
+		int			k;
+
+		for (k = 0; k < a->nkey; k++)
+			as->keystate[i * a->nkey + k] =
+				ExecInitExpr((Expr *) list_nth(mine, at + k), &node->ss.ps);
+		as->armconds = lappend(as->armconds,
+							   list_copy_head(list_copy_tail(mine,
+															 at + a->nkey),
+											  a->nkey));
+	}
 
 	/*
 	 * The join clauses but the scan keys' own, which come first, one to a
@@ -435,8 +467,10 @@ lion_begin_anti(LionCountScanState *st, CustomScanState *node,
 	lion_anti_columns(as, node, priv, mine);
 	for (i = 0; i < as->ninner; i++)
 	{
-		if (as->innerresno[i] >
-			list_length(((Plan *) linitial(cscan->custom_plans))->targetlist))
+		if (as->innerarm[i] < 0 || as->innerarm[i] >= a->narm ||
+			as->innerresno[i] >
+			list_length(((Plan *) list_nth(cscan->custom_plans,
+										   as->innerarm[i]))->targetlist))
 			elog(ERROR, "LionCount: an anti join clause reads no column of its child");
 	}
 	as->evalslot = ExecInitExtraTupleSlot(estate, desc, &TTSOpsVirtual);
@@ -454,6 +488,13 @@ lion_begin_anti(LionCountScanState *st, CustomScanState *node,
 		if (st->cells == NULL)
 			elog(ERROR, "LionCount: an anti join beside cells that do not run");
 		lion_anti_cells_begin(as, cscan, priv);
+
+		/* ... beside a GROUP BY column too, whose walk leaves them out */
+		if (priv->cellgroup)
+		{
+			as->cells = false;
+			as->exclude = true;
+		}
 	}
 	lion_anti_groups(as, priv);
 	lion_anti_sort_begin(as, estate, list_copy_head(mine, a->nkey));
@@ -471,10 +512,19 @@ lion_begin_anti(LionCountScanState *st, CustomScanState *node,
 	as->timing = (estate->es_instrument & INSTRUMENT_TIMER) != 0;
 	MemoryContextSwitchTo(oldcxt);
 
-	/* the inner side, the node's one child */
-	as->child = ExecInitNode((Plan *) linitial(cscan->custom_plans), estate,
-							 eflags);
-	node->custom_ps = list_make1(as->child);
+	/* the inner sides, the node's children, one an arm */
+	if (list_length(cscan->custom_plans) != a->narm)
+		elog(ERROR, "LionCount: an anti join of %d arms with %d children",
+			 a->narm, list_length(cscan->custom_plans));
+	as->children = (PlanState **) palloc(sizeof(PlanState *) * a->narm);
+	node->custom_ps = NIL;
+	for (i = 0; i < a->narm; i++)
+	{
+		as->children[i] = ExecInitNode((Plan *) list_nth(cscan->custom_plans,
+														 i),
+									   estate, eflags);
+		node->custom_ps = lappend(node->custom_ps, as->children[i]);
+	}
 	st->anti = as;
 }
 
@@ -536,7 +586,9 @@ lion_anti_open(LionCountScanState *st)
 
 /*
  * Every row of the child, read once into the sort by its scan keys' values -
- * and its inner columns, with a joinqual - then sorted.  A key with a NULL
+ * and its inner columns, with a joinqual - then sorted: of several arms,
+ * each one's child in turn, its keys' values in the same sort, where a key
+ * two arms' rows have is looked up once.  A key with a NULL
  * value matches nothing (each key is a strict operator), and its row is left
  * out.  The child runs in the caller's memory, which is the query's: a node
  * may keep there what it makes on its first row.  The sort is the run's,
@@ -552,6 +604,7 @@ lion_anti_collect(LionCountScanState *st)
 	TuplesortInstrumentation stats;
 	MemoryContext oldcxt;
 	instr_time	start;
+	int			arm = 0;
 	int			j;
 
 	if (as->timing)
@@ -569,23 +622,31 @@ lion_anti_collect(LionCountScanState *st)
 		int			k;
 
 		CHECK_FOR_INTERRUPTS();
-		slot = ExecProcNode(as->child);
+		slot = ExecProcNode(as->children[arm]);
 		if (TupIsNull(slot))
+		{
+			if (++arm < as->narm)
+				continue;
 			break;
+		}
 		as->childrows++;
 
 		ResetExprContext(econtext);
 		for (j = 0; j < as->ninner; j++)
+		{
+			if (as->innerarm[j] != arm)
+				continue;
 			es->tts_values[as->innerpos[j]] =
 				slot_getattr(slot, as->innerresno[j],
 							 &es->tts_isnull[as->innerpos[j]]);
+		}
 		econtext->ecxt_scantuple = es;
 		ExecClearTuple(in);
 		for (k = 0; k < as->nkey; k++)
 		{
 			in->tts_values[k] =
-				ExecEvalExprSwitchContext(as->keystate[k], econtext,
-										  &in->tts_isnull[k]);
+				ExecEvalExprSwitchContext(as->keystate[arm * as->nkey + k],
+										  econtext, &in->tts_isnull[k]);
 			if (in->tts_isnull[k])
 			{
 				anynull = true;
@@ -1077,6 +1138,151 @@ lion_anti_ranged_put(LionAntiState *as, uint32 ckey, uint64 code)
 	ExecClearTuple(in);
 }
 
+/* ---------------------------------------------------------------------
+ * Beside a GROUP BY column and cells: the rows found left out of the walk
+ * --------------------------------------------------------------------- */
+
+/*
+ * The sort of the rows found, begun (DESIGN.md §10, "A GROUP BY column
+ * beside the cells"): their TIDs' codes (lion_tid_to_code()), int8, within
+ * work_mem and on disk past it, which every pass of the walk reads again.
+ */
+static void
+lion_anti_exclude_begin(LionAntiState *as)
+{
+	MemoryContext oldcxt = MemoryContextSwitchTo(as->cxt);
+
+	as->exclsort = tuplesort_begin_datum(INT8OID, Int8LessOperator,
+										 InvalidOid, false, work_mem, NULL,
+										 TUPLESORT_RANDOMACCESS);
+	as->exclsorted = false;
+	as->exclhave = false;
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * The row in heapslot, found and matched, left out: by the TID the indexes
+ * have of it, which is the root of its HOT chain - the B-tree's lookup of it
+ * followed the chain to the member the snapshot sees, whose TID heapslot
+ * has, and the lion index's sets hold the root's, as every index does
+ * (heap_get_root_tuples(), under the page's share lock and the slot's pin,
+ * which no pruning moves a root under).  Exactly the row the walk counts at
+ * that TID: of a chain the snapshot sees one member at most.
+ */
+static void
+lion_anti_exclude_put(LionAntiState *as)
+{
+	TupleTableSlot *slot = as->heapslot;
+	ItemPointerData tid = slot->tts_tid;
+	BufferHeapTupleTableSlot *bslot;
+	HeapTuple	tuple;
+
+	if (!TTS_IS_BUFFERTUPLE(slot))
+		elog(ERROR, "LionCount: an anti join's row found is no heap tuple");
+	bslot = (BufferHeapTupleTableSlot *) slot;
+	tuple = bslot->base.tuple;
+	if (tuple == NULL || !BufferIsValid(bslot->buffer) ||
+		!ItemPointerIsValid(&tid))
+		elog(ERROR, "LionCount: an anti join's row found is no heap tuple");
+	if (HeapTupleHeaderIsHeapOnly(tuple->t_data))
+	{
+		OffsetNumber roots[MaxHeapTuplesPerPage];
+		OffsetNumber off = ItemPointerGetOffsetNumber(&tid);
+		OffsetNumber root;
+
+		if (off < FirstOffsetNumber || off > MaxHeapTuplesPerPage)
+			elog(ERROR, "LionCount: a row found at offset %u", off);
+		LockBuffer(bslot->buffer, BUFFER_LOCK_SHARE);
+		heap_get_root_tuples(BufferGetPage(bslot->buffer), roots);
+		LockBuffer(bslot->buffer, BUFFER_LOCK_UNLOCK);
+		root = roots[off - 1];
+		if (!OffsetNumberIsValid(root))
+			elog(ERROR, "LionCount: a heap-only row found with no root");
+		ItemPointerSetOffsetNumber(&tid, root);
+	}
+	if (ItemPointerGetOffsetNumber(&tid) > LION_MAX_OFFSET)
+		elog(ERROR, "LionCount: a row found at offset %u",
+			 ItemPointerGetOffsetNumber(&tid));
+	tuplesort_putdatum(as->exclsort,
+					   Int64GetDatum((int64) lion_tid_to_code(&tid)), false);
+}
+
+/* The next row left out into exclcur, or none */
+static void
+lion_anti_exclude_next(LionAntiState *as)
+{
+	Datum		d;
+	bool		isnull;
+
+	as->exclhave = tuplesort_getdatum(as->exclsort, true, false, &d, &isnull,
+									  NULL);
+	if (as->exclhave)
+	{
+		if (isnull)
+			elog(ERROR, "LionCount: a row left out of no TID");
+		as->exclcur = (uint64) DatumGetInt64(d);
+	}
+}
+
+/*
+ * LionCellsExclude's apply(): at container key ckey, every row left out
+ * cleared from `rows` - and counted, the rows the WHERE kept that the anti
+ * join takes away.  The keys come up within a pass, and the sort's rows are
+ * read on past those below each.
+ */
+static void
+lion_anti_exclude_apply(void *arg, uint32 ckey, uint64 *rows)
+{
+	LionAntiState *as = (LionAntiState *) arg;
+
+	while (as->exclhave && lion_code_ckey(as->exclcur) < ckey)
+		lion_anti_exclude_next(as);
+	while (as->exclhave && lion_code_ckey(as->exclcur) == ckey)
+	{
+		uint16		lo = lion_code_lo(as->exclcur);
+		uint64		bit = UINT64CONST(1) << (lo & 63);
+
+		if ((rows[lo >> 6] & bit) != 0)
+		{
+			rows[lo >> 6] &= ~bit;
+			as->subtracted++;
+		}
+		lion_anti_exclude_next(as);
+	}
+}
+
+/*
+ * What the walk of a count by cells beside a GROUP BY column leaves out
+ * (lion_count_cells()): the anti join's rows found, or nothing.
+ */
+const LionCellsExclude *
+lion_anti_exclude(LionCountScanState *st)
+{
+	LionAntiState *as = st->anti;
+
+	if (as == NULL || !as->exclude)
+		return NULL;
+	if (!as->exclsorted)
+		elog(ERROR, "LionCount: a walk before the anti join's rows are found");
+	as->excl.apply = lion_anti_exclude_apply;
+	as->excl.arg = as;
+	return &as->excl;
+}
+
+/* ... read again from the first, for the next pass */
+void
+lion_anti_exclude_rewind(LionCountScanState *st)
+{
+	LionAntiState *as = st->anti;
+
+	if (as == NULL || !as->exclude)
+		return;
+	if (!as->exclsorted)
+		elog(ERROR, "LionCount: a walk before the anti join's rows are found");
+	tuplesort_rescan(as->exclsort);
+	lion_anti_exclude_next(as);
+}
+
 /*
  * A row found that an inner row of its key matches, subtracted: from the
  * total; from its group; or from its cell, of the predicates' truths in it -
@@ -1092,6 +1298,11 @@ lion_anti_subtract(LionCountScanState *st)
 	MemoryContext oldcxt;
 	int			g;
 
+	if (as->exclude)
+	{
+		lion_anti_exclude_put(as);
+		return;
+	}
 	if (as->cells)
 	{
 		uint64		code;
@@ -1187,7 +1398,7 @@ lion_anti_matches(LionAntiState *as)
 	TupleTableSlot *in = as->innerslot;
 	int			j;
 
-	if (as->cells && as->predsread)
+	if ((as->cells || as->exclude) && as->predsread)
 		lion_anti_cells_truths(as);
 	for (j = 0; j < as->nouter; j++)
 		es->tts_values[as->outerpos[j]] =
@@ -1339,7 +1550,7 @@ lion_anti_run(LionCountScanState *st)
 		return;
 	as->ran = true;
 	as->total = 0;
-	if (st->shared != NULL && !as->cells &&
+	if (st->shared != NULL && !as->cells && !as->exclude &&
 		pg_atomic_exchange_u32(&st->shared->antiowner, 1) != 0)
 	{
 		as->owner = false;
@@ -1348,7 +1559,19 @@ lion_anti_run(LionCountScanState *st)
 	as->owner = true;
 	lion_anti_open(st);
 	lion_anti_collect(st);
+	if (as->exclude)
+		lion_anti_exclude_begin(as);
 	lion_anti_lookup(st);
+	if (as->exclude)
+	{
+		TuplesortInstrumentation stats;
+
+		tuplesort_performsort(as->exclsort);
+		tuplesort_get_stats(as->exclsort, &stats);
+		if (stats.spaceType == SORT_SPACE_TYPE_DISK)
+			as->spilled |= LION_ANTI_SPILL_EXCLUDED;
+		as->exclsorted = true;
+	}
 }
 
 /*
@@ -1372,8 +1595,11 @@ lion_anti_adjust(LionCountScanState *st, int nkeys, const Datum *keys,
 	LionAntiState *as = st->anti;
 	int64		n = 0;
 
-	/* a cell loses its rows as the tally gives it up (lion_next_cells()) */
-	if (as->cells || as->draining)
+	/*
+	 * a cell loses its rows as the tally gives it up (lion_next_cells()),
+	 * and beside a GROUP BY column they are left out of the walk
+	 */
+	if (as->cells || as->exclude || as->draining)
 		return false;
 	if (as->owner)
 	{
@@ -1659,6 +1885,11 @@ lion_anti_release(LionAntiState *as)
 		tuplestore_end(as->innerrows);
 	if (as->heldsort != NULL)
 		tuplesort_end(as->heldsort);
+	if (as->exclsort != NULL)
+		tuplesort_end(as->exclsort);
+	as->exclsort = NULL;
+	as->exclsorted = false;
+	as->exclhave = false;
 	lion_anti_ranged_end(as);
 	as->keysorted = NULL;
 	as->innerrows = NULL;
@@ -1700,7 +1931,7 @@ lion_anti_release(LionAntiState *as)
 
 /*
  * A rescan: the run is made again - the table's restrictions and the inner
- * side's rows may have other parameters - and the child starts over, by
+ * sides' rows may have other parameters - and each child starts over, by
  * itself where a parameter it reads changed (core hands a changed parameter
  * to outer and inner plans, not to custom_ps).
  */
@@ -1708,6 +1939,7 @@ void
 lion_anti_rescan(LionCountScanState *st, CustomScanState *node)
 {
 	LionAntiState *as = st->anti;
+	int			i;
 
 	if (as == NULL)
 		return;
@@ -1716,25 +1948,34 @@ lion_anti_rescan(LionCountScanState *st, CustomScanState *node)
 	as->total = 0;
 	lion_anti_release(as);
 	ResetExprContext(as->econtext);
-	if (node->ss.ps.chgParam != NULL)
-		UpdateChangedParamSet(as->child, node->ss.ps.chgParam);
-	if (as->child->chgParam == NULL)
-		ExecReScan(as->child);
+	for (i = 0; i < as->narm; i++)
+	{
+		PlanState  *child = as->children[i];
+
+		if (node->ss.ps.chgParam != NULL)
+			UpdateChangedParamSet(child, node->ss.ps.chgParam);
+		if (child->chgParam == NULL)
+			ExecReScan(child);
+	}
 }
 
-/* The end of the node: the child, the B-tree and the run's memory. */
+/* The end of the node: the children, the B-tree and the run's memory. */
 void
 lion_anti_end(LionCountScanState *st)
 {
 	LionAntiState *as = st->anti;
+	int			i;
 
 	if (as == NULL)
 		return;
 	lion_anti_release(as);
-	if (as->child != NULL)
+	for (i = 0; i < as->narm; i++)
 	{
-		ExecEndNode(as->child);
-		as->child = NULL;
+		if (as->children[i] != NULL)
+		{
+			ExecEndNode(as->children[i]);
+			as->children[i] = NULL;
+		}
 	}
 	if (as->heapslot != NULL)
 	{
@@ -1800,11 +2041,12 @@ lion_anti_cellpred_inline(Node *node, void *context)
 }
 
 /*
- * What the node does with its child (DESIGN.md §27): the kind of join, what
- * the rows it counts are, the B-tree the keys are looked up in, and the join
- * clauses every row found is tested on - as core prints a join's condition,
- * the inner side's columns and the table's both named, and a clause that is
- * a cells predicate printed as the predicate.
+ * What the node does with its children (DESIGN.md §27): the kind of join,
+ * what the rows it counts are, the B-tree the keys are looked up in, and the
+ * join clauses every row found is tested on - as core prints a join's
+ * condition, the inner side's columns and the table's both named, and a
+ * clause that is a cells predicate printed as the predicate.  Of several
+ * arms, their conditions ORed: a row any of them matches is taken away.
  */
 void
 lion_explain_anti(LionCountScanState *st, List *ancestors, ExplainState *es)
@@ -1820,6 +2062,15 @@ lion_explain_anti(LionCountScanState *st, List *ancestors, ExplainState *es)
 	context = set_deparse_context_plan(es->deparse_cxt, st->css.ss.ps.plan,
 									   ancestors);
 	cond = (Node *) make_ands_explicit(as->joinexprs);
+	if (as->armconds != NIL)
+	{
+		List	   *arms = list_make1(cond);
+		ListCell   *lc;
+
+		foreach(lc, as->armconds)
+			arms = lappend(arms, make_ands_explicit((List *) lfirst(lc)));
+		cond = (Node *) make_orclause(arms);
+	}
 	if (as->cells)
 		cond = lion_anti_cellpred_inline(cond, st);
 	ExplainPropertyText("Join Cond",
@@ -1846,6 +2097,7 @@ lion_explain_anti_spilled(uint32 spilled, ExplainState *es)
 		{LION_ANTI_SPILL_SUB, "losses"},
 		{LION_ANTI_SPILL_HELD, "held rows"},
 		{LION_ANTI_SPILL_RANGES, "ranges"},
+		{LION_ANTI_SPILL_EXCLUDED, "rows left out"},
 	};
 	StringInfoData buf;
 	size_t		i;

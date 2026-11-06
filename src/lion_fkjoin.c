@@ -1265,41 +1265,43 @@ lion_anti_inner_expr(PlannerInfo *root, Node *node, Relids inner,
 }
 
 /*
- * Is the anti join `anti`, made by core of `t LEFT JOIN s ON ... WHERE s.a IS
- * NULL` (reduce_outer_joins(): the ON clauses strict for a column the WHERE
- * tests for NULL), one the node may take as it takes a NOT EXISTS's?  The two
+ * Are the anti joins of `t LEFT JOIN s ON ... WHERE s.a IS NULL` among the
+ * arms (reduce_outer_joins(): the ON clauses strict for a column the WHERE
+ * tests for NULL) ones the node may take as it takes a NOT EXISTS's?  The two
  * are the same join - t's rows no row of s matches - except for what is
  * above it: the LEFT JOIN's WHERE and target list may still read s's
- * columns, which are NULL in every row the anti join emits.  So it is taken
- * when they read them only in tests `s.c IS NULL`, true of every such row,
- * and nothing else above the join names s:
+ * columns, which are NULL in every row the anti join emits.  So they are
+ * taken when those read them only in tests `s.c IS NULL`, true of every such
+ * row, and nothing else above the joins names s.  `innertables` are the
+ * inner sides' tables of every such arm, `ojrelids` their outer joins':
  *
- *	- every clause the join rel evaluates above the outer join - pushed down
- *	  (RINFO_IS_PUSHED_DOWN()), in t's joininfo or an inner table's - is a
- *	  NullTest IS NULL of a plain column of the inner side.  PostgreSQL 16 and
- *	  17 keep the one that made the anti join among them; later releases drop
- *	  it (remove_redundant_nullability_quals()) and there may be none;
+ *	- every clause the join rel evaluates above the outer joins - pushed down
+ *	  (RINFO_IS_PUSHED_DOWN()), in t's joininfo or such an inner table's - is
+ *	  a NullTest IS NULL of a plain column of one of those inner sides.
+ *	  PostgreSQL 16 and 17 keep the one that made each anti join among them;
+ *	  later releases drop it (remove_redundant_nullability_quals()) and there
+ *	  may be none;
  *	- the target list core builds the upper rels from (processed_tlist, the
  *	  grouping, ordering and DISTINCT columns among it) and the HAVING read
- *	  no column of the inner side and no column the outer join nulls.
+ *	  no column of those inner sides and no column the outer joins null.
  *
- * The ON clauses are the anti join's own (not pushed down), which the caller
+ * The ON clauses are each anti join's own (not pushed down), which the caller
  * takes as a NOT EXISTS's correlation; one of s alone is in s's own
- * restrictions already, and the child applies it.
+ * restrictions already, and the child applies it.  A NOT EXISTS beside them
+ * has nothing above it to check: nothing outside its subquery names its
+ * tables.
  */
 static bool
-lion_small_anti_left(PlannerInfo *root, RelOptInfo *joinrel,
-					 SpecialJoinInfo *anti, Relids innertables)
+lion_small_anti_left(PlannerInfo *root, RelOptInfo *joinrel, int outerrelid,
+					 Relids innertables, Relids ojrelids)
 {
-	Relids		upper = innertables;
+	Relids		upper = bms_union(innertables, ojrelids);
+	Relids		scanned = bms_add_member(bms_copy(innertables), outerrelid);
 	int			i;
 
-	if (anti->ojrelid != 0)
-		upper = bms_add_member(bms_copy(innertables), anti->ojrelid);
-
-	/* the WHERE above the join, in the joininfo of each table of it */
+	/* the WHERE above the joins, in the joininfo of t and of those tables */
 	i = -1;
-	while ((i = bms_next_member(joinrel->relids, i)) >= 0)
+	while ((i = bms_next_member(scanned, i)) >= 0)
 	{
 		RelOptInfo *rel;
 		ListCell   *lc;
@@ -1331,7 +1333,7 @@ lion_small_anti_left(PlannerInfo *root, RelOptInfo *joinrel,
 		}
 	}
 
-	/* nothing else above it names the inner side */
+	/* nothing else above them names the inner sides */
 	if (bms_overlap(pull_varnos(root, (Node *) root->processed_tlist), upper) ||
 		bms_overlap(pull_varnos(root, root->parse->havingQual), upper))
 		return false;
@@ -1339,108 +1341,30 @@ lion_small_anti_left(PlannerInfo *root, RelOptInfo *joinrel,
 }
 
 /*
- * The anti join over a small inner side (DESIGN.md §27, "The anti join over a
- * small inner side"): joinrel is the whole FROM of a query over one table `t`
- * with a NOT EXISTS correlated with it, and nothing else -
- *
- *	- the special join is the anti join core makes of a NOT EXISTS - or,
- *	  from PostgreSQL 19, of a NOT IN whose two sides it proves never NULL,
- *	  which is then the same join (16 to 18 leave every NOT IN a subplan) -
- *	  or of a `LEFT JOIN s ON ... WHERE s.a IS NULL` (lion_small_anti_left()),
- *	  when nothing above the join reads the inner side but such IS NULL
- *	  tests, true of every row the join emits;
- *	  its outer side t alone, minimal and syntactic, and its syntactic inner
- *	  side every other table of the join; every other special join is inside
- *	  that inner side - an EXISTS, a NOT EXISTS or an outer join of the
- *	  subquery's own, which the child plans;
- *	- t is a plain table or a materialized view (lion_fkjoin_rel_ok(), and
- *	  not a partitioned table) and the inner side's tables have no LATERAL
- *	  reference and no TABLESAMPLE (lion_fkjoin_member_ok());
- *	- the inner side is a rel the join search built, not proved empty, whose
- *	  cheapest path is unparameterized: the child, run once;
- *	- every clause the anti join evaluates - an equivalence class's for the
- *	  pair (none, for an outer join's clauses, which stay in t's joininfo), and
- *	  t's joininfo clauses within the join, a clause of the subquery on t alone
- *	  among them - reads plain columns of t and columns the inner side's rows
- *	  carry, has no volatile function, subquery or pseudoconstant, and at
- *	  least one of them is a key: a strict operator between a column of t and
- *	  an expression of the inner side alone (LionAntiKey).
- *
- * A row of t is then a row of the join when no row of the inner side makes
- * every clause true, and the count is t's count less the rows some inner row
- * does: which rows those are is the caller's to find, by the keys.  A
- * PlaceHolderVar, a pseudoconstant qual or a LATERAL reference anywhere
- * declines, as for the FK-side join.
+ * One arm of the anti join over a small inner side: the anti join `sj` of t
+ * (outer, its relid outerrelid) with its syntactic inner side, into *out -
+ * the inner rel, its cheapest path, the join clauses and the keys among
+ * them.  `ojoin` says whether the join is a LEFT JOIN's, whose WHERE clauses
+ * above it in t's joininfo (lion_small_anti_left()'s IS NULLs) are not its
+ * own.  The join clauses are those of t's joininfo within the arm's tables
+ * and its outer join, and an equivalence class's for the pair.
  */
-bool
-lion_fkjoin_recognize_small_anti(PlannerInfo *root, RelOptInfo *joinrel,
-								 LionSmallAnti *out)
+static bool
+lion_small_anti_arm(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outer,
+					int outerrelid, SpecialJoinInfo *sj, bool ojoin,
+					LionSmallAnti *out)
 {
-	SpecialJoinInfo *anti = NULL;
-	RelOptInfo *outer;
+	Relids		innertables = bms_difference(sj->syn_righthand,
+											 root->outer_join_rels);
+	Relids		armrels;
 	RelOptInfo *inner;
-	Relids		tables;
-	Relids		innertables = NULL;
 	List	   *rinfos;
 	List	   *clauses = NIL;
 	List	   *keys = NIL;
-	int			outerrelid = -1;
 	int			innerrelid;
 	int			i;
-	bool		leftform;
 	ListCell   *lc;
 
-	if (joinrel->reloptkind != RELOPT_JOINREL || IS_DUMMY_REL(joinrel))
-		return false;
-	if (root->placeholder_list != NIL)
-		return false;
-	if (root->hasPseudoConstantQuals || root->hasLateralRTEs)
-		return false;
-
-	/* ---- the anti join: t alone outside, every other table inside ---- */
-	tables = bms_difference(joinrel->relids, root->outer_join_rels);
-	foreach(lc, root->join_info_list)
-	{
-		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
-		Relids		lt;
-		Relids		rt;
-		int			x;
-
-		if (sjinfo->jointype != JOIN_ANTI)
-			continue;
-		lt = bms_difference(sjinfo->syn_lefthand, root->outer_join_rels);
-		rt = bms_difference(sjinfo->syn_righthand, root->outer_join_rels);
-		if (!bms_get_singleton_member(lt, &x) ||
-			!bms_equal(bms_union(lt, rt), tables))
-			continue;
-		anti = sjinfo;
-		outerrelid = x;
-		innertables = rt;
-		break;
-	}
-	if (anti == NULL || bms_is_empty(innertables) ||
-		!bms_equal(anti->min_lefthand, anti->syn_lefthand))
-		return false;
-	leftform = !lion_fkjoin_sublink_anti(root, anti);
-	if (leftform && !lion_small_anti_left(root, joinrel, anti, innertables))
-		return false;
-	foreach(lc, root->join_info_list)
-	{
-		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
-
-		if (sjinfo == anti)
-			continue;
-		/* both of its sides within the anti join's inner side */
-		if (!bms_is_subset(bms_union(sjinfo->syn_lefthand,
-									 sjinfo->syn_righthand),
-						   anti->syn_righthand))
-			return false;
-	}
-
-	/* ---- the table counted, and the inner side's tables ---- */
-	outer = root->simple_rel_array[outerrelid];
-	if (!lion_fkjoin_rel_ok(root, outer) || lion_fkjoin_is_parent(root, outer))
-		return false;
 	i = -1;
 	while ((i = bms_next_member(innertables, i)) >= 0)
 	{
@@ -1450,10 +1374,10 @@ lion_fkjoin_recognize_small_anti(PlannerInfo *root, RelOptInfo *joinrel,
 
 	/* ---- the inner side: the child ---- */
 	if (bms_get_singleton_member(innertables, &innerrelid) &&
-		bms_equal(anti->syn_righthand, innertables))
+		bms_equal(sj->syn_righthand, innertables))
 		inner = root->simple_rel_array[innerrelid];
 	else
-		inner = find_join_rel(root, anti->syn_righthand);
+		inner = find_join_rel(root, sj->syn_righthand);
 	if (inner == NULL || IS_DUMMY_REL(inner))
 		return false;
 	if (!bms_is_empty(inner->lateral_relids))
@@ -1463,16 +1387,19 @@ lion_fkjoin_recognize_small_anti(PlannerInfo *root, RelOptInfo *joinrel,
 		return false;
 
 	/* ---- every clause of the anti join ---- */
-	rinfos = generate_join_implied_equalities(root, joinrel->relids,
-											  outer->relids, inner, NULL);
+	armrels = bms_union(outer->relids, sj->syn_righthand);
+	if (sj->ojrelid != 0)
+		armrels = bms_add_member(armrels, sj->ojrelid);
+	rinfos = generate_join_implied_equalities(root, armrels, outer->relids,
+											  inner, NULL);
 	foreach(lc, outer->joininfo)
 	{
 		RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
 
-		if (!bms_is_subset(ri->required_relids, joinrel->relids))
+		if (!bms_is_subset(ri->required_relids, armrels))
 			continue;
 		/* a LEFT JOIN's WHERE above it: an IS NULL, lion_small_anti_left()'s */
-		if (leftform && RINFO_IS_PUSHED_DOWN(ri, joinrel->relids))
+		if (ojoin && RINFO_IS_PUSHED_DOWN(ri, joinrel->relids))
 			continue;
 		rinfos = list_append_unique_ptr(rinfos, ri);
 	}
@@ -1538,12 +1465,179 @@ lion_fkjoin_recognize_small_anti(PlannerInfo *root, RelOptInfo *joinrel,
 	if (keys == NIL)
 		return false;
 
+	memset(out, 0, sizeof(LionSmallAnti));
 	out->joinrel = joinrel;
 	out->outerrel = outer;
 	out->innerrel = inner;
 	out->innerpath = inner->cheapest_total_path;
 	out->clauses = clauses;
 	out->keys = keys;
+	out->arms = NIL;
+	return true;
+}
+
+/*
+ * The anti join over a small inner side (DESIGN.md §27, "The anti join over a
+ * small inner side"): joinrel is the whole FROM of a query over one table `t`
+ * with one or more NOT EXISTS correlated with it, and nothing else -
+ *
+ *	- each of its arms is a special join core makes of a NOT EXISTS - or,
+ *	  from PostgreSQL 19, of a NOT IN whose two sides it proves never NULL,
+ *	  which is then the same join (16 to 18 leave every NOT IN a subplan) -
+ *	  or of a `LEFT JOIN s ON ... WHERE s.a IS NULL` (lion_small_anti_left()),
+ *	  when nothing above the joins reads their inner sides but such IS NULL
+ *	  tests, true of every row the joins emit: an anti join whose minimal
+ *	  outer side is t alone, so that it reads nothing of another arm;
+ *	- the arms' syntactic inner sides take every other table of the join
+ *	  between them, none in two; every other special join is inside one of
+ *	  them - an EXISTS, a NOT EXISTS or an outer join of a subquery's own,
+ *	  which that arm's child plans; at most LION_MAX_ANTI_ARMS arms;
+ *	- t is a plain table or a materialized view (lion_fkjoin_rel_ok(), and
+ *	  not a partitioned table) and the inner sides' tables have no LATERAL
+ *	  reference and no TABLESAMPLE (lion_fkjoin_member_ok());
+ *	- each inner side is a rel the join search built, not proved empty, whose
+ *	  cheapest path is unparameterized: its child, run once;
+ *	- every clause each anti join evaluates - an equivalence class's for the
+ *	  pair (none, for an outer join's clauses, which stay in t's joininfo), and
+ *	  t's joininfo clauses within the arm's tables, a clause of the subquery on
+ *	  t alone among them - reads plain columns of t and columns the inner
+ *	  side's rows carry, has no volatile function, subquery or pseudoconstant,
+ *	  and at least one of them is a key: a strict operator between a column
+ *	  of t and an expression of the inner side alone (LionAntiKey).  Each of
+ *	  t's join clauses within the join is one arm's.
+ *
+ * A row of t is then a row of the join when no row of any inner side makes
+ * every clause of its arm true, and the count is t's count less the rows
+ * some inner row does: which rows those are is the caller's to find, by the
+ * keys - the first arm's in *out, each other one's a LionSmallAnti in
+ * out->arms.  A PlaceHolderVar, a pseudoconstant qual or a LATERAL
+ * reference anywhere declines, as for the FK-side join.
+ */
+bool
+lion_fkjoin_recognize_small_anti(PlannerInfo *root, RelOptInfo *joinrel,
+								 LionSmallAnti *out)
+{
+	SpecialJoinInfo *arms[LION_MAX_ANTI_ARMS];
+	bool		ojoin[LION_MAX_ANTI_ARMS];
+	int			narm = 0;
+	RelOptInfo *outer;
+	Relids		tables;
+	Relids		covered;
+	Relids		leftinner = NULL;
+	Relids		leftoj = NULL;
+	bool		anyleft = false;
+	int			outerrelid = -1;
+	int			a;
+	ListCell   *lc;
+
+	if (joinrel->reloptkind != RELOPT_JOINREL || IS_DUMMY_REL(joinrel))
+		return false;
+	if (root->placeholder_list != NIL)
+		return false;
+	if (root->hasPseudoConstantQuals || root->hasLateralRTEs)
+		return false;
+
+	/*
+	 * ---- the anti joins: t alone on the outer side of each, every other
+	 * table inside one of them ----
+	 */
+	tables = bms_difference(joinrel->relids, root->outer_join_rels);
+	covered = NULL;
+	foreach(lc, root->join_info_list)
+		covered = bms_union(covered,
+							((SpecialJoinInfo *) lfirst(lc))->syn_righthand);
+	if (!bms_get_singleton_member(bms_difference(tables, covered),
+								  &outerrelid))
+		return false;
+	covered = NULL;
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+		Relids		rt;
+		int			x;
+
+		if (sjinfo->jointype != JOIN_ANTI ||
+			!bms_get_singleton_member(sjinfo->min_lefthand, &x) ||
+			x != outerrelid)
+			continue;
+		rt = bms_difference(sjinfo->syn_righthand, root->outer_join_rels);
+		if (bms_is_empty(rt) || !bms_is_subset(rt, tables) ||
+			bms_is_member(x, rt) || bms_overlap(rt, covered))
+			return false;
+		if (narm >= LION_MAX_ANTI_ARMS)
+			return false;
+		ojoin[narm] = !lion_fkjoin_sublink_anti(root, sjinfo);
+		if (ojoin[narm])
+		{
+			anyleft = true;
+			leftinner = bms_union(leftinner, rt);
+			if (sjinfo->ojrelid != 0)
+				leftoj = bms_add_member(leftoj, sjinfo->ojrelid);
+		}
+		arms[narm++] = sjinfo;
+		covered = bms_union(covered, rt);
+	}
+	if (narm == 0 ||
+		!bms_equal(bms_add_member(covered, outerrelid), tables))
+		return false;
+	if (anyleft &&
+		!lion_small_anti_left(root, joinrel, outerrelid, leftinner, leftoj))
+		return false;
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+		Relids		both = bms_union(sjinfo->syn_lefthand,
+									 sjinfo->syn_righthand);
+
+		for (a = 0; a < narm; a++)
+		{
+			if (sjinfo == arms[a] ||
+				bms_is_subset(both, arms[a]->syn_righthand))
+				break;
+		}
+		/* both of its sides within an anti join's inner side */
+		if (a == narm)
+			return false;
+	}
+
+	/* ---- the table counted, and each arm ---- */
+	outer = root->simple_rel_array[outerrelid];
+	if (!lion_fkjoin_rel_ok(root, outer) || lion_fkjoin_is_parent(root, outer))
+		return false;
+	if (!lion_small_anti_arm(root, joinrel, outer, outerrelid, arms[0],
+							 ojoin[0], out))
+		return false;
+	for (a = 1; a < narm; a++)
+	{
+		LionSmallAnti *arm = (LionSmallAnti *) palloc(sizeof(LionSmallAnti));
+
+		if (!lion_small_anti_arm(root, joinrel, outer, outerrelid, arms[a],
+								 ojoin[a], arm))
+			return false;
+		out->arms = lappend(out->arms, arm);
+	}
+
+	/* ---- each of t's join clauses within the join is one arm's ---- */
+	foreach(lc, outer->joininfo)
+	{
+		RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+		int			n = 0;
+
+		if (!bms_is_subset(ri->required_relids, joinrel->relids))
+			continue;
+		if (anyleft && RINFO_IS_PUSHED_DOWN(ri, joinrel->relids))
+			continue;
+		for (a = 0; a < narm; a++)
+		{
+			const LionSmallAnti *arm = (a == 0) ? out :
+				(const LionSmallAnti *) list_nth(out->arms, a - 1);
+
+			if (list_member_ptr(arm->clauses, ri))
+				n++;
+		}
+		if (n != 1)
+			return false;
+	}
 	return true;
 }
 
