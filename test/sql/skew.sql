@@ -331,6 +331,88 @@ RESET pg_lion.enable_plain_scan;
 RESET enable_bitmapscan;
 SELECT w.count AS want, g.count AS got FROM lsw_want w, lsw_got g;
 
+-- ---------- 7. an array of keys not known at plan time ----------
+-- `fk = ANY (<array>)`, where the array is an InitPlan's or a generic
+-- plan's parameter: core takes it for ten keys at its rows per key, where
+-- the keys are the ones a join to the array's source would probe, each
+-- meeting the rows a probed key meets.  Core's own scan is priced at those
+-- (its run cost grows by the same factor), and the count by lion, which
+-- reads the keys' containers, is the plan.  Off, core's scan is.  Group 1's
+-- ten keys hold 1,000 rows each.
+SET max_parallel_workers_per_gather = 0;
+INSERT INTO lsw_q VALUES
+	('arr_distinct', $q$SELECT count(DISTINCT f.fk), count(*) FROM lsw_fact f WHERE f.fk = ANY ((SELECT array_agg(id) FROM lsw_dim WHERE grp = 1)::int[])$q$),
+	('arr_group', $q$SELECT f.fk, count(*) FROM lsw_fact f WHERE f.fk = ANY ((SELECT array_agg(id) FROM lsw_dim WHERE grp = 1)::int[]) GROUP BY f.fk ORDER BY f.fk$q$),
+	('arr_where', $q$SELECT count(DISTINCT f.fk), count(*) FROM lsw_fact f WHERE f.fk = ANY ((SELECT array_agg(id) FROM lsw_dim WHERE grp >= 1)::int[]) AND f.doc @@ 'a1 & b2'::tsquery$q$),
+	('arr_where_group', $q$SELECT f.fk, count(*) FROM lsw_fact f WHERE f.fk = ANY ((SELECT array_agg(id) FROM lsw_dim WHERE grp >= 1)::int[]) AND f.doc @@ 'a1 | b2'::tsquery GROUP BY f.fk ORDER BY f.fk$q$);
+PREPARE lsw_arr(int[]) AS
+	SELECT count(DISTINCT f.fk), count(*) FROM lsw_fact f WHERE f.fk = ANY ($1);
+SET plan_cache_mode = force_generic_plan;
+\set lsw_param 'EXECUTE lsw_arr(''{9,10,11,12,13,14,15,16,17,18}'')'
+SET pg_lion.enable_skew_estimate = off;
+SELECT name, lsw_plan(q) FROM lsw_q
+ WHERE name IN ('arr_distinct', 'arr_group') ORDER BY name;
+SELECT lsw_plan(:'lsw_param') AS param_plan;
+SET pg_lion.enable_skew_estimate = on;
+SELECT name, lsw_plan(q) FROM lsw_q
+ WHERE name IN ('arr_distinct', 'arr_group') ORDER BY name;
+-- (a generic plan is kept across settings: made again)
+DEALLOCATE lsw_arr;
+PREPARE lsw_arr(int[]) AS
+	SELECT count(DISTINCT f.fk), count(*) FROM lsw_fact f WHERE f.fk = ANY ($1);
+SELECT lsw_plan(:'lsw_param') AS param_plan;
+:lsw_param;
+-- core's plan, at the rows the array's keys meet
+SET pg_lion.enable_count_pushdown = off;
+SELECT lsw_total(q) AS arr_on FROM lsw_q WHERE name = 'arr_distinct' \gset
+SET pg_lion.enable_skew_estimate = off;
+SELECT round((:arr_on / lsw_total(q))::numeric) AS arr_factor
+  FROM lsw_q WHERE name = 'arr_distinct';
+RESET pg_lion.enable_skew_estimate;
+-- A constant array is core's to count: priced as it is.
+SELECT lsw_total('SELECT count(*) FROM lsw_fact f WHERE f.fk = ANY (''{9,10,11,12,13,14,15,16,17,18}''::int[])') AS const_on \gset
+SET pg_lion.enable_skew_estimate = off;
+SELECT lsw_total('SELECT count(*) FROM lsw_fact f WHERE f.fk = ANY (''{9,10,11,12,13,14,15,16,17,18}''::int[])') = :const_on
+	   AS const_unchanged;
+RESET pg_lion.enable_skew_estimate;
+
+-- The answers, against core's: count(DISTINCT) over the array's keys walks
+-- them as GROUP BY does, the WHERE collected once over 20,120 keys.
+CREATE TEMP TABLE lsw_arr_want (name text, r text);
+DO $$
+DECLARE
+	n text;
+BEGIN
+	FOR n IN SELECT name FROM lsw_q WHERE name LIKE 'arr%' LOOP
+		EXECUTE format('INSERT INTO lsw_arr_want SELECT %L, string_agg(t::text, %L) FROM (%s) t',
+					   n, ',', (SELECT q FROM lsw_q WHERE name = n));
+	END LOOP;
+END $$;
+RESET pg_lion.enable_count_pushdown;
+SELECT name, lsw_plan(q) FROM lsw_q
+ WHERE name IN ('arr_where', 'arr_where_group') ORDER BY name;
+CREATE FUNCTION lsw_arr_got(n text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	r text;
+BEGIN
+	EXECUTE format('SELECT string_agg(t::text, %L) FROM (%s) t', ',',
+				   (SELECT q FROM lsw_q WHERE name = n)) INTO r;
+	RETURN r;
+END $$;
+SELECT w.name, w.r = lsw_arr_got(w.name) AS same, length(w.r) > 0 AS nonempty
+  FROM lsw_arr_want w ORDER BY w.name;
+SET pg_lion.enable_count_pushdown = off;
+DEALLOCATE lsw_arr;
+PREPARE lsw_arr(int[]) AS
+	SELECT count(DISTINCT f.fk), count(*) FROM lsw_fact f WHERE f.fk = ANY ($1);
+SELECT lsw_plan(:'lsw_param') AS param_plan;
+:lsw_param;
+RESET pg_lion.enable_count_pushdown;
+RESET plan_cache_mode;
+DEALLOCATE lsw_arr;
+DROP FUNCTION lsw_arr_got(text);
+
 RESET random_page_cost;
 RESET effective_cache_size;
 DROP TABLE lsw_fact, lsw_dim;

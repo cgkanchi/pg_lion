@@ -3022,9 +3022,61 @@ lion_distinct_relation(LionCountScanState *st)
 			if (dist->full && st->sumallitem < 0)
 				total += lion_distinct_test(st, nsource, sources, true);
 		}
+		else if (dist->full)
+		{
+			/*
+			 * Each value's rows, counted as a GROUP BY k counts a group: the
+			 * WHERE collected once, when that pays (lion_group_count()), which
+			 * a walk of many values whose WHERE is probed at each of them
+			 * soon does.  A count against the collected copy needs the
+			 * value's own set under a pin of its own, as there: a listed set
+			 * that holds none is located again (lion_next_group_inlist()), and
+			 * a value whose entry has gone meanwhile held no row anyone can
+			 * see.  A value is weighed at the containers its entry records
+			 * when those are fewer than its rows: its count probes the WHERE
+			 * a container at a time, and a walk of a few hundred clustered
+			 * values had collected the WHERE long before it paid.
+			 */
+			bool		more;
+			uint64		own;
+
+			if (listdrive && ps->nopin)
+			{
+				LionClauseState *cl =
+					&st->clause[st->item[st->ingroupitem].clauseno];
+
+				if (!lion_posting_set_lookup_col(cl->idx, cl->idxcol,
+												 ps->storedkey, InvalidOid,
+												 &st->groupset))
+				{
+					lion_posting_set_release(&st->groupset);
+					MemoryContextSwitchTo(oldcxt);
+					continue;
+				}
+				sources[0].sets = &st->groupset;
+			}
+			more = listdrive ? lion_ingroup_more(st) :
+				lion_entry_scan_batch_left(&st->escan) > 0;
+			own = sources[0].sets->ntids;
+			if (sources[0].sets->ncontainers > 0)
+				own = Min(own, (uint64) sources[0].sets->ncontainers);
+			dist->tests++;
+			n = lion_group_count(st, nsource, sources,
+								 (sources == st->dsources) ? nsource - 1 :
+								 st->nitem,
+								 own, more);
+			if (n > 0)
+			{
+				ndistinct++;
+				nonnull += n;
+				total += n;
+			}
+			if (listdrive)
+				lion_posting_set_release(&st->groupset);
+		}
 		else
 		{
-			n = lion_distinct_test(st, nsource, sources, dist->full);
+			n = lion_distinct_test(st, nsource, sources, false);
 			if (n > 0)
 			{
 				ndistinct++;

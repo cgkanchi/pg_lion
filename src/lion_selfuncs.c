@@ -1055,6 +1055,8 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 static void lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 										Index rti, RangeTblEntry *rte);
 static void lion_skew_reprice_params(PlannerInfo *root, RelOptInfo *rel);
+static void lion_skew_reprice_lists(PlannerInfo *root, RelOptInfo *rel,
+									RangeTblEntry *rte);
 
 /* n_distinct from the directory (DESIGN.md §33), at the end of this file */
 static get_index_stats_hook_type lion_prev_index_stats_hook = NULL;
@@ -5050,6 +5052,7 @@ lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 
 	/* last, so that every hook's parameterized paths are there to reprice */
 	lion_skew_reprice_params(root, rel);
+	lion_skew_reprice_lists(root, rel, rte);
 }
 
 /* ---------------------------------------------------------------------
@@ -7205,6 +7208,36 @@ lion_skew_param_eq_var(PlannerInfo *root, RelOptInfo *rel, Node *clause)
 		clause = (Node *) ((IndexClause *) clause)->rinfo;
 	if (clause != NULL && IsA(clause, RestrictInfo))
 		clause = (Node *) ((RestrictInfo *) clause)->clause;
+	if (clause != NULL && IsA(clause, ScalarArrayOpExpr))
+	{
+		/*
+		 * `col = ANY (array)` probes each of the array's keys: an array of
+		 * keys the plan does not know - a Param, an InitPlan's - meets them
+		 * as the same keys probed one at a time would (DESIGN.md §33, "An
+		 * array of keys not known at plan time").  The column is on the left.
+		 */
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+
+		if (!saop->useOr || list_length(saop->args) != 2 ||
+			get_oprrest(saop->opno) != F_EQSEL)
+			return NULL;
+		left = (Node *) linitial(saop->args);
+		while (IsA(left, RelabelType))
+			left = (Node *) ((RelabelType *) left)->arg;
+		if (!IsA(left, Var) || (Index) ((Var *) left)->varno != rel->relid ||
+			((Var *) left)->varlevelsup != 0)
+			return NULL;
+		var = (Var *) left;
+		other = (Node *) lsecond(saop->args);
+		if (var->varattno <= 0 || contain_volatile_functions(other))
+			return NULL;
+		varnos = pull_varnos(root, other);
+		if (bms_is_member(rel->relid, varnos))
+			return NULL;
+		if (bms_is_empty(varnos) && !lion_skew_has_param(other, NULL))
+			return NULL;
+		return var;
+	}
 	if (clause == NULL || !IsA(clause, OpExpr))
 		return NULL;
 	op = (OpExpr *) clause;
@@ -7410,7 +7443,8 @@ lion_skew_path_factor(PlannerInfo *root, RelOptInfo *rel, Path *path)
 				Node	   *ipath;
 
 				/* a B-tree's walk, by the clauses its index answers */
-				if (cpath->methods != &lion_btree_path_methods ||
+				if ((cpath->methods != &lion_btree_path_methods &&
+					 cpath->methods != &lion_ordered_path_methods) ||
 					cpath->custom_private == NIL)
 					return 1.0;
 				ipath = linitial(cpath->custom_private);
@@ -7630,6 +7664,103 @@ lion_skew_reprice_params(PlannerInfo *root, RelOptInfo *rel)
 		if (!semi)
 			ppi->ppi_rows = rows;
 	}
+}
+
+/*
+ * An array of keys the plan does not know (DESIGN.md §33, "An array of keys
+ * not known at plan time"): a restriction `col = ANY (<Param>)` of rel - a
+ * generic plan's parameter, an InitPlan's array - on a key column whose
+ * probed key meets at least LION_SKEW_MIN_FACTOR times core's rows per key.
+ * Core prices each of the array's keys at the rows per key, as it prices an
+ * outer row's key in a nested loop; the keys are the ones a nested loop over
+ * the array's source would probe, and are priced at the rows such a probe
+ * meets, as lion_skew_reprice_params() prices that loop.  Each unparameterized
+ * path whose own index answers such a clause - an index scan, a bitmap heap
+ * scan whose bitmap holds it, a LionBtreeScan or LionOrdered walk of a B-tree
+ * that has it among its index clauses - reads the rows of the keys it finds,
+ * and its run cost grows by the clause's factor (a bitmap heap scan's startup
+ * by what its bitmap's index scans read more).  A path that answers it some
+ * other way - a scan that filters it, a lion count whose cost is the keys'
+ * containers - reads what it read before.  The relation's rows are not
+ * touched: they are every unparameterized path's, and the array's length is
+ * core's guess either way.
+ *
+ * The repriced paths are taken out and offered again (add_path(),
+ * add_partial_path()), so that the lists stay in their order and a path one
+ * of them had pushed out may come back: a sequential scan, as
+ * set_plain_rel_pathlist() offers it, and the TID scans.
+ */
+static void
+lion_skew_reprice_lists(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+{
+	List	   *lists = NIL;
+	List	   *repriced = NIL;
+	List	   *partials = NIL;
+	double		factor;
+	ListCell   *lc;
+
+	if (!lion_enable_skew_estimate || !IS_SIMPLE_REL(rel) ||
+		rel->rtekind != RTE_RELATION || IS_DUMMY_REL(rel))
+		return;
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+		if (IsA(rinfo->clause, ScalarArrayOpExpr))
+			lists = lappend(lists, rinfo);
+	}
+	if (lists == NIL)
+		return;
+	factor = lion_skew_clauses_factor(root, rel, lists);
+	list_free(lists);
+	if (factor < LION_SKEW_MIN_FACTOR)
+		return;
+	elog(DEBUG2, "lion: an array of keys of \"%s\" priced at %.1f times core's rows",
+		 get_rel_name(planner_rt_fetch(rel->relid, root)->relid), factor);
+
+	for (int pass = 0; pass < 2; pass++)
+	{
+		List	  **plist = (pass == 0) ? &rel->pathlist : &rel->partial_pathlist;
+
+		foreach(lc, *plist)
+		{
+			Path	   *path = (Path *) lfirst(lc);
+			double		pf;
+			Cost		more = 0.0;
+
+			if (path->param_info != NULL)
+				continue;
+			pf = Min(lion_skew_path_factor(root, rel, path), factor);
+			if (IsA(path, BitmapHeapPath))
+				more = lion_skew_bitmap_more(root, rel,
+											 ((BitmapHeapPath *) path)->bitmapqual,
+											 factor);
+			if (pf <= 1.0 && more <= 0.0)
+				continue;
+			path->total_cost = path->startup_cost + more +
+				(path->total_cost - path->startup_cost) * Max(pf, 1.0);
+			path->startup_cost += more;
+			if (pass == 0)
+				repriced = lappend(repriced, path);
+			else
+				partials = lappend(partials, path);
+			*plist = foreach_delete_current(*plist, lc);
+		}
+	}
+	foreach(lc, repriced)
+		add_path(rel, (Path *) lfirst(lc));
+	foreach(lc, partials)
+		add_partial_path(rel, (Path *) lfirst(lc));
+	if (repriced != NIL && rte->rtekind == RTE_RELATION && !rte->inh &&
+		(rte->relkind == RELKIND_RELATION || rte->relkind == RELKIND_MATVIEW) &&
+		rte->tablesample == NULL)
+	{
+		/* as set_plain_rel_pathlist() offers them */
+		add_path(rel, create_seqscan_path(root, rel, rel->lateral_relids, 0));
+		(void) create_tidscan_paths(root, rel);
+	}
+	list_free(repriced);
+	list_free(partials);
 }
 
 /*
