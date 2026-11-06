@@ -19654,10 +19654,10 @@ is past the default `hash_mem`, and a refused plan there is the query failing un
   finds its rows in the first few hundred container keys needs the set at those keys only. When
   every leaf's keys are set trees (an equality or a list on a scalar column, and beside one any
   column's `IS NOT NULL`, whose NULL entry the probe takes away from the leaf's AND, §14 - since
-  2026-10-19: `lo_lazy_ok()`; a
-  range is a walk of entries, a multi-key query may need every row, and a list longer than a
-  plain scan opens at once, `lion_scan_list_batch()`, is read a batch at a time - a stream holds
-  a cursor for each of its sets), the set is LAZY instead: each leaf key's
+  2026-10-19: `lo_lazy_ok()`; and a multi-key column's query that is a tree of whole key sets,
+  below; a range is a walk of entries, and a list longer than a plain scan opens at once,
+  `lion_scan_list_batch()`, is read a batch at a time - a stream holds a cursor for each of its
+  sets), the set is LAZY instead: each leaf key's
   posting sets are located once (`lion_scankey_sets()`, as a bitmap scan locates them) and their
   pins let go (§30.5: the node holds none between rows), and each TID the walk hands out is looked
   up in a memo of container keys (a simplehash, `lo_memo`); a key met for the first time is
@@ -19712,7 +19712,35 @@ is past the default `hash_mem`, and a refused plan there is the query failing un
   members all in the last 1% of the order, builds at 10,000 entries and switches at 12,160,
   0.63 ms where building at 40,000 took 1.40. A leaf key that selects nothing makes an AND of it
   empty, as before (`lo_lazy_empty()`). Exactness is the lion quals' own (every lazy key is an
-  exact set). A rescan keeps the memo unless a Param of the lion quals changed, as it keeps a
+  exact set).
+
+  A multi-key column's query is lazy where its value is a tree of whole key sets that selects
+  exactly its rows (§17, `LION_QMODE_KEYS`): a tsquery's ANDs and ORs of plain lexemes, a prefix
+  expanded to its lexemes (up to its cap), an array's `@>` and `&&`, a jsonb document's `@>`, and
+  `@@ ANY` of such queries. That is known only from the value, which may be a run-time one - a
+  generic plan's parameter, a LATERAL's outer row - so `lo_lazy_ok()` lets a multi-key key through
+  whatever its strategy and `lo_lazy_begin()` asks `lion_scankey_sets()`, which answers such a tree
+  exactly or not at all: a query that needs every row, a phrase's positions, a weight, a NOT, or a
+  prefix past its cap is built, as it always was. Until 2026-11 every multi-key key was built, and
+  a walk under a tsquery filter that found its rows in the first few container keys read the
+  lexemes' sets over the whole table first. A rescan that keeps the lazy set does not count the
+  new walk's first key as one behind the last: a nested loop's probe walks each outer row's rows
+  somewhere else in the heap, which says nothing of whether each walk goes in heap order, and the
+  probe budget still bounds what the probes cost.
+
+  **Measured** (synthetic: 20M child rows of 2M parents, a tsquery of three lexemes' ORs ANDed
+  keeping a few percent, PG 18, warm, median of 3; a LATERAL over each chosen parent's first three
+  matching children by id, a LionOrdered walk of `(parent, id)` per parent):
+
+  | parents | built at the start (ms) | lazy (ms) | ratio |
+  |---:|---:|---:|---:|
+  | 40 | 44 | 3.7 | 12x |
+  | 342 | 43 | 23 | 1.9x |
+  | 10,000 (three ANDed lexemes) | 238 | 246 | 0.97x |
+
+  At 10,000 parents the probes reach their budget and the set is built after 1,928 keys, the
+  bounded loss the budget allows. A LionBtreeScan the plan marks to build at once
+  (`LO_FLAG_BUILD`) builds as before. A rescan keeps the memo unless a Param of the lion quals changed, as it keeps a
   built set; the members met are the scan's and go with it. When a rule above builds the set
   mid-walk, the members met are counted again against the built set rather than carried over:
   the probes answered from the index as it was, and a VACUUM in between may have taken out the

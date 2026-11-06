@@ -493,13 +493,13 @@ SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 AND length(note) =
 (7 rows)
 
 SELECT * FROM lion_ord_run($$SELECT id FROM lo WHERE tags @> ARRAY['t3', 'u5'] ORDER BY k, id LIMIT 10$$);
-            lion_ord_run             
--------------------------------------
+                            lion_ord_run                             
+---------------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on lo
  Index Entries Walked: 4002
  Lion Set Hits: 10
  Heap Fetches: 10
- Lion Set: 32 containers, exact
+ Lion Set: 32 containers, exact, after 12 keys probed (probe budget)
 (5 rows)
 
 -- a node that never ran built no set, and rechecked nothing (it used to

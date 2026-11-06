@@ -6830,9 +6830,13 @@ lo_shared_set(LionOrderedState *st)
 
 /*
  * Can every key of every leaf be sought in: a set tree - an equality or a
- * list - on a scalar column, or `IS NOT NULL` beside one, its column's NULL
- * entry taken away from it?  A range is a walk of entries, and a multi-key
- * column's query may need every row; those leaves are only ever built.
+ * list on a scalar column, or a multi-key column's query - or `IS NOT NULL`
+ * beside one, its column's NULL entry taken away from it?  A range is a walk
+ * of entries, and is only ever built.  Whether a multi-key query is a tree
+ * of whole key sets - a tsquery's ANDs and ORs of plain lexemes, a jsonb
+ * containment - is known only from its value: lo_lazy_begin() asks
+ * (lion_scankey_sets(), which answers exactly or not at all), and builds the
+ * set of one that needs every row, a phrase's positions or a weight.
  */
 static bool
 lo_lazy_ok(LionOrderedState *st)
@@ -6858,7 +6862,7 @@ lo_lazy_ok(LionOrderedState *st)
 			if ((sk->sk_flags & (SK_SEARCHNOTNULL | SK_ROW_HEADER)) ==
 				SK_SEARCHNOTNULL)
 				continue;		/* any column's: its NULL entry, subtracted */
-			if (col->multikey || sk->sk_strategy != LION_STRAT_EQUAL ||
+			if ((!col->multikey && sk->sk_strategy != LION_STRAT_EQUAL) ||
 				(sk->sk_flags & (SK_SEARCHNULL | SK_SEARCHNOTNULL |
 								 SK_ROW_HEADER)) != 0)
 				return false;
@@ -8844,6 +8848,15 @@ lo_rescan(CustomScanState *node)
 		if (st->lazy)
 			lo_lazy_end(st);
 	}
+
+	/*
+	 * A lazy set kept across the rescan: the new walk starts where its own
+	 * order does, which says nothing of whether it goes in heap order - a
+	 * nested loop's probe walks each outer row's rows somewhere else - so
+	 * its first key is not counted as one behind the last (lo_lazy_why()).
+	 */
+	if (st->lazy)
+		st->lazylast = 0;
 
 	ExecScanReScan(&node->ss);
 }
