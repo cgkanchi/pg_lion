@@ -6198,8 +6198,10 @@ lo_reparameterize(PlannerInfo *root, List *custom_private,
 {
 	Path	   *ord;
 	Path	   *moved;
+	List	   *result;
 
-	if (list_length(custom_private) != 3 ||
+	if ((list_length(custom_private) != 3 &&
+		 list_length(custom_private) != 5) ||
 		!IsA(linitial(custom_private), IndexPath))
 		elog(ERROR, "LionBtreeScan: unrecognized path to reparameterize");
 	ord = (Path *) linitial(custom_private);
@@ -6207,7 +6209,16 @@ lo_reparameterize(PlannerInfo *root, List *custom_private,
 	if (moved == NULL)
 		elog(ERROR, "LionBtreeScan: could not reparameterize the walk of index %u",
 			 ((IndexPath *) ord)->indexinfo->indexoid);
-	return list_make3(moved, lsecond(custom_private), lthird(custom_private));
+	result = list_make3(moved, lsecond(custom_private), lthird(custom_private));
+
+	/*
+	 * A complement probe's restrictions and their clauses are the relation's
+	 * own, read by no join, so they move as they are.
+	 */
+	if (list_length(custom_private) == 5)
+		result = lappend(lappend(result, lfourth(custom_private)),
+						 list_nth(custom_private, 4));
+	return result;
 }
 
 /* ---------------------------------------------------------------------

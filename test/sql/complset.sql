@@ -142,5 +142,51 @@ SELECT q, lion_cs(q) FROM (VALUES
 ) v(q);
 RESET pg_lion.enable_complement_sets;
 
+-- a partitionwise join moves the probe's parameterization to each outer
+-- partition, the complement with it
+CREATE TABLE csp (id int, g text) PARTITION BY RANGE (id);
+CREATE TABLE csp1 PARTITION OF csp FOR VALUES FROM (0) TO (20000);
+CREATE TABLE csp2 PARTITION OF csp FOR VALUES FROM (20000) TO (40000);
+INSERT INTO csp SELECT i, CASE WHEN i % 6 = 0 THEN 'v' ELSE 'g' || (i % 500) END
+  FROM generate_series(0, 39999) i;
+CREATE INDEX ON csp (id) INCLUDE (g);
+CREATE INDEX csp_lion ON csp USING lion (g);
+CREATE TABLE cspd (id int, w int) PARTITION BY RANGE (id);
+CREATE TABLE cspd1 PARTITION OF cspd FOR VALUES FROM (0) TO (20000);
+CREATE TABLE cspd2 PARTITION OF cspd FOR VALUES FROM (20000) TO (40000);
+INSERT INTO cspd SELECT i, i % 4 FROM generate_series(0, 39999, 3) i;
+VACUUM ANALYZE csp;
+VACUUM ANALYZE cspd;
+SET enable_partitionwise_join = on;
+BEGIN;
+SET LOCAL enable_hashjoin = off;
+SET LOCAL enable_mergejoin = off;
+SET LOCAL enable_bitmapscan = off;
+SET LOCAL enable_material = off;
+SET LOCAL enable_memoize = off;
+SET LOCAL pg_lion.enable_plain_scan = off;
+SET LOCAL pg_lion.enable_ordered_join = off;
+SET LOCAL pg_lion.pushdown_margin = 1000;
+EXPLAIN (COSTS OFF)
+SELECT cspd.id FROM cspd JOIN csp ON csp.id = cspd.id
+ WHERE cspd.w = 1 AND csp.g <> 'v';
+SELECT count(*) FROM cspd JOIN csp ON csp.id = cspd.id
+ WHERE cspd.w = 1 AND csp.g <> 'v';
+COMMIT;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+SET enable_nestloop = off;
+SET pg_lion.enable_btree_scan = off;
+SET pg_lion.enable_ordered_scan = off;
+SELECT count(*) FROM cspd JOIN csp ON csp.id = cspd.id
+ WHERE cspd.w = 1 AND csp.g <> 'v';
+RESET enable_indexscan;
+RESET enable_indexonlyscan;
+RESET enable_nestloop;
+RESET pg_lion.enable_btree_scan;
+RESET pg_lion.enable_ordered_scan;
+RESET enable_partitionwise_join;
+DROP TABLE csp, cspd;
+
 DROP TABLE cs, csd;
 DROP FUNCTION lion_cs(text);
