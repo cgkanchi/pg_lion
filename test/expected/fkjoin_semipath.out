@@ -629,8 +629,9 @@ SELECT * FROM lion_sp_explain('SELECT d.pk FROM lion_sp_d d WHERE NOT EXISTS (SE
          Implied by Partition Bounds: (kind = 'b'::text)
          Join Key Lookups: in index order
          Join Rows: the outer rows without a match
+         Fact Filters: collected once
          ->  Parallel Seq Scan on lion_sp_d d
-(9 rows)
+(10 rows)
 
 -- ---- 2. the answers ------------------------------------------------------------
 -- semi and anti joins over the plain fact, fact filters of every kind

@@ -1147,8 +1147,8 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 	{
 		*walk = (walked < descents);
 		*collect = (copybytes > 0 &&
-					collected < probed * (keysjoined ?
-										  LION_FKJOIN_JOINED_KEYS_HEDGE : 1.0) &&
+					collected < probed *
+					lion_fkjoin_collect_hedge(workers, keysjoined) &&
 					!RecoveryInProgress());
 	}
 	if (mayunite && united < (*collect ? collected : probed))

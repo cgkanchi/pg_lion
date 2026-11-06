@@ -128,14 +128,18 @@ lion_meta_carry_conts(Relation index, LionMetaNdistinct *nd)
 	for (i = 0; i < LION_META_MAX_COLS; i++)
 	{
 		uint32		bit = ((uint32) 1) << i;
+		double		scaled;
 
 		if ((nd->valid_cols & bit) == 0 || (old.valid_cols & bit) == 0 ||
 			!LionMetaContsKnown(&old, i) || nd->ndistinct[i] == 0)
 			continue;
-		nd->conts[i] = (uint64) Max(rint((double) old.conts[i] /
-										 (double) old.ndistinct[i] *
-										 (double) nd->ndistinct[i]),
-									(double) nd->ndistinct[i]);
+		scaled = Max(rint((double) old.conts[i] /
+						  (double) old.ndistinct[i] *
+						  (double) nd->ndistinct[i]),
+					 (double) nd->ndistinct[i]);
+		/* a double at or past 2^64 has no uint64 value */
+		nd->conts[i] = (scaled >= (double) PG_UINT64_MAX) ?
+			PG_UINT64_MAX : (uint64) scaled;
 	}
 }
 

@@ -583,6 +583,17 @@ StaticAssertDecl(INDEX_MAX_KEYS <= LION_META_MAX_COLS,
 StaticAssertDecl(sizeof(LionMetaNdistinct) == 784,
 				 "the lion meta page's key counts must not change size");
 
+/*
+ * The counts as a build before conts wrote them: the same fields, without
+ * conts.  A LION_OP_NDISTINCT record of that size - an older server's, which
+ * a standby upgraded first replays - is applied as such (lion_redo_apply()),
+ * and the page reads as one without counts (LionMetaHasNdistinct()) until a
+ * VACUUM, ANALYZE or REINDEX writes them again.
+ */
+#define LION_META_NDISTINCT_V1_SIZE	offsetof(LionMetaNdistinct, conts)
+StaticAssertDecl(offsetof(LionMetaNdistinct, conts) == 528,
+				 "the older key counts are the first 528 bytes of these");
+
 /* Key column i's (from 0) Σn² of nd, when it is known. */
 #define LionMetaSumsqKnown(nd, i) \
 	((nd)->rows > 0 && (nd)->sumsq[i] != 0 && \
