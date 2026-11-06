@@ -2717,8 +2717,9 @@ list is no item of the WHERE), and the pairs of two columns (`lion_next_group2()
 - **Pauses.** The copy holds no pin, so it is kept across rows (§15, "Paused and finished counts")
   like the WHERE sets' own copies, and collecting needs no pin either: a count after a pause
   collects the NOPIN copies as it would the pinned sets.
-- **Not taken.** A count(DISTINCT) walk (§26): its tests stop at the first visible row and read a
-  share of each intersection, so a collection of all of it could read more than every test together.
+- **Not taken.** A count(DISTINCT) walk of existence tests (§26): its tests stop at the first
+  visible row and read a share of each intersection, so a collection of all of it could read more
+  than every test together. One whose tests count (`count(*)` beside it) collects as GROUP BY does.
   The sums of §14 and §28, which make many counts for one row, re-read their WHERE sets the same way
   and are left for later. The FK-side join has had its own copy since §27.
 
@@ -2741,7 +2742,7 @@ on another, ORs, multi-key queries, a range as a source, two GROUP BY columns, a
 generic plan, a LATERAL rescan, a cursor paused between groups (which pins no page of the indexes
 while it waits), a dirty heap and a collection that spills - and says which of them collected: none
 of a GROUP BY with one group, without a WHERE, over one set, over only `IS NOT NULL`, over a
-collected range alone, of a count(DISTINCT), or of a handful of one-row groups. And it compares the
+collected range alone, of a count(DISTINCT) of existence tests, or of a handful of one-row groups. And it compares the
 shared buffers a grouped count over an OR of two CHAIN sets reads with the same count ungrouped:
 beyond the walk of the groups, at most three times the ungrouped count's, where each group used to
 read the OR's sets again.
@@ -11745,6 +11746,10 @@ and includes the key deleted after the snapshot.
   is the sum over all entries, the NULL entry included - §15's disjointness again - and `count(k)`
   the sum over the non-NULL ones); in shape 2, `count(*)` and `count(g)` make the GROUP test a
   count and `count(k)` makes the PAIR tests counts. A pure distinct count is existence tests only.
+  Shape 1's full counts are §10's GROUP BY counts (`lion_group_count()`): the WHERE is collected
+  once (§10, "The WHERE sets, collected once") when the counts so far and the next would read more, each
+  value weighed at the fewer of its rows and the containers its entry records. A listed value
+  whose set holds no pin is located again for it, as `lion_next_group_inlist()` does.
 - A GROUP BY the planner folded to constants (`WHERE g = 3 GROUP BY g`) is shape 1 under §10's
   single-group rule - no row when nothing matches. Whether a row matches when every matching row
   has `k` NULL is one more existence test, on `k`'s NULL entry, made only when no distinct value
@@ -22391,9 +22396,45 @@ match reads every row of its key for, is repriced whole. A probe whose outer
 values do not all come from the join's outer side - from another relation of the inner side, say -
 is an ordinary probe there, and is repriced.
 
-Only parameterized paths are repriced. A correlated subquery's scan and a generic plan's Param
-are restrictions of the relation, not parameterizations, and keep core's rows; so does every
-estimate core makes from the column. `pg_lion.enable_skew_estimate` (on) turns it off.
+**An array of keys not known at plan time.** `col = ANY (<array>)`, where the array is a Param
+- an InitPlan's, a generic plan's parameter - is a restriction of the relation, and core prices it
+as ten keys (`estimate_array_length()`) at its rows per key. The keys are not drawn by key: an
+InitPlan that aggregates the keys of a dimension's chosen rows names them as a join to that
+dimension would probe them, each with the chance of its rows. So once every hook has added its
+paths (`lion_skew_reprice_lists()`), each unparameterized path of a relation with such a
+restriction on a key column whose figure is at least twice core's rows per key is repriced as a
+probe of that key would be: a path whose index answers the clause - an index scan, a bitmap heap
+scan's bitmap, a LionBtreeScan or LionOrdered walk of a B-tree that has it among its index clauses
+- has its run cost grown by the factor, a bitmap heap scan's startup by what its index scans read
+more; any other path, a scan that filters the clause or a lion count that reads the keys'
+containers, reads what it read before. The relation's rows are not touched: they are every
+unparameterized path's, and the array's length is core's guess either way. The repriced paths are
+taken out and offered again, with a sequential scan and the TID scans as `set_plain_rel_pathlist()`
+offers them, so that a path one of them had pushed out may come back. A constant array is core's to
+count, and is priced as it is.
+
+**Measured** (synthetic: a 2,000,000-row fact whose key column has a few heavy keys and many light
+ones, a count over the keys of a dimension's chosen rows passed as an InitPlan's array, PG 18,
+warm): core's B-tree scan of the keys' rows was the plan at every list length, and lion's count
+over the keys' containers lost on price. Repriced, the count is the plan:
+
+| keys in the array | core (ms) | lion (ms) | ratio |
+|---:|---:|---:|---:|
+| count(DISTINCT k), count(*), 342 keys | 94 | 3.3 | 28x |
+| the same, 10,000 keys | 1,095 | 40 | 27x |
+| the same, 100,000 keys | 1,294 | 188 | 6.9x |
+| GROUP BY k, 342 keys | 91 | 7.7 | 12x |
+| GROUP BY k, 10,000 keys | 1,105 | 29 | 38x |
+| GROUP BY k, 100,000 keys | 1,330 | 245 | 5.4x |
+
+The count(DISTINCT) walk counts each key's rows against the WHERE as GROUP BY does, collecting
+the WHERE once where the walk's probes of it would read more (§26, "count(DISTINCT k) with
+count(*)").
+
+A correlated subquery's scan and a generic plan's scalar Param (`col = $1`) are restrictions of
+the relation, not parameterizations, and keep core's rows: one key the plan does not know is a key
+drawn by key as much as by row. So does every estimate core makes from the column.
+`pg_lion.enable_skew_estimate` (on) turns it off.
 `lion_debug_skew_rows(text)` plans a query and returns, for each column whose figure a probe's
 pricing computed, repriced or not, the figure and core's rows per key;
 `lion_debug_key_skew(regclass)` returns each key column's `rows`, `ndistinct` and `sumsq` from the
