@@ -437,8 +437,15 @@ CREATE INDEX crt_a ON crt USING lion (a);
 VACUUM (FREEZE, ANALYZE) crt;
 DELETE FROM crt WHERE id % 37 = 0;
 UPDATE crt SET big = ARRAY['k1', 'k5'] WHERE id % 41 = 0;
-SELECT count(*) FILTER (WHERE pg_column_toast_chunk_id(big) IS NOT NULL) > 2000
-		   AS big_out_of_line,
+CREATE FUNCTION crt_toasted() RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE n bigint;
+BEGIN
+	EXECUTE format('SELECT count(DISTINCT chunk_id) FROM %s',
+				   (SELECT reltoastrelid::regclass FROM pg_class
+					 WHERE oid = 'crt'::regclass)) INTO n;
+	RETURN n;
+END $$;
+SELECT crt_toasted() > 2000 AS big_out_of_line,
 	   count(*) FILTER (WHERE pg_column_compression(cmp) IS NOT NULL) > 2000
 		   AS cmp_compressed
   FROM crt;
@@ -447,6 +454,7 @@ SELECT count(*) FILTER (WHERE pg_column_toast_chunk_id(big) IS NOT NULL) > 2000
  t               | t
 (1 row)
 
+DROP FUNCTION crt_toasted();
 SELECT cr_plan('SELECT count(*) FROM crt WHERE a = 2 AND (big[1] = ''k1'' OR cardinality(big) > 80)');
                                 cr_plan                                
 -----------------------------------------------------------------------
