@@ -271,7 +271,7 @@ lion_hooktest_cells(void)
 										  false, true)),
 					 list_make1_int(1),
 					 NIL);
-	dim = lappend(dim, NIL);
+	dim = lappend(lappend(dim, NIL), NIL);
 	return list_make3(list_make4_int(1, 1, -1, 0), list_make1(dim),
 					  list_make1(list_make5_int(0, LION_CELLPRED_TABLE, 0,
 												LION_TRUTH_FALSE,

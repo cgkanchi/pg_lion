@@ -14,6 +14,9 @@
  */
 #include "postgres.h"
 
+#include "common/int.h"
+#include "utils/numeric.h"
+
 #include "lion_customscan.h"
 
 /*
@@ -64,7 +67,27 @@ typedef struct CellDim
 	int			nbit;			/* its multi-key leaves */
 	Node	   *bitleaf[LION_CELLS_MAX_BITS];
 	LionLeafInfo bitinfo[LION_CELLS_MAX_BITS];
+	bool		sum;			/* SUM: one sum's terms of the column ... */
+	int			sumpred;		/* ... the sum's predicate ... */
+	List	   *terms;			/* ... and the terms, CellTerm */
 } CellDim;
+
+/*
+ * A term of a weighted sum (DESIGN.md §10, "Weighted sums"), as it is found:
+ * `CASE WHEN leaf THEN w1 ELSE w0 END`, or `leaf::int4` (cast), its leaf a
+ * multi-key one; the weights in the sum's unit.
+ */
+typedef struct CellTerm
+{
+	Node	   *leaf;
+	LionLeafInfo info;
+	bool		none;			/* its query selects no row */
+	bool		cast;			/* NULL where the column is */
+	int64		w0;
+	int64		w1;
+	int			s0;				/* numeric: their display scales */
+	int			s1;
+} CellTerm;
 
 /* A predicate, as it is being found. */
 typedef struct CellPred
@@ -75,6 +98,11 @@ typedef struct CellPred
 								 * tree on a multi-key column, until the
 								 * column is known to be one */
 	int			bit;
+	/* SUM: the sum's type, unit and constants (LionCellsPredPriv) */
+	Oid			sumtype;
+	int			sumunit;
+	int64		sumbase;
+	int			sumbasescale;
 } CellPred;
 
 typedef struct CellsCx
@@ -86,6 +114,7 @@ typedef struct CellsCx
 	CellDim		dims[LION_CELLS_MAX_DIMS];
 	int			ndim;
 	bool		ranges;			/* ranges are leaves (lion_cells_analyze()) */
+	bool		sums;			/* weighted sums are dimensions */
 	bool		failed;
 } CellsCx;
 
@@ -377,17 +406,10 @@ cells_multi_leaf(CellsCx *cx, Node *node, Var **var, LionLeafInfo *leaf,
 	return false;
 }
 
-/* The dimension of column var, made when it is first met */
+/* A new dimension, of column var */
 static int
-cells_dim_of(CellsCx *cx, Var *var)
+cells_new_dim(CellsCx *cx, Var *var)
 {
-	int			d;
-
-	for (d = 0; d < cx->ndim; d++)
-	{
-		if (cx->dims[d].var->varattno == var->varattno)
-			return d;
-	}
 	if (cx->ndim >= LION_CELLS_MAX_DIMS)
 	{
 		cx->failed = true;
@@ -396,6 +418,20 @@ cells_dim_of(CellsCx *cx, Var *var)
 	memset(&cx->dims[cx->ndim], 0, sizeof(CellDim));
 	cx->dims[cx->ndim].var = var;
 	return cx->ndim++;
+}
+
+/* The dimension of column var, made when it is first met: not a sum's */
+static int
+cells_dim_of(CellsCx *cx, Var *var)
+{
+	int			d;
+
+	for (d = 0; d < cx->ndim; d++)
+	{
+		if (!cx->dims[d].sum && cx->dims[d].var->varattno == var->varattno)
+			return d;
+	}
+	return cells_new_dim(cx, var);
 }
 
 /*
@@ -679,6 +715,336 @@ cells_add_pred(CellsCx *cx, Node *node, Var *var, bool multi,
 }
 
 /*
+ * WEIGHTED SUMS (DESIGN.md §10, "Weighted sums"): a sum of terms each
+ * `CASE WHEN leaf THEN w1 ELSE w0 END` or `leaf::int4`, its leaf a multi-key
+ * one, and of constants - the shape of a score over tags, a jsonb's keys or a
+ * document's words, and of "matches at least k of" - is one predicate whose
+ * value the cell gives: a dimension per column its terms test, each column's
+ * part of the sum an outcome of it.  Its weights are integers, or numerics
+ * held as integers of the sum's unit, so that the sum is exact: int2, int4,
+ * int8 or numeric, as `+` adds them.
+ */
+
+/* `+` of one of the sum's types, and the type */
+static bool
+cells_sum_op(Oid opno, Oid *type)
+{
+	switch (get_opcode(opno))
+	{
+		case F_INT2PL:
+			*type = INT2OID;
+			return true;
+		case F_INT4PL:
+			*type = INT4OID;
+			return true;
+		case F_INT8PL:
+			*type = INT8OID;
+			return true;
+		case F_NUMERIC_ADD:
+			*type = NUMERICOID;
+			return true;
+	}
+	return false;
+}
+
+/*
+ * A constant of a sum of the given type, as an integer of 10^-*scale, its
+ * display scale: false where it is NULL, NaN or infinite, or of more digits
+ * than LION_CELLS_MAX_SUMSCALE + 3 hold.
+ */
+static bool
+cells_sum_const(Node *node, Oid type, int64 *val, int *scale)
+{
+	Const	   *c = (Const *) node;
+
+	if (node == NULL || !IsA(node, Const) || c->constisnull ||
+		c->consttype != type)
+		return false;
+	*scale = 0;
+	switch (type)
+	{
+		case INT2OID:
+			*val = DatumGetInt16(c->constvalue);
+			return true;
+		case INT4OID:
+			*val = DatumGetInt32(c->constvalue);
+			return true;
+		case INT8OID:
+			*val = DatumGetInt64(c->constvalue);
+			return true;
+		case NUMERICOID:
+			{
+				char	   *str = DatumGetCString(DirectFunctionCall1(numeric_out,
+																	  c->constvalue));
+				char	   *s = str;
+				bool		neg = false;
+				bool		frac = false;
+				int			digits = 0;
+				int64		v = 0;
+
+				if (*s == '-')
+				{
+					neg = true;
+					s++;
+				}
+				if (*s == '\0')
+					return false;
+				for (; *s != '\0'; s++)
+				{
+					if (*s == '.' && !frac)
+					{
+						frac = true;
+						continue;
+					}
+					if (*s < '0' || *s > '9')
+						return false;	/* NaN, Infinity */
+					if (v != 0 || *s != '0')
+						digits++;
+					if (digits > LION_CELLS_MAX_SUMSCALE + 3)
+						return false;
+					v = v * 10 + (*s - '0');
+					if (frac)
+						(*scale)++;
+				}
+				if (*scale > LION_CELLS_MAX_SUMSCALE)
+					return false;
+				*val = neg ? -v : v;
+				pfree(str);
+				return true;
+			}
+	}
+	return false;
+}
+
+/* v times 10^n, false past the int64 range */
+static bool
+cells_sum_rescale(int64 *v, int n)
+{
+	while (n-- > 0)
+	{
+		if (pg_mul_s64_overflow(*v, 10, v))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Is node a term of a sum of the given type?  Its leaf a multi-key one of a
+ * column of the relation (cells_multi_leaf()), its weights into *t, raw, of
+ * their own scales, and the column into *var.
+ */
+static bool
+cells_sum_term(CellsCx *cx, Node *node, Oid type, CellTerm *t, Var **var)
+{
+	Node	   *leaf;
+
+	memset(t, 0, sizeof(CellTerm));
+	if (IsA(node, CaseExpr))
+	{
+		CaseExpr   *ce = (CaseExpr *) node;
+		CaseWhen   *w;
+
+		if (ce->arg != NULL || list_length(ce->args) != 1 ||
+			ce->casetype != type)
+			return false;
+		w = (CaseWhen *) linitial(ce->args);
+		if (!cells_sum_const((Node *) w->result, type, &t->w1, &t->s1) ||
+			!cells_sum_const((Node *) ce->defresult, type, &t->w0, &t->s0))
+			return false;
+		leaf = (Node *) w->expr;
+	}
+	else if (IsA(node, FuncExpr) &&
+			 ((FuncExpr *) node)->funcid == F_INT4_BOOL &&
+			 type == INT4OID && list_length(((FuncExpr *) node)->args) == 1)
+	{
+		leaf = (Node *) linitial(((FuncExpr *) node)->args);
+		t->w1 = 1;
+		t->w0 = 0;
+		t->cast = true;
+	}
+	else
+		return false;
+	if (!cells_multi_leaf(cx, leaf, var, &t->info, &t->none))
+		return false;
+	t->leaf = leaf;
+	return true;
+}
+
+/* The operands of a tree of `+` operator opno, in their order */
+static void
+cells_sum_operands(Node *node, Oid opno, List **out)
+{
+	if (IsA(node, OpExpr) && ((OpExpr *) node)->opno == opno &&
+		list_length(((OpExpr *) node)->args) == 2)
+	{
+		cells_sum_operands((Node *) linitial(((OpExpr *) node)->args), opno,
+						   out);
+		cells_sum_operands((Node *) lsecond(((OpExpr *) node)->args), opno,
+						   out);
+		return;
+	}
+	*out = lappend(*out, node);
+}
+
+/*
+ * Is node a weighted sum - a tree of one `+` whose operands are terms and
+ * constants, at least one a term?  Then it is a predicate, noted once, and
+ * each column its terms test a SUM dimension of its own.  Its weights are in
+ * one unit, the largest display scale among its constants, and the largest
+ * magnitude its prefixes may reach - every term's larger weight's, and the
+ * constants' - within its type's range, so that core adds it without an
+ * overflow the cells would not raise.  False, the expression walked as any
+ * other, where it is no such sum.
+ */
+static bool
+cells_sum_chain(CellsCx *cx, Node *node)
+{
+	OpExpr	   *op = (OpExpr *) node;
+	Oid			type;
+	List	   *ops = NIL;
+	CellTerm   *terms;
+	Var		  **vars;
+	int64	   *cvals;
+	int		   *cscales;
+	int			nterm = 0;
+	int			nconst = 0;
+	int			unit = 0;
+	int64		bound = 0;
+	int64		limit;
+	int64		base = 0;
+	int			basescale = -1;
+	CellPred   *p;
+	ListCell   *lc;
+	int			d0;
+	int			i;
+	int			j;
+
+	if (!cx->sums || !IsA(node, OpExpr) || list_length(op->args) != 2 ||
+		!cells_sum_op(op->opno, &type) || op->opresulttype != type)
+		return false;
+	cells_sum_operands(node, op->opno, &ops);
+	terms = (CellTerm *) palloc(sizeof(CellTerm) * list_length(ops));
+	vars = (Var **) palloc(sizeof(Var *) * list_length(ops));
+	cvals = (int64 *) palloc(sizeof(int64) * list_length(ops));
+	cscales = (int *) palloc(sizeof(int) * list_length(ops));
+	foreach(lc, ops)
+	{
+		Node	   *o = (Node *) lfirst(lc);
+
+		if (IsA(o, Const))
+		{
+			if (!cells_sum_const(o, type, &cvals[nconst], &cscales[nconst]))
+				return false;
+			unit = Max(unit, cscales[nconst]);
+			nconst++;
+		}
+		else if (cells_sum_term(cx, o, type, &terms[nterm], &vars[nterm]))
+		{
+			unit = Max(unit, Max(terms[nterm].s0, terms[nterm].s1));
+			nterm++;
+		}
+		else
+			return false;
+	}
+	if (nterm == 0 || nterm > LION_CELLS_MAX_SUMTERMS)
+		return false;
+
+	/* noted once */
+	foreach(lc, cx->preds)
+	{
+		if (equal(((CellPred *) lfirst(lc))->expr, node))
+			return true;
+	}
+
+	/* the weights in the sum's unit, and the magnitudes they reach */
+	switch (type)
+	{
+		case INT2OID:
+			limit = PG_INT16_MAX;
+			break;
+		case INT4OID:
+			limit = PG_INT32_MAX;
+			break;
+		default:
+			limit = PG_INT64_MAX / 4;
+			break;
+	}
+	for (i = 0; i < nconst; i++)
+	{
+		if (!cells_sum_rescale(&cvals[i], unit - cscales[i]) ||
+			pg_add_s64_overflow(bound, (cvals[i] < 0) ? -cvals[i] : cvals[i],
+								&bound) ||
+			bound > limit)
+			return false;
+		base += cvals[i];
+		basescale = Max(basescale, cscales[i]);
+	}
+	for (i = 0; i < nterm; i++)
+	{
+		CellTerm   *t = &terms[i];
+
+		if (!cells_sum_rescale(&t->w0, unit - t->s0) ||
+			!cells_sum_rescale(&t->w1, unit - t->s1) ||
+			t->w0 < -limit || t->w0 > limit || t->w1 < -limit ||
+			t->w1 > limit ||
+			pg_add_s64_overflow(bound, Max((t->w0 < 0) ? -t->w0 : t->w0,
+										   (t->w1 < 0) ? -t->w1 : t->w1),
+								&bound) ||
+			bound > limit)
+			return false;
+		if (type != NUMERICOID)
+			t->s0 = t->s1 = 0;
+	}
+
+	/* the predicate, and a dimension for each column, in their order */
+	if (list_length(cx->preds) >= LION_CELLS_MAX_PREDS)
+	{
+		cx->failed = true;
+		return true;
+	}
+	d0 = cx->ndim;
+	for (i = 0; i < nterm; i++)
+	{
+		CellTerm   *t = (CellTerm *) palloc(sizeof(CellTerm));
+		int			d;
+
+		*t = terms[i];
+		for (d = d0; d < cx->ndim; d++)
+		{
+			if (cx->dims[d].var->varattno == vars[i]->varattno)
+				break;
+		}
+		if (d == cx->ndim)
+		{
+			d = cells_new_dim(cx, vars[i]);
+			if (d < 0)
+				return true;
+			cx->dims[d].sum = true;
+			cx->dims[d].sumpred = list_length(cx->preds);
+		}
+		if (list_length(cx->dims[d].terms) >= LION_CELLS_MAX_SUMTERMS)
+		{
+			cx->failed = true;
+			return true;
+		}
+		cx->dims[d].terms = lappend(cx->dims[d].terms, t);
+	}
+	for (j = d0; j < cx->ndim; j++)
+		cx->dims[j].preds = list_make1_int(list_length(cx->preds));
+
+	p = (CellPred *) palloc0(sizeof(CellPred));
+	p->expr = node;
+	p->dim = d0;
+	p->kind = LION_CELLPRED_SUM;
+	p->sumtype = type;
+	p->sumunit = unit;
+	p->sumbase = base;
+	p->sumbasescale = basescale;
+	cx->preds = lappend(cx->preds, p);
+	return true;
+}
+
+/*
  * The walk of an expression: each predicate it is made of noted, and true -
  * the end of the walk - at anything that would make its value more than a
  * function of the predicates' truths: a column outside every predicate, a
@@ -698,6 +1064,8 @@ cells_walker(Node *node, CellsCx *cx)
 	if (cx->failed)
 		return true;
 
+	if (cells_sum_chain(cx, node))
+		return cx->failed;
 	if ((attno = cells_scalar_tree(cx, node)) != 0)
 	{
 		Var		   *v;
@@ -767,6 +1135,7 @@ lion_cells_shape_ok(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	cx.root = root;
 	cx.rel = rel;
 	cx.rti = rti;
+	cx.sums = true;
 	return !cells_walker(expr, &cx) && !cx.failed && cx.preds != NIL;
 }
 
@@ -1430,10 +1799,244 @@ cells_ranged_outcomes(CellsCx *cx, CellDim *dim, LionCellsDimPlan *dp,
 }
 
 /*
+ * The states a SUM dimension's part of a sum may be in, as its terms are
+ * added one by one: each a value, the display scale its constants give it and
+ * its share of the non-NULL rows, sorted by value and scale.
+ */
+typedef struct CellsSumStates
+{
+	int			n;
+	int64	   *val;
+	int16	   *scale;
+	double	   *share;
+} CellsSumStates;
+
+/*
+ * The states after one more term, of weights w0 and w1 (w1 never where the
+ * term is a none leaf, q 0), true of a share q of the rows: each state with
+ * w0 added, and each with w1, merged in order - adding to every value, and
+ * taking the larger of each scale and one, keep each list's order - and the
+ * equal ones made one.  False past LION_CELLS_MAX_SUMOUTS states.
+ */
+static bool
+cells_sum_step(CellsSumStates *st, CellsSumStates *out, const CellTerm *t,
+			   double q)
+{
+	int			na = st->n;
+	int			nb = t->none ? 0 : st->n;
+	int			a = 0;
+	int			b = 0;
+
+	out->n = 0;
+	while (a < na || b < nb)
+	{
+		int64		v;
+		int16		sc;
+		double		sh;
+
+		if (b >= nb ||
+			(a < na &&
+			 (st->val[a] + t->w0 < st->val[b] + t->w1 ||
+			  (st->val[a] + t->w0 == st->val[b] + t->w1 &&
+			   Max(st->scale[a], t->s0) <= Max(st->scale[b], t->s1)))))
+		{
+			v = st->val[a] + t->w0;
+			sc = Max(st->scale[a], t->s0);
+			sh = st->share[a] * (1.0 - q);
+			a++;
+		}
+		else
+		{
+			v = st->val[b] + t->w1;
+			sc = Max(st->scale[b], t->s1);
+			sh = st->share[b] * q;
+			b++;
+		}
+		if (out->n > 0 && out->val[out->n - 1] == v &&
+			out->scale[out->n - 1] == sc)
+		{
+			out->share[out->n - 1] += sh;
+			continue;
+		}
+		if (out->n >= LION_CELLS_MAX_SUMOUTS)
+			return false;
+		out->val[out->n] = v;
+		out->scale[out->n] = sc;
+		out->share[out->n] = sh;
+		out->n++;
+	}
+	return true;
+}
+
+/*
+ * A SUM dimension (DESIGN.md §10, "Weighted sums"): the index its leaves are
+ * read from - one multi-key column, exact for every leaf - and its outcomes,
+ * the values its terms' part of the sum may take: outcome 0 every term
+ * false, which a row of no key or of none of the terms' keys is in, the rest
+ * in order, and NULL's last.  A numeric sum's outcomes are told apart by the
+ * display scale the constants picked give them as well, which core's `+`
+ * gives the sum (the largest of its operands'): one scale of every w0, so
+ * that the walk tells the scale of a row from its true terms alone
+ * (lion_cells_sum_outcome()).  Each term's leaf is taken as independent of
+ * the others for the outcomes' shares.  False where the dimension will not
+ * do: no one index, too many keys or outcomes.
+ */
+static bool
+cells_sum_dim(CellsCx *cx, CellDim *dim, LionCellsDimPlan *dp)
+{
+	LionCellsDimPriv *pv = &dp->priv;
+	CellPred   *p = (CellPred *) list_nth(cx->preds, dim->sumpred);
+	AttrNumber	attno = dim->var->varattno;
+	int			nterm = list_length(dim->terms);
+	IndexOptInfo *idx = NULL;
+	AttrNumber	col = 0;
+	CellsSumStates s1;
+	CellsSumStates s2;
+	CellsSumStates *cur = &s1;
+	CellsSumStates *next = &s2;
+	double		nonnull;
+	double		treekeys = 0;
+	int			zero = -1;
+	ListCell   *lc;
+	int			i;
+	int			o;
+
+	/* the index, every leaf's */
+	foreach(lc, dim->terms)
+	{
+		CellTerm   *t = (CellTerm *) lfirst(lc);
+		LionLeafInfo *li = &t->info;
+		AttrNumber	tcol;
+		IndexOptInfo *tidx;
+
+		if (t->none)
+			continue;
+		tidx = lion_match_index(cx->rel, attno, LION_CLAUSE_MULTI, li->opno,
+								li->cmptype, li->strategy, li->extractquery,
+								li->collation, false, &tcol);
+		if (tidx == NULL || (idx != NULL && (tidx != idx || tcol != col)))
+			return false;
+		idx = tidx;
+		col = tcol;
+	}
+	if (idx == NULL)
+		idx = lion_find_roaring_index(cx->rel, attno, true, &col);
+	if (idx == NULL || idx->indpred != NIL)
+		return false;
+	dp->idx = idx;
+	dp->col = col;
+	dp->var = dim->var;
+	dp->entries = 1.0;
+	dp->nullsel = cells_sel(cx, cells_null_test(dim->var));
+	nonnull = Max(1.0 - dp->nullsel, 0.0);
+
+	pv->kind = LION_CELLDIM_SUM;
+	pv->attno = attno;
+	pv->idxoid = idx->indexoid;
+	pv->sumpred = dim->sumpred;
+	pv->nterm = nterm;
+	pv->termop = (Oid *) palloc(sizeof(Oid) * nterm);
+	pv->termcoll = (Oid *) palloc(sizeof(Oid) * nterm);
+	pv->termquery = (Const **) palloc(sizeof(Const *) * nterm);
+	pv->terminc = (int64 *) palloc(sizeof(int64) * nterm);
+	pv->terms1 = (int16 *) palloc(sizeof(int16) * nterm);
+	pv->sumzero = 0;
+	pv->zscale = (int16) ((CellTerm *) linitial(dim->terms))->s0;
+
+	s1.val = (int64 *) palloc(sizeof(int64) * LION_CELLS_MAX_SUMOUTS);
+	s1.scale = (int16 *) palloc(sizeof(int16) * LION_CELLS_MAX_SUMOUTS);
+	s1.share = (double *) palloc(sizeof(double) * LION_CELLS_MAX_SUMOUTS);
+	s2.val = (int64 *) palloc(sizeof(int64) * LION_CELLS_MAX_SUMOUTS);
+	s2.scale = (int16 *) palloc(sizeof(int16) * LION_CELLS_MAX_SUMOUTS);
+	s2.share = (double *) palloc(sizeof(double) * LION_CELLS_MAX_SUMOUTS);
+	s1.n = 1;
+	s1.val[0] = 0;
+	s1.scale[0] = (p->sumtype == NUMERICOID) ? -1 : 0;
+	s1.share[0] = 1.0;
+
+	dp->sumsel = dp->nullsel;
+	dp->sumkeys = 1.0;
+	i = 0;
+	foreach(lc, dim->terms)
+	{
+		CellTerm   *t = (CellTerm *) lfirst(lc);
+		OpExpr	   *leaf = (OpExpr *) t->leaf;
+		double		q = 0;
+		CellsSumStates *tmp;
+
+		/* one scale of every w0 */
+		if (t->s0 != pv->zscale)
+			return false;
+		pv->termop[i] = leaf->opno;
+		pv->termcoll[i] = leaf->inputcollid;
+		pv->termquery[i] = (Const *)
+			copyObject(t->none ? lion_strip((Node *) lsecond(leaf->args)) :
+					   (Node *) t->info.val);
+		pv->terminc[i] = t->w1 - t->w0;
+		pv->terms1[i] = (int16) t->s1;
+		pv->sumzero += t->w0;
+		pv->sumnull |= t->cast;
+		if (!t->none)
+		{
+			double		sel = cells_sel(cx, t->leaf);
+			double		keys = Max(lion_multikey_nkeys(idx, col, t->leaf), 1.0);
+
+			q = (nonnull > 0) ? Min(sel / nonnull, 1.0) : 0;
+			dp->sumsel += sel;
+			dp->sumkeys += keys;
+			if (keys != 1.0)
+				treekeys += keys;
+		}
+		if (!cells_sum_step(cur, next, t, q))
+			return false;
+		tmp = cur;
+		cur = next;
+		next = tmp;
+		i++;
+	}
+	/* the walk's masks are of the keys of the terms of more than one key */
+	if (treekeys > LION_CELLS_MAX_KEYS ||
+		dp->sumkeys > LION_CELLS_MAX_SUMKEYS + 1)
+		return false;
+
+	/* outcome 0 every term false's, the others in order, NULL's last */
+	for (o = 0; o < cur->n; o++)
+	{
+		if (cur->val[o] == pv->sumzero && cur->scale[o] == pv->zscale)
+			zero = o;
+	}
+	if (zero < 0)
+		elog(ERROR, "lion: a weighted sum without its every-term-false value");
+	pv->radix = cur->n + 1;
+	pv->nullout = cur->n;
+	pv->sumval = (int64 *) palloc(sizeof(int64) * pv->radix);
+	pv->sumscale = (int16 *) palloc(sizeof(int16) * pv->radix);
+	dp->sumshare = (double *) palloc(sizeof(double) * pv->radix);
+	pv->sumval[0] = cur->val[zero];
+	pv->sumscale[0] = cur->scale[zero];
+	dp->sumshare[0] = cur->share[zero];
+	i = 1;
+	for (o = 0; o < cur->n; o++)
+	{
+		if (o == zero)
+			continue;
+		pv->sumval[i] = cur->val[o];
+		pv->sumscale[i] = cur->scale[o];
+		dp->sumshare[i] = cur->share[o];
+		i++;
+	}
+	pv->sumval[pv->nullout] = pv->sumzero;
+	pv->sumscale[pv->nullout] = pv->zscale;
+	dp->sumshare[pv->nullout] = 0;
+	return true;
+}
+
+/*
  * Every predicate of exprs (DESIGN.md §10, "Counts by cells"), each
  * dimension's outcomes and each predicate's truth in them, and the cells
  * they make; or NULL when exprs are not functions of predicates the posting
- * sets decide, or make more cells than pg_lion.count_cells_max.  With
+ * sets decide, or make more cells than pg_lion.count_cells_max (with a
+ * weighted sum, more cells with rows).  With
  * `ranges`, a range of a scalar column is a leaf too, and its column a
  * RANGED dimension, whose outcomes are runs of the column's order (§46,
  * "Ranges"); the count takes none.  The driver is
@@ -1447,6 +2050,7 @@ lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs,
 	LionCellsPlan *cp;
 	Bitmapset  *notnull = lion_notnullattnums(root, rel);
 	ListCell   *lc;
+	bool		has_sum = false;
 	int			d;
 	int			i;
 
@@ -1455,6 +2059,7 @@ lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs,
 	cx.rel = rel;
 	cx.rti = rti;
 	cx.ranges = ranges;
+	cx.sums = !ranges;			/* LionProbeJoin's are no sums */
 	foreach(lc, exprs)
 	{
 		Node	   *e = (Node *) lfirst(lc);
@@ -1484,6 +2089,14 @@ lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs,
 		LionCellsDimPriv *pv = &dp->priv;
 		Node	   *nullclause;
 
+		if (dim->sum)
+		{
+			if (!cells_sum_dim(&cx, dim, dp))
+				return NULL;
+			has_sum = true;
+			cp->ncells *= (double) pv->radix;
+			continue;
+		}
 		if (!cells_dim_index(&cx, dim, dp))
 			return NULL;
 		dp->var = dim->var;
@@ -1609,11 +2222,42 @@ lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs,
 		cp->ncells *= (double) pv->radix;
 	}
 
+	/* each weighted sum: its type, unit and constants */
+	i = 0;
+	foreach(lc, cx.preds)
+	{
+		CellPred   *p = (CellPred *) lfirst(lc);
+		LionCellsPredPriv *pp = &cp->preds[i++];
+
+		if (p->kind != LION_CELLPRED_SUM)
+			continue;
+		pp->dim = p->dim;
+		pp->kind = LION_CELLPRED_SUM;
+		pp->sumtype = p->sumtype;
+		pp->sumunit = p->sumunit;
+		pp->sumbase = p->sumbase;
+		pp->sumbasescale = p->sumbasescale;
+	}
+
 	for (i = 0; i < cp->npred; i++)
 		Assert(cp->preds[i].kind != LION_CELLPRED_TABLE ||
 			   cp->preds[i].truth != NULL);
 
-	if (cp->ncells > (double) lion_count_cells_max)
+	/*
+	 * The bound.  A weighted sum's outcomes are every value its part may
+	 * take, most of them in few rows if any, so with one the bound is on
+	 * the cells the table's rows can fill, as lion_cells_nonempty() counts
+	 * them - the walk's time follows those - and the product only within
+	 * the codes a tally and a GROUP BY column's batch take.
+	 */
+	if (has_sum)
+	{
+		if (cp->ncells > LION_CELLS_MAX_SUMCODES ||
+			lion_cells_nonempty(cp, Max(rel->tuples, 1.0)) >
+			(double) lion_count_cells_max)
+			return NULL;
+	}
+	else if (cp->ncells > (double) lion_count_cells_max)
 		return NULL;
 	return cp;
 }
@@ -1703,6 +2347,14 @@ lion_cells_nonempty(const LionCellsPlan *cp, double rows)
 			}
 			share[pv->nullout] = dp->nullsel;
 		}
+		else if (pv->kind == LION_CELLDIM_SUM)
+		{
+			double		nonnull = Max(1.0 - dp->nullsel, 0.0);
+
+			for (o = 0; o < pv->nullout; o++)
+				share[o] = dp->sumshare[o] * nonnull;
+			share[pv->nullout] = dp->nullsel;
+		}
 		else
 		{
 			double		rest = 1.0;
@@ -1766,6 +2418,8 @@ cells_label_rows(const LionCellsDimPlan *dp, double tuples)
 	double		sel = 0;
 	int			i;
 
+	if (pv->kind == LION_CELLDIM_SUM)
+		return Min(dp->sumsel, (double) pv->nterm + 1) * tuples;
 	if (pv->kind == LION_CELLDIM_MULTI)
 	{
 		for (i = 0; i < pv->nbit; i++)

@@ -15,6 +15,8 @@
  */
 #include "postgres.h"
 
+#include "utils/numeric.h"
+
 #include "lion_customscan.h"
 
 /* The most keys of a multi-key dimension whose outcomes are tabled */
@@ -66,6 +68,27 @@ lion_begin_cells(LionCountScanState *st, const LionCountPriv *priv,
 		cr->gradix[d] = pv->radix;
 		cr->dims[d].nullout = pv->nullout;
 		cr->dims[d].nbit = pv->nbit;
+		if (pv->kind == LION_CELLDIM_SUM)
+		{
+			LionCellDim *dim = &cr->dims[d];
+			int			t;
+
+			dim->sum = true;
+			dim->numeric = (priv->cellpred[pv->sumpred].sumtype == NUMERICOID);
+			dim->nterm = pv->nterm;
+			dim->zscale = pv->zscale;
+			dim->sumzero = pv->sumzero;
+			dim->nsum = pv->radix - 1;
+			dim->sumval = pv->sumval;
+			dim->sumscale = pv->sumscale;
+			if (cr->termfn == NULL)
+				cr->termfn = (FmgrInfo **) palloc0(sizeof(FmgrInfo *) *
+												   cr->ndim);
+			cr->termfn[d] = (FmgrInfo *) palloc(sizeof(FmgrInfo) * pv->nterm);
+			for (t = 0; t < pv->nterm; t++)
+				fmgr_info_cxt(get_opcode(pv->termop[t]), &cr->termfn[d][t],
+							  estate->es_query_cxt);
+		}
 		if ((uint64) pv->radix > (UINT64CONST(1) << 62) / weight)
 			elog(ERROR, "LionCount: the cells of a count by cells do not fit a code");
 		weight *= (uint64) pv->radix;
@@ -74,6 +97,15 @@ lion_begin_cells(LionCountScanState *st, const LionCountPriv *priv,
 	cr->basecells = weight;
 	cr->outs = (int *) palloc0(sizeof(int) * (cr->ndim + 1));
 	cr->truth = (uint8 *) palloc0(sizeof(uint8) * cr->npred);
+	cr->sumvalue = (Datum *) palloc0(sizeof(Datum) * cr->npred);
+	cr->sumisnull = (bool *) palloc0(sizeof(bool) * cr->npred);
+	cr->heapattno = (AttrNumber *) palloc0(sizeof(AttrNumber) * cr->ndim);
+	cr->valcxt = AllocSetContextCreate(estate->es_query_cxt,
+									   "LionCount cell values",
+									   ALLOCSET_SMALL_SIZES);
+	cr->rowcxt = AllocSetContextCreate(estate->es_query_cxt,
+									   "LionCount weighted sum of a row",
+									   ALLOCSET_SMALL_SIZES);
 	cr->labelcxt = AllocSetContextCreate(estate->es_query_cxt,
 										 "LionCount cell labels",
 										 ALLOCSET_DEFAULT_SIZES);
@@ -105,14 +137,14 @@ lion_cells_open(LionCountScanState *st)
 	{
 		const LionCellsDimPriv *pv = &cr->dimpriv[d];
 
+		cr->heapattno[d] = lion_heap_attno_in(st->heap, st->plan.heapoid,
+											  pv->attno);
 		if (d == cr->drv)
 			continue;
 		cr->idx[d] = index_open(pv->idxoid, AccessShareLock);
 		cr->idxcol[d] =
-			lion_index_col_for(cr->idx[d],
-							   lion_heap_attno_in(st->heap, st->plan.heapoid,
-												  pv->attno),
-							   pv->kind == LION_CELLDIM_MULTI,
+			lion_index_col_for(cr->idx[d], cr->heapattno[d],
+							   pv->kind != LION_CELLDIM_SCALAR,
 							   st->plan.vcols);
 	}
 }
@@ -163,6 +195,14 @@ lion_cells_reset(LionCountScanState *st)
 		cr->dims[d].nkeys = 0;
 		cr->dims[d].trees = NULL;
 		cr->dims[d].map = NULL;
+		cr->dims[d].keyinc = NULL;
+		cr->dims[d].keycnt = NULL;
+		cr->dims[d].keys1 = NULL;
+		cr->dims[d].keymask = NULL;
+		cr->dims[d].ntree = 0;
+		cr->dims[d].treeterm = NULL;
+		cr->dims[d].treeinc = NULL;
+		cr->dims[d].trees1 = NULL;
 	}
 }
 
@@ -218,6 +258,159 @@ lion_cells_add_label(LionCellsRun *cr, int *cap, int d, uint64 bits,
 	cr->nlabel++;
 }
 
+/* Every key of tree n renumbered by map, of nmap keys */
+static void
+lion_cells_tree_renumber(LionKeyNode *tree, const int *map, int nmap)
+{
+	LionKeyNode **stack = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * 1024);
+	int			nstack = 0;
+
+	stack[nstack++] = tree;
+	while (nstack > 0)
+	{
+		LionKeyNode *n = stack[--nstack];
+		int			a;
+
+		if (n->kind == LION_KN_KEY)
+		{
+			if (n->keyno < 0 || n->keyno >= nmap)
+				elog(ERROR, "LionCount: a key tree names key %d of %d",
+					 n->keyno, nmap);
+			n->keyno = map[n->keyno];
+			continue;
+		}
+		for (a = 0; a < n->nargs; a++)
+		{
+			if (nstack >= 1024)
+				elog(ERROR, "LionCount: a key tree too deep for a count by cells");
+			stack[nstack++] = n->args[a];
+		}
+	}
+	pfree(stack);
+}
+
+/*
+ * A SUM dimension's labels (DESIGN.md §10, "Weighted sums"): the keys each
+ * term's query extracts - the same query, by the same function, as the plan
+ * was made for, so exact - each once, a label whose bits are its number, and
+ * the NULL entry.  A term whose tree is one key adds its increment at that
+ * key (keyinc, keycnt, keys1); any other's tree is over bits of a mask, one
+ * a key of such trees, at most LION_CELLS_MAX_KEYS of them.  A term whose
+ * query selects no row has no key and is never true.
+ */
+static void
+lion_cells_locate_sum(LionCellsRun *cr, int *cap, int d)
+{
+	const LionCellsDimPriv *pv = &cr->dimpriv[d];
+	LionCellDim *dim = &cr->dims[d];
+	Relation	idx = cr->idx[d];
+	AttrNumber	col = cr->idxcol[d];
+	LionState  *istate = lion_index_column_state(idx, col);
+	Datum	   *keys = (Datum *) palloc(sizeof(Datum) * LION_CELLS_MAX_SUMKEYS);
+	int			nkeys = 0;
+	int			nmask = 0;
+	LionPostingSet ps;
+	int			t;
+	int			k;
+
+	dim->keyinc = (int64 *) palloc0(sizeof(int64) * LION_CELLS_MAX_SUMKEYS);
+	dim->keycnt = (int32 *) palloc0(sizeof(int32) * LION_CELLS_MAX_SUMKEYS);
+	dim->keys1 = (int16 *) palloc0(sizeof(int16) * LION_CELLS_MAX_SUMKEYS);
+	dim->keymask = (uint64 *) palloc0(sizeof(uint64) * LION_CELLS_MAX_SUMKEYS);
+	dim->treeterm = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * pv->nterm);
+	dim->treeinc = (int64 *) palloc(sizeof(int64) * pv->nterm);
+	dim->trees1 = (int16 *) palloc(sizeof(int16) * pv->nterm);
+	dim->ntree = 0;
+	for (t = 0; t < pv->nterm; t++)
+	{
+		StrategyNumber strategy =
+			get_op_opfamily_strategy(pv->termop[t], idx->rd_opfamily[col - 1]);
+		LionQuery	q;
+		int		   *map;
+		LionKeyNode *tree;
+
+		lion_extract_query(istate, pv->termquery[t]->constvalue, strategy, &q);
+		if (q.mode == LION_QMODE_NONE)
+			continue;			/* a query that selects no row: never true */
+		if (q.mode != LION_QMODE_KEYS || q.nkeys <= 0)
+			elog(ERROR, "roaring count: query for index \"%s\" is no longer exact",
+				 RelationGetRelationName(idx));
+
+		/* each key once in the dimension, numbered among its keys */
+		map = (int *) palloc(sizeof(int) * q.nkeys);
+		for (k = 0; k < q.nkeys; k++)
+		{
+			int			j;
+
+			for (j = 0; j < nkeys; j++)
+			{
+				if (datumIsEqual(keys[j], q.keys[k], istate->typbyval,
+								 istate->typlen))
+					break;
+			}
+			if (j == nkeys)
+			{
+				if (nkeys >= LION_CELLS_MAX_SUMKEYS)
+					elog(ERROR, "LionCount: more than %d keys in one weighted sum's column",
+						 LION_CELLS_MAX_SUMKEYS);
+				keys[nkeys++] = q.keys[k];
+			}
+			map[k] = j;
+		}
+		tree = lion_cells_tree_copy(q.tree, 0);
+		lion_cells_tree_renumber(tree, map, q.nkeys);
+
+		if (tree->kind == LION_KN_KEY)
+		{
+			/* one key: its increment where the key's set has the row */
+			k = tree->keyno;
+			dim->keyinc[k] += pv->terminc[t];
+			dim->keycnt[k]++;
+			dim->keys1[k] = Max(dim->keys1[k], pv->terms1[t]);
+			continue;
+		}
+
+		/* ... any other: a tree over the bits of its keys */
+		{
+			int		   *bit = (int *) palloc(sizeof(int) * nkeys);
+
+			for (k = 0; k < nkeys; k++)
+			{
+				bit[k] = -1;
+				if (dim->keymask[k] != 0)
+					bit[k] = pg_rightmost_one_pos64(dim->keymask[k]);
+			}
+			for (k = 0; k < q.nkeys; k++)
+			{
+				int			j = map[k];
+
+				if (bit[j] < 0)
+				{
+					if (nmask >= LION_CELLS_MAX_KEYS)
+						elog(ERROR, "LionCount: more than %d keys in the terms of one weighted sum's column that are not one key",
+							 LION_CELLS_MAX_KEYS);
+					bit[j] = nmask++;
+					dim->keymask[j] = UINT64CONST(1) << bit[j];
+				}
+			}
+			lion_cells_tree_renumber(tree, bit, nkeys);
+			dim->treeterm[dim->ntree] = tree;
+			dim->treeinc[dim->ntree] = pv->terminc[t];
+			dim->trees1[dim->ntree] = pv->terms1[t];
+			dim->ntree++;
+		}
+	}
+	dim->nkeys = nkeys;
+	for (k = 0; k < nkeys; k++)
+	{
+		(void) lion_posting_set_lookup_col(idx, col, keys[k], InvalidOid, &ps);
+		lion_cells_add_label(cr, cap, d, (uint64) k, &ps);
+		CHECK_FOR_INTERRUPTS();
+	}
+	(void) lion_posting_set_lookup_null_col(idx, col, &ps);
+	lion_cells_add_label(cr, cap, d, LION_CELL_NULLBIT, &ps);
+}
+
 /*
  * Every dimension's labels but the driver's, a dimension's together: a
  * scalar one's the entries of its values whose outcome is not 0 and its NULL
@@ -251,6 +444,11 @@ lion_cells_locate(LionCountScanState *st)
 		if (d == cr->drv)
 			continue;
 		Assert(idx != NULL);
+		if (pv->kind == LION_CELLDIM_SUM)
+		{
+			lion_cells_locate_sum(cr, &cap, d);
+			continue;
+		}
 		if (pv->kind == LION_CELLDIM_SCALAR)
 		{
 			ListCell   *lc;
@@ -318,36 +516,9 @@ lion_cells_locate(LionCountScanState *st)
 					}
 					map[k] = j;
 				}
-				tree = lion_cells_tree_copy(q.tree, 0);
-
 				/* the tree's keys renumbered as the dimension's */
-				{
-					LionKeyNode **stack = (LionKeyNode **)
-						palloc(sizeof(LionKeyNode *) * 1024);
-					int			nstack = 0;
-
-					stack[nstack++] = tree;
-					while (nstack > 0)
-					{
-						LionKeyNode *n = stack[--nstack];
-						int			a;
-
-						if (n->kind == LION_KN_KEY)
-						{
-							if (n->keyno < 0 || n->keyno >= q.nkeys)
-								elog(ERROR, "LionCount: a key tree names key %d of %d",
-									 n->keyno, q.nkeys);
-							n->keyno = map[n->keyno];
-							continue;
-						}
-						for (a = 0; a < n->nargs; a++)
-						{
-							if (nstack >= 1024)
-								elog(ERROR, "LionCount: a key tree too deep for a count by cells");
-							stack[nstack++] = n->args[a];
-						}
-					}
-				}
+				tree = lion_cells_tree_copy(q.tree, 0);
+				lion_cells_tree_renumber(tree, map, q.nkeys);
 				dim->trees[b] = tree;
 			}
 			dim->nkeys = nkeys;
@@ -630,6 +801,89 @@ lion_cells_truth(const LionCellsRun *cr, int p)
 	return lion_cells_truth_in(cr, p, cr->outs[cr->pred[p].dim]);
 }
 
+/*
+ * A weighted sum's value (DESIGN.md §10, "Weighted sums"), its constants'
+ * part plus each of its SUM dimensions' outcome's, `outs` - NULL where a
+ * dimension's outcome is NULL's and its NULL is the sum's - as a Datum of
+ * its type in the current memory context: a numeric of the display scale
+ * core's `+` would give it, the largest of the constants' it adds.
+ */
+static Datum
+lion_cells_sum_value(const LionCellsDimPriv *dimpriv, int ndim,
+					 const LionCellsPredPriv *pp, int p, const int *outs,
+					 bool *isnull)
+{
+	int64		v = pp->sumbase;
+	int			scale = pp->sumbasescale;
+	int			d;
+
+	*isnull = false;
+	for (d = pp->dim; d < ndim; d++)
+	{
+		const LionCellsDimPriv *pv = &dimpriv[d];
+		int			o = outs[d];
+
+		if (pv->kind != LION_CELLDIM_SUM || pv->sumpred != p)
+			continue;
+		if (o < 0 || o >= pv->radix)
+			elog(ERROR, "LionCount: outcome %d of a weighted sum's column of %d",
+				 o, pv->radix);
+		if (o == pv->nullout && pv->sumnull)
+		{
+			*isnull = true;
+			return (Datum) 0;
+		}
+		v += pv->sumval[o];
+		scale = Max(scale, pv->sumscale[o]);
+	}
+	switch (pp->sumtype)
+	{
+		case INT2OID:
+			return Int16GetDatum((int16) v);
+		case INT4OID:
+			return Int32GetDatum((int32) v);
+		case INT8OID:
+			return Int64GetDatum(v);
+		case NUMERICOID:
+			{
+				int			i;
+
+				/* every digit past the scale is a zero of the unit's */
+				scale = Max(scale, 0);
+				for (i = scale; i < pp->sumunit; i++)
+					v /= 10;
+				return NumericGetDatum(int64_div_fast_to_numeric(v, scale));
+			}
+	}
+	elog(ERROR, "LionCount: a weighted sum of type %u", pp->sumtype);
+	return (Datum) 0;			/* keep the compiler quiet */
+}
+
+/*
+ * The cell that goes up, whose outcomes are cr->outs: each predicate's truth
+ * in it, and each weighted sum's value, made in valcxt, which the next cell
+ * resets.
+ */
+static void
+lion_cells_fill_cell(LionCellsRun *cr)
+{
+	MemoryContext oldcxt;
+	int			p;
+
+	MemoryContextReset(cr->valcxt);
+	oldcxt = MemoryContextSwitchTo(cr->valcxt);
+	for (p = 0; p < cr->npred; p++)
+	{
+		if (cr->pred[p].kind == LION_CELLPRED_SUM)
+			cr->sumvalue[p] = lion_cells_sum_value(cr->dimpriv, cr->ndim,
+												   &cr->pred[p], p, cr->outs,
+												   &cr->sumisnull[p]);
+		else
+			cr->truth[p] = lion_cells_truth(cr, p);
+	}
+	MemoryContextSwitchTo(oldcxt);
+}
+
 /* The order of a dimension's outcomes by their truths: npd bytes each */
 typedef struct LionCellsTupSort
 {
@@ -692,7 +946,7 @@ lion_cells_bytruth(LionCellsRun *cr)
 		t->preds = (int *) palloc(sizeof(int) * Max(cr->npred, 1));
 		for (p = 0; p < cr->npred; p++)
 		{
-			if (cr->pred[p].dim == d)
+			if (cr->pred[p].dim == d && cr->pred[p].kind != LION_CELLPRED_SUM)
 				t->preds[t->npd++] = p;
 		}
 		width = (Size) Max(t->npd, 1);
@@ -762,6 +1016,58 @@ lion_cells_bytruth_find(const LionCellsByTruth *t, const uint8 *tup)
 }
 
 /*
+ * The outcome of SUM dimension d of the row in heapslot (DESIGN.md §10,
+ * "Weighted sums"): its column's value, and each term's leaf - the
+ * operator, on the column and the query - evaluated on it, as core would;
+ * NULL's for a NULL.  In rowcxt, reset once it is known.
+ */
+static int
+lion_cells_sum_of_row(LionCellsRun *cr, int d, TupleTableSlot *heapslot)
+{
+	const LionCellsDimPriv *pv = &cr->dimpriv[d];
+	const LionCellDim *dim = &cr->dims[d];
+	MemoryContext oldcxt;
+	Datum		val;
+	bool		isnull;
+	int64		sum = 0;
+	int32		cnt = 0;
+	int			s1 = 0;
+	int			scale = 0;
+	int			o;
+	int			t;
+
+	if (heapslot == NULL || cr->heapattno[d] <= 0)
+		elog(ERROR, "LionCount: a weighted sum's column without its row");
+	val = slot_getattr(heapslot, cr->heapattno[d], &isnull);
+	if (isnull)
+		return dim->nullout;
+	oldcxt = MemoryContextSwitchTo(cr->rowcxt);
+	for (t = 0; t < pv->nterm; t++)
+	{
+		if (DatumGetBool(FunctionCall2Coll(&cr->termfn[d][t],
+										   pv->termcoll[t], val,
+										   pv->termquery[t]->constvalue)))
+		{
+			sum += pv->terminc[t];
+			cnt++;
+			s1 = Max(s1, pv->terms1[t]);
+		}
+	}
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(cr->rowcxt);
+	if (dim->numeric)
+	{
+		scale = s1;
+		if (cnt < pv->nterm)
+			scale = Max(scale, pv->zscale);
+	}
+	o = lion_cells_sum_find(dim, pv->sumzero + sum, scale);
+	if (o < 0)
+		elog(ERROR, "LionCount: a row of no outcome of weighted sum column %d", d);
+	return o;
+}
+
+/*
  * The code of the cell a row is in whose predicates have the truths
  * truth[] (LION_TRUTH_*) - of a row the anti join over a small inner side
  * takes away (DESIGN.md §27, "Counts by cells beside the anti join"), its
@@ -777,7 +1083,8 @@ lion_cells_bytruth_find(const LionCellsByTruth *t, const uint8 *tup)
  * cpu_operator_cost a predicate (lion_anti_price()).
  */
 uint64
-lion_cells_code_of(LionCellsRun *cr, const uint8 *truth)
+lion_cells_code_of(LionCellsRun *cr, const uint8 *truth,
+				   TupleTableSlot *heapslot)
 {
 	uint8		tup[LION_CELLS_MAX_PREDS];
 	uint64		code = 0;
@@ -792,6 +1099,12 @@ lion_cells_code_of(LionCellsRun *cr, const uint8 *truth)
 		int			o;
 		int			i;
 
+		if (cr->dims[d].sum)
+		{
+			code += (uint64) lion_cells_sum_of_row(cr, d, heapslot) *
+				cr->dims[d].weight;
+			continue;
+		}
 		for (i = 0; i < t->npd; i++)
 			tup[i] = truth[t->preds[i]];
 		o = lion_cells_bytruth_find(t, tup);
@@ -964,7 +1277,6 @@ lion_next_cells_grouped(LionCountScanState *st, bool *exhausted)
 			Datum		key;
 			bool		isnull;
 			int			v;
-			int			p;
 
 			if (lion_decode_tally_next(dr->tally, &code, &count))
 			{
@@ -974,8 +1286,7 @@ lion_next_cells_grouped(LionCountScanState *st, bool *exhausted)
 				if (v < 0 || v >= dr->nvals[0])
 					elog(ERROR, "LionCount: a cell of entry %d of a pass of %d",
 						 v, dr->nvals[0]);
-				for (p = 0; p < cr->npred; p++)
-					cr->truth[p] = lion_cells_truth(cr, p);
+				lion_cells_fill_cell(cr);
 				key = dr->keys[0][v];
 				isnull = dr->isnull[0][v];
 				dr->rowsup++;
@@ -1036,7 +1347,6 @@ lion_next_cells(LionCountScanState *st, bool *exhausted)
 		uint64		code;
 		int64		count;
 		TupleTableSlot *slot;
-		int			p;
 
 		CHECK_FOR_INTERRUPTS();
 		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
@@ -1081,8 +1391,7 @@ lion_next_cells(LionCountScanState *st, bool *exhausted)
 			continue;
 		}
 		lion_decode_code_split(code, cr->ndim, cr->radix, cr->outs);
-		for (p = 0; p < cr->npred; p++)
-			cr->truth[p] = lion_cells_truth(cr, p);
+		lion_cells_fill_cell(cr);
 		dr->rowsup++;
 		slot = lion_emit_keys(st, 0, NULL, NULL, count);
 		if (slot == NULL)
@@ -1124,7 +1433,7 @@ lion_explain_cells(LionCountScanState *st, List *ancestors, ExplainState *es)
 		cols = lappend(cols,
 					   psprintf("%s%s (%s)", get_rel_name(idxoid),
 								lion_explain_col(idxoid, dp->attno,
-												 dp->kind == LION_CELLDIM_MULTI,
+												 dp->kind != LION_CELLDIM_SCALAR,
 												 NIL),
 								get_attname(st->plan.heapoid, dp->attno,
 											false)));

@@ -1256,6 +1256,32 @@ typedef struct LionCellDim
 	struct LionKeyNode **trees; /* each leaf's tree, over the keys' bits */
 	uint16	   *map;			/* the outcome of every mask of the keys, or
 								 * NULL to work each out */
+
+	/*
+	 * SUM (DESIGN.md §10, "Weighted sums"): its labels' bits are a key's
+	 * number, or LION_CELL_NULLBIT.  A term whose leaf is one key adds its
+	 * increment where the key's set has the row: keyinc[k] the sum of those
+	 * terms', keycnt[k] how many they are and keys1[k] the largest display
+	 * scale of their w1s.  The other terms' leaves are trees over the bits
+	 * of their keys, keymask[k] the key's.  A row's outcome is its value's,
+	 * found among sumval/sumscale (lion_cells_sum_outcome()).
+	 */
+	bool		sum;
+	bool		numeric;
+	int			nterm;
+	int16		zscale;
+	int64		sumzero;
+	int64	   *keyinc;
+	int32	   *keycnt;
+	int16	   *keys1;
+	uint64	   *keymask;
+	int			ntree;
+	struct LionKeyNode **treeterm;
+	int64	   *treeinc;
+	int16	   *trees1;
+	int			nsum;			/* outcomes but NULL's */
+	const int64 *sumval;
+	const int16 *sumscale;
 } LionCellDim;
 
 /*
@@ -1272,6 +1298,10 @@ typedef struct LionCellsExclude
 } LionCellsExclude;
 
 extern int	lion_cells_outcome(const LionCellDim *dim, uint64 mask);
+extern int	lion_cells_sum_find(const LionCellDim *dim, int64 value,
+								int scale);
+extern int	lion_cells_sum_outcome(const LionCellDim *dim, uint64 mask,
+								   int64 sum, int32 cnt, int s1);
 extern void lion_count_cells(Relation heap, Snapshot snapshot,
 							 const LionDecodeCol *driver, const uint64 *drvadd,
 							 int ndim, const LionCellDim *dims,

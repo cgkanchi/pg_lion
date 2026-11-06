@@ -1433,9 +1433,12 @@ typedef struct LionVColScope
  *		an IntList {kind, attnum, outcomes, the NULL's outcome, leaves}, an
  *		OidList {index, equality, collation}, a List of the Consts with an
  *		outcome other than 0 and an IntList of those outcomes, an OidList of
- *		each multi-key leaf's operator and a List of its query Const; and
- *		an IntList per predicate {dimension, kind, leaf, then its truth in
- *		each outcome}.  In the PATH's list only, a List of the predicates'
+ *		each multi-key leaf's operator and a List of its query Const, and a
+ *		SUM dimension's own part (NIL for any other kind,
+ *		lion_priv_encode_cellsum()); and an IntList per predicate
+ *		{dimension, kind, leaf, then its truth in each outcome - or, of a
+ *		weighted sum, its type, unit, constants' sum (two ints) and their
+ *		display scale}.  In the PATH's list only, a List of the predicates'
  *		expressions and a List of the WHERE clauses over them, which
  *		lion_plan_custom_path() makes LION_TL_CELLPRED columns and the qual
  *	24	List, or empty: the anti join over a small inner side (DESIGN.md
@@ -1626,6 +1629,11 @@ typedef struct LionVColScope
  * NOT EXISTS (DESIGN.md §27, "Several anti joins"), which an older build
  * would have read as one.
  *
+ * Shape 34 moved no member but gave each dimension of the CELLS member (23)
+ * a seventh member, a SUM dimension's own part, and a predicate the
+ * LION_CELLPRED_SUM kind: weighted sums (DESIGN.md §10, "Weighted sums"),
+ * which an older build would have read as malformed.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1638,7 +1646,7 @@ typedef struct LionVColScope
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424921
+#define LION_PRIV_MAGIC		0x52424922
 #define LION_PRIV_NMEMBERS	27
 
 /*
@@ -2771,12 +2779,17 @@ typedef struct LionCountPrivSAgg
  */
 #define LION_CELLDIM_SCALAR		0
 #define LION_CELLDIM_MULTI		1
+#define LION_CELLDIM_SUM		2	/* a weighted sum's terms of one
+									 * multi-key column (DESIGN.md §10,
+									 * "Weighted sums") */
 
 #define LION_CELLPRED_TABLE		0	/* scalar: truth[outcome] */
 #define LION_CELLPRED_BIT		1	/* multi-key: leaf `bit` */
 #define LION_CELLPRED_NONE		2	/* multi-key: a query no key narrows */
 #define LION_CELLPRED_NULLS		3	/* multi-key: truth[0] of a value,
 									 * truth[1] of NULL */
+#define LION_CELLPRED_SUM		4	/* a weighted sum: its value, from its
+									 * SUM dimensions' outcomes */
 
 #define LION_TRUTH_FALSE		0
 #define LION_TRUTH_TRUE			1
@@ -2788,6 +2801,16 @@ typedef struct LionCountPrivSAgg
 #define LION_CELLS_MAX_BITS		10	/* a multi-key column's leaves */
 #define LION_CELLS_MAX_VALUES	1024	/* a scalar column's constants */
 #define LION_CELLS_MAX_KEYS		63	/* a multi-key column's keys, all leaves */
+#define LION_CELLS_MAX_SUMTERMS	1024	/* a SUM dimension's terms */
+#define LION_CELLS_MAX_SUMKEYS	1024	/* ... and keys */
+#define LION_CELLS_MAX_SUMOUTS	4096	/* ... and outcomes */
+#define LION_CELLS_MAX_SUMSCALE 15	/* a numeric sum's decimal places */
+/*
+ * The most cells a count by cells with a weighted sum may code: 2^52, room
+ * for a GROUP BY column's batch of LION_GROUP_BATCH_MAX under the tally's
+ * 2^62.
+ */
+#define LION_CELLS_MAX_SUMCODES	4503599627370496.0
 
 typedef struct LionCellsDimPriv
 {
@@ -2806,14 +2829,42 @@ typedef struct LionCellsDimPriv
 	int			nbit;
 	Oid			bitop[LION_CELLS_MAX_BITS];
 	Const	   *bitquery[LION_CELLS_MAX_BITS];
+
+	/*
+	 * SUM (DESIGN.md §10, "Weighted sums"): the terms of one sum that test
+	 * this column, each `CASE WHEN leaf THEN w1 ELSE w0 END` or `leaf::int4`
+	 * (w1 1, w0 0), a leaf a multi-key one.  The outcomes are the values the
+	 * terms' part of the sum may take - each a scaled integer, 10^sumscale
+	 * the predicate's unit, and of a numeric sum the display scale the
+	 * constants picked give it - outcome 0 every term false's, the others in
+	 * ascending order, and NULL's last (nullout = radix - 1): every term
+	 * false again, or NULL when a term is a cast (sumnull).
+	 */
+	int			sumpred;		/* the sum's predicate */
+	bool		sumnull;
+	int			nterm;
+	Oid		   *termop;			/* each term's leaf: its operator ... */
+	Oid		   *termcoll;		/* ... collation ... */
+	Const	  **termquery;		/* ... and query */
+	int64	   *terminc;		/* w1 - w0 */
+	int16	   *terms1;			/* numeric: w1's display scale */
+	int16		zscale;			/* ... and every w0's */
+	int64		sumzero;		/* every term false: the w0s' sum */
+	int64	   *sumval;			/* each outcome's value ... */
+	int16	   *sumscale;		/* ... and display scale (numeric) */
 } LionCellsDimPriv;
 
 typedef struct LionCellsPredPriv
 {
-	int			dim;
+	int			dim;			/* SUM: its first SUM dimension */
 	int			kind;			/* LION_CELLPRED_* */
 	int			bit;			/* BIT */
 	uint8	   *truth;			/* TABLE: radix truths, NULLS: two */
+	/* SUM: the type of the sum, its unit, and its constants' part */
+	Oid			sumtype;		/* int2, int4, int8 or numeric */
+	int			sumunit;		/* values are of 10^-sumunit */
+	int64		sumbase;		/* the constants added, scaled */
+	int			sumbasescale;	/* ... their display scale, or -1 */
 } LionCellsPredPriv;
 
 /*
@@ -2892,6 +2943,18 @@ typedef struct LionCellsRun
 	/* the cell that goes up */
 	int		   *outs;
 	uint8	   *truth;
+
+	/*
+	 * ... and each weighted sum's value in it (LION_CELLPRED_SUM), made in
+	 * valcxt, which each cell resets; a SUM dimension's column in the heap
+	 * and each term's operator, which the anti join evaluates on a row
+	 */
+	Datum	   *sumvalue;
+	bool	   *sumisnull;
+	MemoryContext valcxt;
+	MemoryContext rowcxt;
+	AttrNumber *heapattno;
+	FmgrInfo  **termfn;
 } LionCellsRun;
 
 /*
@@ -3863,6 +3926,10 @@ typedef struct LionAntiState
 	int		   *predpos;		/* ... its LION_TL_CELLPRED place */
 	uint8	   *predtruth;		/* ... and its truth (LION_TRUTH_*) in the
 								 * row found last */
+	bool	   *predsum;		/* ... a weighted sum, its value's ... */
+	int16	   *predlen;		/* ... length ... */
+	bool	   *predbyval;		/* ... and passing */
+	MemoryContext sumcxt;		/* the values kept, by reference */
 	bool		predsread;		/* a join clause or restriction reads a
 								 * predicate's truth */
 	LionAntiCell *held;			/* the cells this participant's rows are of,
@@ -4243,6 +4310,10 @@ typedef struct LionCellsDimPlan
 	double		bitsel[LION_CELLS_MAX_BITS];	/* MULTI: each leaf's */
 	double		bitkeys[LION_CELLS_MAX_BITS];	/* ... and its keys */
 	Node	   *bitclause[LION_CELLS_MAX_BITS];
+	double	   *sumshare;		/* SUM: each outcome's share of the non-NULL
+								 * rows */
+	double		sumsel;			/* ... the rows its labels hold */
+	double		sumkeys;		/* ... and its labels */
 
 	/*
 	 * A SCALAR dimension read by ranges (DESIGN.md §46, "Ranges"): its
@@ -4777,7 +4848,8 @@ extern void lion_cells_close(LionCountScanState *st);
 extern void lion_cells_reset(LionCountScanState *st);
 extern TupleTableSlot *lion_next_cells(LionCountScanState *st,
 									   bool *exhausted);
-extern uint64 lion_cells_code_of(LionCellsRun *cr, const uint8 *truth);
+extern uint64 lion_cells_code_of(LionCellsRun *cr, const uint8 *truth,
+								 TupleTableSlot *heapslot);
 extern const char *lion_explain_col(Oid idxoid, AttrNumber heapattno,
 									bool multikey, List *vcols);
 extern void lion_explain_cells(LionCountScanState *st, List *ancestors,

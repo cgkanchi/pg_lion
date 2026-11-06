@@ -970,6 +970,74 @@ lion_cells_outcome(const LionCellDim *dim, uint64 mask)
 }
 
 /*
+ * The outcome of SUM dimension dim (DESIGN.md §10, "Weighted sums") whose
+ * part of the sum is value, of display scale `scale`: outcome 0 every term
+ * false's, the others found by a binary search; -1 where none is.
+ */
+int
+lion_cells_sum_find(const LionCellDim *dim, int64 value, int scale)
+{
+	int			lo = 1;
+	int			hi = dim->nsum;
+
+	if (value == dim->sumval[0] && scale == dim->sumscale[0])
+		return 0;
+	while (lo < hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (value == dim->sumval[mid] && scale == dim->sumscale[mid])
+			return mid;
+		if (value < dim->sumval[mid] ||
+			(value == dim->sumval[mid] && scale < dim->sumscale[mid]))
+			hi = mid;
+		else
+			lo = mid + 1;
+	}
+	return -1;
+}
+
+/*
+ * The outcome of a row of SUM dimension dim: NULL's for a row of its NULL
+ * entry; otherwise its part of the sum - every w0, plus the increments of
+ * the terms of one key whose sets have the row (sum, cnt of them, s1 the
+ * largest display scale of their w1s) and of the terms whose key trees the
+ * keys of mask satisfy - and, of a numeric sum, its display scale: the
+ * largest of the true terms' w1s' and, while a term is false, the w0s'.
+ */
+int
+lion_cells_sum_outcome(const LionCellDim *dim, uint64 mask, int64 sum,
+					   int32 cnt, int s1)
+{
+	int			scale = 0;
+	int			o;
+	int			t;
+
+	Assert(dim->sum);
+	if ((mask & LION_CELL_NULLBIT) != 0)
+		return dim->nullout;
+	for (t = 0; t < dim->ntree; t++)
+	{
+		if (lion_cells_tree(dim->treeterm[t], mask))
+		{
+			sum += dim->treeinc[t];
+			cnt++;
+			s1 = Max(s1, dim->trees1[t]);
+		}
+	}
+	if (dim->numeric)
+	{
+		scale = s1;
+		if (cnt < dim->nterm)
+			scale = Max(scale, dim->zscale);
+	}
+	o = lion_cells_sum_find(dim, dim->sumzero + sum, scale);
+	if (o < 0)
+		elog(ERROR, "lion index count: a weighted sum of a value no outcome has");
+	return o;
+}
+
+/*
  * COUNTS BY CELLS (DESIGN.md §10, "Counts by cells"): the driver's sets in
  * one pass of its decoded walk, every row of them the WHERE keeps labelled
  * by the dimensions and counted under its cell's code.
@@ -1039,6 +1107,9 @@ lion_count_cells(Relation heap, Snapshot snapshot,
 	uint32	   *val0;
 	uint64	   *code;
 	uint64	   *acc;
+	int64	   *sacc = NULL;
+	int32	   *scnt = NULL;
+	int16	   *ss1 = NULL;
 	uint32	   *gen;
 	uint16	   *touched;
 	uint32		curgen = 0;
@@ -1122,6 +1193,15 @@ lion_count_cells(Relation heap, Snapshot snapshot,
 	acc = (uint64 *) palloc(sizeof(uint64) * LION_CONTAINER_RANGE);
 	gen = (uint32 *) palloc0(sizeof(uint32) * LION_CONTAINER_RANGE);
 	touched = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
+	for (i = 0; i < ndim; i++)
+	{
+		if (dims[i].sum && sacc == NULL)
+		{
+			sacc = (int64 *) palloc(sizeof(int64) * LION_CONTAINER_RANGE);
+			scnt = (int32 *) palloc(sizeof(int32) * LION_CONTAINER_RANGE);
+			ss1 = (int16 *) palloc(sizeof(int16) * LION_CONTAINER_RANGE);
+		}
+	}
 	if (mat != NULL && lion_mat_spills(mat))
 		buf = (LionContainer *) palloc(MAXALIGN(LION_CONTAINER_MAX_SIZE));
 
@@ -1280,7 +1360,68 @@ lion_count_cells(Relation heap, Snapshot snapshot,
 
 			while (end < nhot && labels[curlab[hot[end]]].dim == d)
 				end++;
-			if (!dim->multi)
+			if (dim->sum)
+			{
+				int			nt = 0;
+				int			t;
+
+				if (++curgen == 0)
+				{
+					memset(gen, 0, sizeof(uint32) * LION_CONTAINER_RANGE);
+					curgen = 1;
+				}
+				for (; i < end; i++)
+				{
+					int			k = hot[i];
+					uint64		bits = labels[curlab[k]].bits;
+					uint64		m = LION_CELL_NULLBIT;
+					int64		inc = 0;
+					int32		cnt = 0;
+					int16		s1 = 0;
+					uint32		n = lion_container_to_array(cur[k].cur, members);
+					uint32		j;
+
+					if (bits != LION_CELL_NULLBIT)
+					{
+						if (bits >= (uint64) dim->nkeys)
+							elog(ERROR, "lion index count: a label of key %d of %d",
+								 (int) bits, dim->nkeys);
+						m = dim->keymask[bits];
+						inc = dim->keyinc[bits];
+						cnt = dim->keycnt[bits];
+						s1 = dim->keys1[bits];
+					}
+					for (j = 0; j < n; j++)
+					{
+						uint16		lo = members[j];
+
+						if (gen[lo] != curgen)
+						{
+							gen[lo] = curgen;
+							acc[lo] = 0;
+							sacc[lo] = 0;
+							scnt[lo] = 0;
+							ss1[lo] = 0;
+							touched[nt++] = lo;
+						}
+						acc[lo] |= m;
+						sacc[lo] += inc;
+						scnt[lo] += cnt;
+						ss1[lo] = Max(ss1[lo], s1);
+					}
+				}
+				for (t = 0; t < nt; t++)
+				{
+					uint16		lo = touched[t];
+
+					if ((rows[lo >> 6] & (UINT64CONST(1) << (lo & 63))) != 0)
+						code[lo] += (uint64)
+							lion_cells_sum_outcome(dim, acc[lo], sacc[lo],
+												   scnt[lo], ss1[lo]) *
+							dim->weight;
+				}
+			}
+			else if (!dim->multi)
 			{
 				for (; i < end; i++)
 				{

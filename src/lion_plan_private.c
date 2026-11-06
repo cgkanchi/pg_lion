@@ -672,6 +672,152 @@ lion_priv_decode_partial(List *priv, LionCountPriv *out)
 	}
 }
 
+
+/* An int64 as two ints of an IntList, the high half first */
+static List *
+lion_priv_append_int64(List *l, int64 v)
+{
+	l = lappend_int(l, (int) (int32) ((uint64) v >> 32));
+	return lappend_int(l, (int) (int32) ((uint64) v & 0xFFFFFFFF));
+}
+
+/* ... and back, from places n and n + 1 */
+static int64
+lion_priv_int64_at(List *l, int n)
+{
+	uint64		hi = (uint32) list_nth_int(l, n);
+	uint64		lo = (uint32) list_nth_int(l, n + 1);
+
+	return (int64) ((hi << 32) | lo);
+}
+
+/*
+ * A SUM dimension's own part (DESIGN.md §10, "Weighted sums"), its seventh
+ * member, NIL for any other dimension: an IntList {its predicate, NULL's
+ * value NULL, terms, every w0's display scale, the w0s' sum (two ints)}, an
+ * OidList of each term's operator then each one's collation, a List of each
+ * one's query Const, an IntList of each one's increment (two ints) and w1's
+ * display scale, and an IntList of each outcome's value (two ints) and
+ * display scale.
+ */
+static List *
+lion_priv_encode_cellsum(const LionCellsDimPriv *dp)
+{
+	List	   *hdr;
+	List	   *ops = NIL;
+	List	   *qs = NIL;
+	List	   *terms = NIL;
+	List	   *outs = NIL;
+	int			t;
+	int			o;
+
+	if (dp->kind != LION_CELLDIM_SUM)
+		return NIL;
+	hdr = list_make4_int(dp->sumpred, dp->sumnull ? 1 : 0, dp->nterm,
+						 (int) dp->zscale);
+	hdr = lion_priv_append_int64(hdr, dp->sumzero);
+	for (t = 0; t < dp->nterm; t++)
+		ops = lappend_oid(ops, dp->termop[t]);
+	for (t = 0; t < dp->nterm; t++)
+		ops = lappend_oid(ops, dp->termcoll[t]);
+	for (t = 0; t < dp->nterm; t++)
+	{
+		qs = lappend(qs, dp->termquery[t]);
+		terms = lion_priv_append_int64(terms, dp->terminc[t]);
+		terms = lappend_int(terms, (int) dp->terms1[t]);
+	}
+	for (o = 0; o < dp->radix; o++)
+	{
+		outs = lion_priv_append_int64(outs, dp->sumval[o]);
+		outs = lappend_int(outs, (int) dp->sumscale[o]);
+	}
+	return list_make5(hdr, ops, qs, terms, outs);
+}
+
+/*
+ * ... decoded, every number in its range: the outcomes but NULL's distinct
+ * and in order past outcome 0, and NULL's every term false
+ */
+static void
+lion_priv_decode_cellsum(List *m, LionCellsDimPriv *dp, int npred)
+{
+	List	   *hdr;
+	List	   *ops;
+	List	   *qs;
+	List	   *terms;
+	List	   *outs;
+	int			t;
+	int			o;
+
+	if (m == NIL || !IsA(m, List) || list_length(m) != 5)
+		elog(ERROR, "LionCount: malformed cells dimension");
+	hdr = (List *) linitial(m);
+	ops = (List *) lsecond(m);
+	qs = (List *) lthird(m);
+	terms = (List *) lfourth(m);
+	outs = (List *) list_nth(m, 4);
+	if (hdr == NIL || !IsA(hdr, IntList) || list_length(hdr) != 6 ||
+		!lion_priv_is(ops, T_OidList) || !lion_priv_is(qs, T_List) ||
+		!lion_priv_is(terms, T_IntList) || outs == NIL ||
+		!IsA(outs, IntList))
+		elog(ERROR, "LionCount: malformed cells dimension");
+	dp->sumpred = list_nth_int(hdr, 0);
+	dp->sumnull = (list_nth_int(hdr, 1) != 0);
+	dp->nterm = list_nth_int(hdr, 2);
+	dp->zscale = (int16) list_nth_int(hdr, 3);
+	dp->sumzero = lion_priv_int64_at(hdr, 4);
+	if (dp->sumpred < 0 || dp->sumpred >= npred ||
+		(list_nth_int(hdr, 1) != 0 && list_nth_int(hdr, 1) != 1) ||
+		dp->nterm < 1 || dp->nterm > LION_CELLS_MAX_SUMTERMS ||
+		list_nth_int(hdr, 3) < 0 ||
+		list_nth_int(hdr, 3) > LION_CELLS_MAX_SUMSCALE ||
+		list_length(ops) != 2 * dp->nterm ||
+		list_length(qs) != dp->nterm ||
+		list_length(terms) != 3 * dp->nterm ||
+		list_length(outs) != 3 * dp->radix)
+		elog(ERROR, "LionCount: malformed cells dimension");
+	dp->termop = (Oid *) palloc(sizeof(Oid) * dp->nterm);
+	dp->termcoll = (Oid *) palloc(sizeof(Oid) * dp->nterm);
+	dp->termquery = (Const **) palloc(sizeof(Const *) * dp->nterm);
+	dp->terminc = (int64 *) palloc(sizeof(int64) * dp->nterm);
+	dp->terms1 = (int16 *) palloc(sizeof(int16) * dp->nterm);
+	for (t = 0; t < dp->nterm; t++)
+	{
+		Node	   *q = (Node *) list_nth(qs, t);
+		int			s1 = list_nth_int(terms, 3 * t + 2);
+
+		dp->termop[t] = list_nth_oid(ops, t);
+		dp->termcoll[t] = list_nth_oid(ops, dp->nterm + t);
+		dp->terminc[t] = lion_priv_int64_at(terms, 3 * t);
+		if (q == NULL || !IsA(q, Const) || ((Const *) q)->constisnull ||
+			!OidIsValid(dp->termop[t]) || s1 < 0 ||
+			s1 > LION_CELLS_MAX_SUMSCALE)
+			elog(ERROR, "LionCount: malformed cells dimension");
+		dp->termquery[t] = (Const *) q;
+		dp->terms1[t] = (int16) s1;
+	}
+	dp->sumval = (int64 *) palloc(sizeof(int64) * dp->radix);
+	dp->sumscale = (int16 *) palloc(sizeof(int16) * dp->radix);
+	for (o = 0; o < dp->radix; o++)
+	{
+		int			sc = list_nth_int(outs, 3 * o + 2);
+
+		dp->sumval[o] = lion_priv_int64_at(outs, 3 * o);
+		if (sc < 0 || sc > LION_CELLS_MAX_SUMSCALE)
+			elog(ERROR, "LionCount: malformed cells dimension");
+		dp->sumscale[o] = (int16) sc;
+		if (o >= 2 && o < dp->nullout &&
+			(dp->sumval[o] < dp->sumval[o - 1] ||
+			 (dp->sumval[o] == dp->sumval[o - 1] &&
+			  dp->sumscale[o] <= dp->sumscale[o - 1])))
+			elog(ERROR, "LionCount: malformed cells dimension");
+	}
+	if (dp->sumval[0] != dp->sumzero || dp->sumscale[0] != dp->zscale ||
+		dp->sumval[dp->nullout] != dp->sumzero ||
+		dp->sumscale[dp->nullout] != dp->zscale)
+		elog(ERROR, "LionCount: malformed cells dimension");
+}
+
 /*
  * The cells of a count by cells (DESIGN.md §10, "Counts by cells"): the
  * header, each dimension and each predicate, every number in its range, and
@@ -723,7 +869,7 @@ lion_priv_decode_cells(List *priv, LionPrivStage stage, LionCountPriv *out)
 		List	   *bitops;
 		List	   *bitqs;
 
-		if (dm == NIL || !IsA(dm, List) || list_length(dm) != 6)
+		if (dm == NIL || !IsA(dm, List) || list_length(dm) != 7)
 			elog(ERROR, "LionCount: malformed cells dimension");
 		ints = (List *) list_nth(dm, 0);
 		oids = (List *) list_nth(dm, 1);
@@ -761,7 +907,19 @@ lion_priv_decode_cells(List *priv, LionPrivStage stage, LionCountPriv *out)
 		if (dp->attno <= 0 || !OidIsValid(dp->idxoid) || dp->radix < 1 ||
 			dp->nullout < 0 || dp->nullout >= dp->radix)
 			elog(ERROR, "LionCount: malformed cells dimension");
-		if (dp->kind == LION_CELLDIM_SCALAR)
+		if (dp->kind != LION_CELLDIM_SUM ? list_nth(dm, 6) != NIL :
+			list_nth(dm, 6) == NIL)
+			elog(ERROR, "LionCount: malformed cells dimension");
+		if (dp->kind == LION_CELLDIM_SUM)
+		{
+			if (dp->nbit != 0 || bitops != NIL || dp->nval != 0 ||
+				dp->radix < 2 || dp->radix > LION_CELLS_MAX_SUMOUTS + 1 ||
+				dp->nullout != dp->radix - 1)
+				elog(ERROR, "LionCount: malformed cells dimension");
+			lion_priv_decode_cellsum((List *) list_nth(dm, 6), dp,
+									 out->ncellpred);
+		}
+		else if (dp->kind == LION_CELLDIM_SCALAR)
 		{
 			if (dp->nbit != 0 || bitops != NIL ||
 				(dp->nval > 0 && !OidIsValid(dp->eqop)) ||
@@ -823,12 +981,40 @@ lion_priv_decode_cells(List *priv, LionPrivStage stage, LionCountPriv *out)
 			case LION_CELLPRED_NONE:
 				ntruth = (dp->kind == LION_CELLDIM_MULTI) ? 0 : -1;
 				break;
+			case LION_CELLPRED_SUM:
+				ntruth = (dp->kind == LION_CELLDIM_SUM &&
+						  dp->sumpred == i && pp->bit == 0) ? 0 : -1;
+				break;
 			default:
 				ntruth = -1;
 				break;
 		}
-		if (ntruth < 0 || list_length(pm) != 3 + ntruth)
+		if (ntruth < 0 ||
+			list_length(pm) != 3 + ntruth +
+			(pp->kind == LION_CELLPRED_SUM ? 5 : 0))
 			elog(ERROR, "LionCount: malformed cells predicate");
+		if (pp->kind == LION_CELLPRED_SUM)
+		{
+			int			d2;
+
+			pp->sumtype = (Oid) list_nth_int(pm, 3);
+			pp->sumunit = list_nth_int(pm, 4);
+			pp->sumbase = lion_priv_int64_at(pm, 5);
+			pp->sumbasescale = list_nth_int(pm, 7);
+			if ((pp->sumtype != INT2OID && pp->sumtype != INT4OID &&
+				 pp->sumtype != INT8OID && pp->sumtype != NUMERICOID) ||
+				pp->sumunit < 0 || pp->sumunit > LION_CELLS_MAX_SUMSCALE ||
+				(pp->sumtype != NUMERICOID && pp->sumunit != 0) ||
+				pp->sumbasescale < -1 || pp->sumbasescale > pp->sumunit)
+				elog(ERROR, "LionCount: malformed cells predicate");
+			/* its first dimension is its dimensions' first */
+			for (d2 = 0; d2 < pp->dim; d2++)
+			{
+				if (out->celldim[d2].kind == LION_CELLDIM_SUM &&
+					out->celldim[d2].sumpred == i)
+					elog(ERROR, "LionCount: malformed cells predicate");
+			}
+		}
 		pp->truth = (uint8 *) palloc(Max(ntruth, 1));
 		for (o = 0; o < ntruth; o++)
 		{
@@ -838,6 +1024,15 @@ lion_priv_decode_cells(List *priv, LionPrivStage stage, LionCountPriv *out)
 				elog(ERROR, "LionCount: malformed cells predicate");
 			pp->truth[o] = (uint8) t;
 		}
+	}
+
+	for (d = 0; d < out->ncelldim; d++)
+	{
+		const LionCellsDimPriv *dp = &out->celldim[d];
+
+		if (dp->kind == LION_CELLDIM_SUM &&
+			out->cellpred[dp->sumpred].kind != LION_CELLPRED_SUM)
+			elog(ERROR, "LionCount: malformed cells dimension");
 	}
 
 	if (stage == LION_PRIV_STAGE_PLAN)
@@ -1315,16 +1510,17 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 				bitqs = lappend(bitqs, dp->bitquery[j]);
 			}
 			dims = lappend(dims,
-						   lappend(list_make5(list_make5_int(dp->kind,
-															 (int) dp->attno,
-															 dp->radix,
-															 dp->nullout,
-															 dp->nbit),
-											  list_make3_oid(dp->idxoid,
-															 dp->eqop,
-															 dp->collation),
-											  dp->vals, outs, bitops),
-								   bitqs));
+						   lappend(lappend(list_make5(list_make5_int(dp->kind,
+																	 (int) dp->attno,
+																	 dp->radix,
+																	 dp->nullout,
+																	 dp->nbit),
+													  list_make3_oid(dp->idxoid,
+																	 dp->eqop,
+																	 dp->collation),
+													  dp->vals, outs, bitops),
+										   bitqs),
+								   lion_priv_encode_cellsum(dp)));
 		}
 		for (i = 0; i < p->ncellpred; i++)
 		{
@@ -1336,6 +1532,13 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 
 			for (j = 0; j < ntruth; j++)
 				one = lappend_int(one, (int) pp->truth[j]);
+			if (pp->kind == LION_CELLPRED_SUM)
+			{
+				one = lappend_int(one, (int) pp->sumtype);
+				one = lappend_int(one, pp->sumunit);
+				one = lion_priv_append_int64(one, pp->sumbase);
+				one = lappend_int(one, pp->sumbasescale);
+			}
 			preds = lappend(preds, one);
 		}
 		m = list_make3(list_make4_int(p->ncelldim, p->ncellpred, p->celldrv,
