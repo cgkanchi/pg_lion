@@ -19559,6 +19559,30 @@ clause was lossy. The executor substitutes an `INDEX_VAR` Var for each index qua
 as `fix_indexqual_references()` would, and builds the scan keys with core's
 `ExecIndexBuildScanKeys()`, so a Param becomes a run-time key exactly as in an Index Scan.
 
+**A negated multi-key query.** Core makes no index path for `NOT (tags && '{x}')`: an index
+answers an operator, never its negation. So a walk or a nested loop's probe left the NOT to its
+filter, which reads the heap for every member, and a probe whose set answered the rest of the
+WHERE fetched each row it met for that one clause. `lo_lion_accesses()` therefore also offers each
+of core's accesses with such a restriction added to a leaf of the same lion index on the AND path
+from the root (`lo_not_paths()`): a restriction `NOT (col op const)`, col a multi-key column of
+the index, op a search strategy of its family under the column's collation, and const a non-NULL
+Const whose query the posting sets answer exactly (`lion_multikey_literal_mode()` KEYS, or NONE,
+a query that selects no row). The leaf's set less the query's rows and less the column's NULLs is
+the set of the NOT beside the leaf's clauses: every such operator is strict and returns no NULL
+for non-NULL inputs, so the clause is true exactly where the column is not NULL and the query is
+false. The leaf carries the NOT as an IndexClause whose `rinfo` is the restriction and whose one
+index qual is the query; its price adds the index's lookup of the query alone
+(`create_index_path()`) and its selectivity is multiplied by the NOT's. In custom_private the leaf
+becomes a MINUS node, `LO_NODE_MINUS`: the leaf's other clauses, then for each NOT a leaf of the
+query and a leaf of `col IS NULL`, all of the same index, and `lo_build_node()` takes the later
+children's sets from the first's (`lo_set_andnot()`). A set taken away must be exact; one whose
+source says it is not (`lion_source_exact()`) is dropped instead, and the set left, a superset of
+the NOT's rows, is rechecked on the row with the whole lion qual, as any inexact set is. A leaf
+with no other clause has no set to take from and is left alone, as is a NOT under an OR. The lazy
+set (§40.10) takes no MINUS. GUC `pg_lion.enable_not_sets` (default on) turns it off, for
+comparing. Tested in notsets.sql against a seq scan (NULL arrays, empty arrays, NULL elements,
+tsvector, jsonb, two NOTs, dead and moved rows, a nested loop's probe).
+
 No overlap with LionCount (§10) or the FK join (§27): those replace an aggregate at the upper rel;
 this is a scan path of the base rel.
 
@@ -25404,6 +25428,34 @@ visibility-map test per member and the values from the index tuple.
   builds over it holds lion, the competitor is none, and the count is priced at rate 1 where a hash
   join's 0.5 had been. test/sql/rangesource.sql's join of a ten-row dimension then planned the
   probe's loop over its count, 2.1 ms against 1.8; that section now runs with the walks off.
+
+**A complement set.** A WHERE that keeps nearly every row - `g <> 'v' OR g IS NULL`, `n IS NOT
+NULL`, `c NOT IN (...)` - has a set of nearly the whole table: `<>` is a walk of every entry of its
+column but one, and over a column of many values each entry brings a piece a member (§30.3), so the
+probe's build is priced, rightly, at about the table's rows, and on a large table the probe loses
+to core's Index Scan: at 10M rows its set alone took longer than the heap lookups it saved. Every
+entry the B-tree hands the probe is a row of the table, and a non-partial lion index holds every row,
+so the probe can build the rows the WHERE REJECTS instead - one entry, or two with the NULLs - and
+keep each entry not among them (`lo_compl_access()`, `LO_FLAG_COMPL`). Each restriction it takes
+(`lo_compl_rejects()`), with what it rejects:
+
+    c IS NOT NULL                c IS NULL
+    c <> v                       c = v, c IS NULL
+    c <> v OR c IS NULL          c = v
+    c <> ALL (array)             c = ANY (array), c IS NULL   (a non-empty constant, no NULL in it)
+    NOT (m op v)                 m op v, m IS NULL            (a multi-key query, §30.2)
+
+`c` a scalar column of a non-partial lion index under a deterministic collation, so that an `=`
+lookup is the operator's own test, `v` a non-NULL Const; every operator is strict and returns no NULL
+for non-NULL operands, so a NULL is rejected unless the clause keeps it. The set is the BitmapOr of
+those leaves, which lion must answer exactly at plan time; the restrictions it answers leave the
+filter. Priced by `lo_cost_set()` as the rejected rows' build and the rest as members. A set that
+turns out inexact at run time would turn away rows the WHERE keeps, so then every entry is a
+candidate and the WHERE is rechecked on the row. Never lazy (§30.4: the lazy set tests members, not
+non-members), never a LionOrderedJoin's side. `pg_lion.enable_complement_sets` (default on) turns
+it off. Measured (synthetic, 10M rows, a text column of 50,000 values, 'v' in 16%; 239,395 probes,
+four workers, PostgreSQL 18, warm): the kept set 480 ms, core's Index Scan 230 ms, the complement
+set 200 ms. Tested in complset.sql against a hash join over a seq scan.
 
 **Declined, and why.**
 
