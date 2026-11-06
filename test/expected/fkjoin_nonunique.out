@@ -793,8 +793,9 @@ SELECT * FROM lion_nj_explain('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND 
                Join Type: Semi
                Join Keys: distinct, sorted
                Join Key Lookups: in index order
+               Fact Filters: collected once
                ->  (the dimension's plan)
-(9 rows)
+(10 rows)
 
 SELECT * FROM lion_nj_explain('SELECT count(DISTINCT f.fk) FROM lion_nf f WHERE f.fk IN (SELECT d.k FROM lion_nd d WHERE d.attr < 4)');
                         lion_nj_explain                        
@@ -914,8 +915,9 @@ SELECT * FROM lion_nj_explain('SELECT g, s.c FROM generate_series(1, 4) g LEFT J
                      Join Type: Semi
                      Join Keys: distinct, sorted
                      Join Key Lookups: in index order
+                     Fact Filters: collected once
                      ->  (the dimension's plan)
-(12 rows)
+(13 rows)
 
 SELECT lion_nj_par('SELECT g, s.c FROM generate_series(1, 4) g LEFT JOIN (SELECT count(*) AS c FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)) s ON s.c > g');
    lion_nj_par    

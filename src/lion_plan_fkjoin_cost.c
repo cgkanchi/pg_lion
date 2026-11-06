@@ -194,8 +194,10 @@ lion_fkjoin_probe_one(double heap_pages, double members, double cfk)
  *	  each of them, a Parallel Hash's.  Its lookups stay each participant's:
  *	  every one of them locates the filters for itself.
  *
- * Either way the filters are located once for the whole scan, each one lookup
- * and one walk of its chain, as a single count prices them.
+ * Either way the filters are located once for the whole scan, a directory
+ * lookup each.  The walk of their chains is the collecting's alone: probed,
+ * each count reads only the containers of its own key's pages, which
+ * lion_fkjoin_probe_one() prices, never the whole chain.
  *
  * And the heap the visibility map cannot vouch for, exactly as §10 prices it:
  * the candidates are the fact rows the dimension rows reach, which is their
@@ -328,6 +330,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	Cost		located = 0;
 	Cost		probed = 0;
 	Cost		collected = 0;
+	double		chainpages = 0.0;
+	double		probeseeks = 0.0;
 	double		reads;
 	int			ci = 0;
 	int			sno;
@@ -346,6 +350,24 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	nd = lion_fkjoin_fk_ndistinct(root, rel, fkvar);
 	perkey = tuples / nd;
 	cfk = lion_containers_for(heap_pages, perkey);
+
+	/*
+	 * ... which lion_containers_for() takes as one each, up to the heap's
+	 * container keys - rows scattered - while a key's rows stored together,
+	 * as a table loaded or clustered by the key keeps them, fill one or two
+	 * whatever the order of the keys (DESIGN.md §27, "A key's containers").
+	 * The fk index's count of its keys' containers says which: the share
+	 * of the scattered figure its keys' average has, applied to this key's.
+	 */
+	{
+		double		keyrows;
+		double		counted = lion_key_containers_counted(root, rel, fkidx,
+														  fkcol, &keyrows);
+
+		if (counted > 0.0)
+			cfk = Max(1.0, cfk * Min(1.0, counted /
+									 lion_containers_for(heap_pages, keyrows)));
+	}
 
 	/*
 	 * An existence test stops at the first container that shows a row the
@@ -519,7 +541,11 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 									 Min(sel * nkeys, 1.0) : sel);
 		ci++;
 
-		/* Located once: a lookup per set, and the walk of their chains. */
+		/*
+		 * Located once: a lookup per set.  The pages of their chains are read
+		 * whole only to collect them (`chainpages`, below); probes read their
+		 * own containers.
+		 */
 		cshare = lion_index_column_share(root, rel, idx,
 										 (AttrNumber) lfirst_int(lc4));
 		cdir = lion_index_dir_pages(idx, &cheight);
@@ -530,9 +556,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 
 		located += Min(nkeys, Max(cdir * cshare, 1.0)) * random_page_cost +
 			nkeys * (cheight + 1.0) * LION_DESCENT_COST;
-		located += Max(Min(nkeys, cpages), cpages * sel) * seq_page_cost;
-		reads += Min(nkeys, Max(cdir * cshare, 1.0)) +
-			Max(Min(nkeys, cpages), cpages * sel);
+		reads += Min(nkeys, Max(cdir * cshare, 1.0));
+		chainpages += Max(Min(nkeys, cpages), cpages * sel);
 	}
 	run += located;
 
@@ -581,6 +606,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 			}
 			probed += found * seeks * readshare *
 				lion_fkjoin_probe_one(heap_pages, setm, cfk);
+			probeseeks += found * seeks * readshare;
 
 			/* ... and a range spilled to a file reads each one back */
 			if (srcspills[sno])
@@ -648,7 +674,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 										   filtered, 1.0);
 		collected += drive * LION_FKJOIN_COLLECT_CONTAINER_COST +
 			drive * (npositive - 1) * LION_FKJOIN_PROBE_COST +
-			copyckeys * LION_FKJOIN_COPY_CONTAINER_COST + poscollected;
+			copyckeys * LION_FKJOIN_COPY_CONTAINER_COST + poscollected +
+			chainpages * seq_page_cost;
 
 		/*
 		 * A copy past the memory it has SPILLS to a temporary file
@@ -686,8 +713,20 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		 * large for the memory is chosen as any other, spilled and priced
 		 * so.
 		 */
+		/*
+		 * In a parallel plan a probing run that meets more keys than planned
+		 * collects the filters in EVERY participant, each its own copy
+		 * (lion_join_switch_reset()), where a plan that collects makes one
+		 * among them: the switch's bound of about twice the better way is
+		 * the bound per participant.  So it probes only where probing
+		 * beats collecting by the participants' share of the work - an
+		 * estimate of the dimension rows a few times too low, which is
+		 * what a join's often is, still collects.
+		 */
 		if (force ? wantcollect :
-			(collected < probed && !RecoveryInProgress()))
+			(collected < probed * (workers > 0 ?
+								   lion_parallel_divisor(workers) : 1.0) &&
+			 !RecoveryInProgress()))
 			*collect = true;
 		if (parts != NULL)
 		{
@@ -698,6 +737,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		}
 	}
 	run += *collect ? collected : probed;
+	reads += *collect ? chainpages : Min(chainpages, probeseeks);
 	if (parts != NULL)
 	{
 		parts->probed = probed;

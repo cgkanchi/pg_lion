@@ -12094,7 +12094,9 @@ set's containers - `lion_containers_for(heap_pages, rows per fk value)` - at §1
 common (`LION_FKJOIN_PROBE_COST`, 30 `cpu_operator_cost`, measured below), the set's chain pages
 (none when its entries are INLINE), and `LION_FKJOIN_ROW_COST` per row handed up - one a run when
 the target is counts alone ("The cost of a key, after the per-key path"); each fact filter's
-lookup and chain once (located once, materialized on second use, §9); and §10's recheck term for
+lookup once (located once, materialized on second use, §9), and its chain's pages only when the
+filters are collected - probed, a count reads just the containers of its key's pages, which the
+PROBE prices, so a few dimension rows are not charged the walk of a whole filter's chain; and §10's recheck term for
 the fact rows the dimension rows reach - `min(D × rows per fk value, fact rows) × filter
 selectivity × dirtyfrac` candidates, on dirty pages fetched once per query. Nothing charges the
 whole fact heap: that is what the node exists not to read. The Finalize Agg is costed by core.
@@ -14217,7 +14219,12 @@ or semi join has no row left, and an anti join's are every row, as when a filter
   plan run without its workers does. The shared copy of "One copy per query" is not joined: a
   probing plan sized no dynamic shared memory for it, and the participants reach the price at keys
   of their own, each over its own share of the dimension rows. A participant whose share holds few
-  heavy keys may never switch, and needs not.
+  heavy keys may never switch, and needs not. So the planner prices the risk: a parallel plan probes only
+  where probing beats collecting by `lion_parallel_divisor()` (`lion_cost_fkjoin_rel()`), since a
+  run that meets more keys than planned pays the collection once per participant, where a plan
+  that collects makes one copy among them. A key set from a multi-table join estimated at 1,140
+  keys that holds 10,000 (synthetic, 20M-row fact stored by key, PostgreSQL 18, warm) probed and
+  switched in all four participants, 169 ms; collected from the start, 33 ms.
 - **Rescans.** Each run starts its account again (`lion_join_switch_reset()`, from
   `lion_reset_run()`); the copy of the run before is released with the run.
 - **EXPLAIN ANALYZE** prints `Fact Filters: probed, then collected` in place of nothing (a probing
@@ -14468,6 +14475,51 @@ three new settings. Where a test counts the copy's own counters (`fkjoin_perkey.
 `fkjoin_semi.sql`, `fkjoin_walk.sql`) it now forces the collection with `pg_lion.fkjoin_count_cost`,
 and `fkjoin_adaptive.sql`'s switches come a few keys later (13 where 10), its rescan case running
 two dimension sets of twenty heavy keys so that each run still reaches the price.
+
+### A key's containers (2026-11-06)
+
+A count of one fk key reads the key's containers, and a probe seeks each fact filter at them: the
+per-key price is that count, `cfk`. `lion_containers_for(heap_pages, rows per key)` takes it as a
+container per row, up to the heap's container keys - rows scattered. A table loaded or clustered by
+the key keeps a key's rows together, in one or two containers whatever the order of the keys
+(clustered by key, the keys in random order: the column's correlation near zero, so
+`lion_key_containers()`'s interpolation cannot see it), and the price of a probe was ten times what
+it ran. The build knows: it closes each container key of a key's set as it writes it (a dense
+container, or a group of a sparse segment, which packs several), and sums them per key column
+beside Σn² (`conts` of `LionMetaNdistinct`). An entry's `ncontainers` counts items, a segment as
+one, so a VACUUM or ANALYZE that counts the keys again (§33, "The value") cannot recount them
+from the leaves; it keeps the average per key of the count before it, for the keys it finds
+(`lion_meta_carry_conts()`) - how a table was loaded outlives the rows it is counted over, and a
+REINDEX counts again. `lion_key_containers_counted()` gives the average per key and the rows per key it was counted at,
+from a count within a factor of 2 of the table's rows, not for a multi-key column or a partial
+index. The FK-side count takes the share the average is of the scattered figure at its own rows
+per key, applied to the key it prices: `cfk × min(1, counted / lion_containers_for(heap_pages,
+counted rows per key))`, at least 1. Scattered keys keep the figure they had; a clustered table's
+keys are one or two containers each.
+
+Measured with the lazy probe set of §40.10 (synthetic: a 20M-row fact of 2M keys, 4,000 of them
+2,000 rows each, stored by key in random key order; the key set the K² heaviest parents, from a
+two-to-four-table join with an anti join estimated at about one row for K = 6 and about 900 for
+K = 100; the fact filter a tsquery; PostgreSQL 18, warm, median of three):
+
+| query | keys | before | after | plan after |
+|---|---:|---:|---:|---|
+| count over the join, tsquery of 12 lexemes | 36 | 49.9 ms | 9.8 ms | nested loop over LionBtreeScan, its set lazy |
+| | 361 | 106 ms | 84.6 ms | the same |
+| | 1,369 | 276 ms | 136 ms | LionCount, the filter probed |
+| | 10,000 | 27.9 ms | 33.3 ms | parallel LionCount, collected (the same plan) |
+| count over the join, `s1 & f2` | 36 | 11.7 ms | 0.78 ms | LionCount (before: nested loop over LionBtreeScan) |
+| | 1,369 | 172 ms | 14.3 ms | LionCount |
+| `IN (key set)` | 36 | 8.8 ms | 0.75 ms | LionCount (before: nested loop over LionBtreeScan) |
+| | 10,000 | 36.8 ms | 48.9 ms | LionCount, probed, then collected |
+| `EXISTS` page of the key set | 36 | 6.5 ms | 0.66 ms | LionSemiJoin (before: nested loop over LionBtreeScan) |
+| | 10,000 | 11.9 ms | 37.1 ms | LionSemiJoin, probed, then collected (before: core's merge join) |
+
+The losses are the key sets of 10,000 estimated at about 900: priced at the estimate, probing
+is the cheaper way, and the run switches ("Probed, then collected") after about 2,600 keys. At 361
+keys the loop is still chosen at its estimate of one key; the count forced (nested loops off) runs
+in 29 ms. The misses are core's estimates of the key set, which no per-key price undoes. Other
+shapes of the same repro - a constant list, an InitPlan's array, LATERAL - plan as before.
 
 ### The semi and anti join as a join path (2026-09-29)
 
@@ -22035,7 +22087,7 @@ estimate needs. On a 2,000,000-row test column of 206,679 log-uniformly skewed k
 
 ### The meta page, and the format
 
-`LionMetaNdistinct` (lion.h), 528 bytes, right after `LionMetaPageData` on the meta page at
+`LionMetaNdistinct` (lion.h), 784 bytes, right after `LionMetaPageData` on the meta page at
 `LION_META_NDISTINCT_OFFSET`:
 
     valid_cols   uint32   bit i - 1: key column i has a count
@@ -22044,6 +22096,11 @@ estimate needs. On a 2,000,000-row test column of 206,679 log-uniformly skewed k
     ndistinct    uint64[32]  the VALUE entries of each key column
     sumsq        uint64[32]  Σn² of each key column: the square of each such entry's TIDs, summed
                              (below, "The rows of a probed key")
+    conts        uint64[32]  the container keys of each such entry's set, summed: a build's
+                             count, carried by later counts (§27, "A key's containers"); 0 unknown
+
+A meta page whose area ends before `conts` - counted before the sums of containers were kept -
+reads as one without counts until a VACUUM or ANALYZE counts again, or a REINDEX.
 
 Nothing in it says when it was counted. A build writes exactly the bytes every other build of the
 same rows writes, whatever its memory, its workers or its snapshot - `test/sql/build.sql` and
@@ -22326,8 +22383,8 @@ are restrictions of the relation, not parameterizations, and keep core's rows; s
 estimate core makes from the column. `pg_lion.enable_skew_estimate` (on) turns it off.
 `lion_debug_skew_rows(text)` plans a query and returns, for each column whose figure a probe's
 pricing computed, repriced or not, the figure and core's rows per key;
-`lion_debug_key_skew(regclass)` returns each key column's `rows`, `ndistinct` and `sumsq` from the
-meta page (`sumsq` NULL where it is unknown). Both are C functions for the tests, superuser only,
+`lion_debug_key_skew(regclass)` returns each key column's `rows`, `ndistinct`, `sumsq` and
+`containers` from the meta page (`sumsq` and `containers` NULL where unknown). Both are C functions for the tests, superuser only,
 that the extension's SQL does not create (`test/sql/skew.sql`).
 
 ### Limits
@@ -25106,10 +25163,16 @@ visibility-map test per member and the values from the index tuple.
   after the snapshot is taken, held in the query's memory, and rebuilt on a rescan only when a Param
   of the lion quals changed (§30.4) - which an outer row's never is, since no join clause reaches the
   lion side. A correlated subquery's or a generic plan's Param in the lion filter still rebuilds it
-  for each value, counted in `Lion Set`'s builds. It is built lazily (§30.4, "The set, lazily") when
-  the loop's scans together are expected to meet fewer than `LO_SWITCH_MIN_WALK` (10,000) entries -
-  a few outer rows probing a few keys, the memo of the keys probed kept across the scans - and at once
-  otherwise (`LO_FLAG_BUILD`).
+  for each value, counted in `Lion Set`'s builds. It is built lazily (§30.4, "The set, lazily"),
+  the memo of the keys probed kept across the scans, whatever the loops are expected to be: the
+  loops below are the rows of the outer relations, the most the loop could run, and the outer side
+  the plan puts there - that relation joined to others, a key set of a few rows - is often a
+  handful of rows, where a set built at once costs the whole lion filter for them. A loop that does
+  run long builds the set once its probes have cost what the build would (the probe budget), so it
+  pays at most about twice the build. Below a Gather, where the participants build one set
+  together ("Parallel query", below) and a lazy set is each participant's own, it is built at once
+  (`LO_FLAG_BUILD`) when the loop's scans together are expected to meet `LO_SWITCH_MIN_WALK`
+  (10,000) entries, lazily otherwise.
 - **Cost** (`lo_cost()` with `loops` and `scans`; `lo_probe_scans()`). A scan's price is §40.3's
   with the walk the parameterized IndexPath's: core's `indextotalcost` for one scan (the descent,
   and the B-tree's pages amortized over the loop count by core's `amcostestimate`), each entry's
@@ -30625,8 +30688,7 @@ more than the loop keeping its price, and at least 1 / `pg_lion.cold_max_discoun
 - **The sets, lazily or at once** (`lo_plan_path()`, from the side's weight). The fact's set is
   built at once when the share is at least `LO_LAZY_MAX_SHARE` (0.2) and its share of the walk at
   least `LO_SWITCH_MIN_WALK` (10,000) entries, lazily otherwise; the dimension's at once when the
-  descents are at least `LO_SWITCH_MIN_WALK`, lazily otherwise, as a nested loop's probe's is
-  (§40.10). A lazy set builds itself on §30.4's rules - the probe budget, the walk's length, a
+  descents are at least `LO_SWITCH_MIN_WALK`, lazily otherwise. A lazy set builds itself on §30.4's rules - the probe budget, the walk's length, a
   walk out of heap order - and `Lion Set` says which (`after N keys probed (probe budget)`).
 - **A row** (`oj_exec()`). The key sets are built first, if they are not (§47.6); an empty one
   ends the scan before the walk. Then, for each row the fact's walk returns - a member, visible,
@@ -31835,8 +31897,8 @@ Memoize, 118 to 139 (cold the hash join is 12% faster). Under a LIMIT the probe 
 LionOrderedJoin's medium page core's ordered loop over a Memoize of the probe is priced 3,635 against
 the node's 5,475 and runs 3.1 times slower warm, 3.7 times cold, because the probe's set - 14,990 to
 build - is spread over the 883,021 scans the whole loop would make, of which the LIMIT charges 2,403,
-while it is built whole at the first (`loops * expected >= LO_SWITCH_MIN_WALK`, from the whole
-loop's rows). The dense page and the medium page index-only lose the same way, 2.8 to 3.3 times; the
+while it is built whole at the first (measured with the probe's set built at once past
+`LO_SWITCH_MIN_WALK` entries over the whole loop; it is lazy now, §40.10, "The set"). The dense page and the medium page index-only lose the same way, 2.8 to 3.3 times; the
 sparse page, 5.6 times, to core's price of the outer Index Scan's cached fetches, which the probe's
 lower inner price exposes. On, the warm matrix comes out level with the default, the cold one 3.8 s
 worse at 4 GB and 6.7 s better at 256 MB: the probe stays off until its set under a LIMIT is priced as

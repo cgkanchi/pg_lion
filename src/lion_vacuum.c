@@ -730,8 +730,11 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		bool		counted = lion_vac_may_count(index, vs.ix);
 
 		if (counted)
-			lion_meta_fill_ndistinct(&nd, vs.ix, vs.nvalues, vs.sumsq,
+		{
+			lion_meta_fill_ndistinct(&nd, vs.ix, vs.nvalues, vs.sumsq, NULL,
 									 (uint64) vs.numtids);
+			lion_meta_carry_conts(index, &nd);
+		}
 		else
 			(void) lion_read_meta_ndistinct(index, &nd);
 		lion_bm25_count_lengths(index, vs.ix, &nd);
@@ -1453,8 +1456,9 @@ lion_vacuum_sample_keys(IndexVacuumInfo *info, LionIndexState *ix,
 		finals[c] = saturated[c] ? PG_UINT64_MAX :
 			lion_vacuum_scaled(ests[c], seen[c]);
 	}
-	lion_meta_fill_ndistinct(&nd, ix, finalv, finals,
+	lion_meta_fill_ndistinct(&nd, ix, finalv, finals, NULL,
 							 lion_vacuum_scaled(estrows, false));
+	lion_meta_carry_conts(index, &nd);
 	lion_bm25_count_lengths(index, ix, &nd);
 	lion_meta_write_ndistinct(index, &nd);
 
@@ -1630,7 +1634,8 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 		lion_vacuum_delay_point();
 	}
 
-	lion_meta_fill_ndistinct(&nd, ix, nvalues, sumsq, rows);
+	lion_meta_fill_ndistinct(&nd, ix, nvalues, sumsq, NULL, rows);
+	lion_meta_carry_conts(index, &nd);
 	lion_bm25_count_lengths(index, ix, &nd);
 	lion_meta_write_ndistinct(index, &nd);
 	if (nlisted >= 0)

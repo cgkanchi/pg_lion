@@ -5381,10 +5381,7 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	 * share of its walk a LIMIT on the node alone lets it go, and the entries
 	 * that comes to.  A parallel walk's set is built at once, for every
 	 * participant (§40.9).  A nested loop's probe (§40.10) keeps its set for
-	 * every scan the loop makes, and its walk is all of theirs: lazily while
-	 * the loop's scans together are expected to meet fewer entries than a
-	 * walk that would be built for - a few outer rows probing a few keys of
-	 * the set - and built at once otherwise.
+	 * every scan the loop makes, lazily, as below.
 	 */
 	if (side == LO_SIDE_DIM)
 	{
@@ -5406,12 +5403,28 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	}
 	else if (best_path->path.param_info != NULL)
 	{
-		double		loops;
-
+		/*
+		 * Lazily, whatever the loop count: core's get_loop_count() gives the
+		 * rows of the outer relations the probe is parameterized by, the
+		 * most the loop could run, where the outer side the plan puts there
+		 * - that relation joined to others - is often a handful of rows; and
+		 * the lazy set builds once its probes have cost what the build
+		 * would, so a loop that does run long pays at most about twice the
+		 * build.  Below a Gather, where the participants build one set
+		 * together (§40.10, "Parallel query") and a lazy one would be each
+		 * participant's own, it is built at once when the loop's scans
+		 * together are expected to meet `LO_SWITCH_MIN_WALK` entries.
+		 */
 		flags |= LO_FLAG_PROBE;
-		(void) lo_probe_scans(root, rel, best_path->path.param_info, &loops);
-		if (loops * expected >= LO_SWITCH_MIN_WALK)
-			flags |= LO_FLAG_BUILD;
+		if (best_path->path.parallel_aware)
+		{
+			double		loops;
+
+			(void) lo_probe_scans(root, rel, best_path->path.param_info,
+								  &loops);
+			if (loops * expected >= LO_SWITCH_MIN_WALK)
+				flags |= LO_FLAG_BUILD;
+		}
 	}
 	else if (best_path->path.parallel_aware)
 		flags |= LO_FLAG_BUILD;

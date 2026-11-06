@@ -469,9 +469,8 @@ SELECT * FROM lion_sp_explain('SELECT d.pk, d.grp FROM lion_sp_d d WHERE EXISTS 
    Refuted by Partition Bounds: ((kind = 'a'::text) AND (tags && '{t1}'::text[])) in 2 of 4 partitions, ((kind = 'b'::text) AND (x = 3)) in 3 of 4 partitions, (kind = 'c'::text) in 3 of 4 partitions
    Join Key Lookups: in index order
    Join Rows: the outer rows with a match
-   Fact Filters: collected once
    ->  Seq Scan on lion_sp_d d
-(9 rows)
+(8 rows)
 
 -- an outer side that is a join: the dimension inner-joined to a small table
 SELECT * FROM lion_sp_explain('SELECT d.pk, g.label FROM lion_sp_d d JOIN lion_sp_g g ON g.grp = d.grp WHERE g.flag AND EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)', true);
@@ -597,12 +596,11 @@ SELECT * FROM lion_sp_explain('SELECT count(*) FROM lion_sp_f2 f2 WHERE f2.doc @
                Refuted by Partition Bounds: ((kind = 'a'::text) AND (tags && '{t1}'::text[])) in 2 of 4 partitions, ((kind = 'b'::text) AND (x = 3)) in 3 of 4 partitions, (kind = 'c'::text) in 3 of 4 partitions
                Join Key Lookups: in index order
                Join Rows: the outer rows with a match
-               Fact Filters: collected once
                ->  Bitmap Heap Scan on lion_sp_d d
                      Recheck Cond: (region = 'eu'::text)
                      ->  Bitmap Index Scan on lion_sp_d_rg
                            Index Cond: (region = 'eu'::text)
-(17 rows)
+(16 rows)
 
 SET max_parallel_workers_per_gather = 2;
 -- parallel: each participant tests its share of the outer rows

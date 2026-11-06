@@ -251,10 +251,10 @@ SELECT bsp('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
 -- 3. Outer rows that repeat their keys: each fact row's group, two thousand
 --    keys among 28,572 rows, probed with a Memoize above the probe (lion's
 --    paths at a tenth: at a thousandth the probe is too cheap to cache) and
---    without one.  The set is built once either way: a scan Memoize answers
+--    without one.  The set is kept either way: a scan Memoize answers
 --    from its cache never reaches the probe, and the probe it rescans keeps
---    its set (no "builds" in Lion Set) - two thousand walks with a Memoize,
---    28,572 without.  PostgreSQL 19 may aggregate the fact side below the
+--    its set (no "builds" in Lion Set), lazily, each container key probed
+--    once - two thousand walks with a Memoize, 28,572 without.  PostgreSQL 19 may aggregate the fact side below the
 --    join instead (eager aggregation), which probes each key once itself.
 DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN PERFORM set_config('enable_eager_aggregate', 'off', false); END IF; END$$;
 SELECT bsp('SELECT d.id, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.g + 1
@@ -270,6 +270,18 @@ SELECT * FROM bsp_run('SELECT d.id, count(*) FROM bsp_fact f JOIN bsp_dim d ON d
  WHERE f.tsv @@ ''x3''::tsquery AND d.grade = ''alpha'' AND d.verified GROUP BY d.id',
 					  memoize => false);
 DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN EXECUTE 'RESET enable_eager_aggregate'; END IF; END$$;
+
+-- 3a. A few outer rows reached through another relation: four values joined
+--    to the fact by its key, the probe parameterized by the fact.  Core
+--    gives the probe's loops as the fact's 200,000 rows; the loop runs four
+--    times.  The set is lazy, whatever the loops: the container keys of the
+--    rows the walks meet, not the whole of the dimension's filter.
+SELECT bsp('SELECT f.id, d.id FROM (VALUES (101), (2002), (30003), (150004)) v(x)
+ JOIN bsp_fact f ON f.id = v.x JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE d.grade = ''alpha'' AND d.verified');
+SELECT * FROM bsp_run('SELECT f.id, d.id FROM (VALUES (101), (2002), (30003), (150004)) v(x)
+ JOIN bsp_fact f ON f.id = v.x JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE d.grade = ''alpha'' AND d.verified');
 
 -- 4. A B-tree of two columns: the leading one the outer row's, the second a
 --    constant, both its Index Cond; each descent finds a few entries.

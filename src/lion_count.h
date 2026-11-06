@@ -2197,6 +2197,16 @@ extern void lion_ordjoin_init(void);
 extern void lion_selfuncs_init(void);
 
 /*
+ * How many containers a key of lion index idx's key column col (from 1) has,
+ * on average over the column's keys, as its meta page counted them, and the
+ * rows a key had then (*keyrows); 0 when the page has no count of it or the
+ * count is not of rel's rows now (DESIGN.md §27, "A key's containers").
+ */
+extern double lion_key_containers_counted(PlannerInfo *root, RelOptInfo *rel,
+										  IndexOptInfo *idx, AttrNumber col,
+										  double *keyrows);
+
+/*
  * While lion prices one of its own accesses to rel, a range among `clauses`
  * that bounds a column past its histogram's ends is estimated with the ends
  * a lion index on the column holds.  lion_probe_begin() says whether a scope

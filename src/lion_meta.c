@@ -17,6 +17,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/genam.h"
 #include "access/generic_xlog.h"
 #include "access/htup_details.h"
@@ -82,13 +84,13 @@ lion_init_metapage(Page page, uint32 inline_limit, BlockNumber root,
 
 /*
  * The key counts of DESIGN.md §33 for ix's columns: the VALUE entries of each
- * scalar key column, the sum of the squares of their TIDs, and the rows under
- * the first of them, as of now.
+ * scalar key column, the sum of the squares of their TIDs and of their
+ * containers, and the rows under the first of them, as of now.
  */
 void
 lion_meta_fill_ndistinct(LionMetaNdistinct *nd, const LionIndexState *ix,
 						 const uint64 *nvalues, const uint64 *sumsq,
-						 uint64 rows)
+						 const uint64 *conts, uint64 rows)
 {
 	int			i;
 
@@ -101,8 +103,40 @@ lion_meta_fill_ndistinct(LionMetaNdistinct *nd, const LionIndexState *ix,
 		nd->valid_cols |= ((uint32) 1) << i;
 		nd->ndistinct[i] = nvalues[i];
 		nd->sumsq[i] = sumsq[i];
+		nd->conts[i] = (conts != NULL) ? conts[i] : 0;
 	}
 	nd->rows = rows;
+}
+
+/*
+ * The container keys of each key column (conts), which only a build counts:
+ * a VACUUM or ANALYZE that counts the keys again sees each entry's items,
+ * and an item may be a sparse segment of many container keys.  So nd, a
+ * count just taken, keeps the average per key of the count on idx's meta
+ * page, for the keys it has now - how a table was loaded, by key or not,
+ * outlives the rows it is counted over (DESIGN.md §27, "A key's
+ * containers").
+ */
+void
+lion_meta_carry_conts(Relation index, LionMetaNdistinct *nd)
+{
+	LionMetaNdistinct old;
+	int			i;
+
+	if (!lion_read_meta_ndistinct(index, &old))
+		return;
+	for (i = 0; i < LION_META_MAX_COLS; i++)
+	{
+		uint32		bit = ((uint32) 1) << i;
+
+		if ((nd->valid_cols & bit) == 0 || (old.valid_cols & bit) == 0 ||
+			!LionMetaContsKnown(&old, i) || nd->ndistinct[i] == 0)
+			continue;
+		nd->conts[i] = (uint64) Max(rint((double) old.conts[i] /
+										 (double) old.ndistinct[i] *
+										 (double) nd->ndistinct[i]),
+									(double) nd->ndistinct[i]);
+	}
 }
 
 /*
