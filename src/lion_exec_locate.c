@@ -11,6 +11,7 @@
  */
 #include "postgres.h"
 
+#include "access/detoast.h"
 #include "lion_customscan.h"
 
 /*
@@ -1604,6 +1605,14 @@ lion_arg_type_passed(Oid type, Oid declared)
  * clauses"): the columns they read copied into the node's residual slot -
  * pointers into the tuple, which the caller's pin keeps in place - and the
  * clauses evaluated over it, as the ordinary plan's scan evaluates its quals.
+ *
+ * A column the clauses read more than once (residonce[]: an array, tsvector
+ * or jsonb, whose operators read a value whole) whose value is compressed or
+ * stored out of line is detoasted here, once, into the row's memory: every
+ * operator call over the TOASTed datum would otherwise fetch and decompress
+ * it again - a score of twenty `arr && '{x}'` terms read the
+ * array twenty times a row (DESIGN.md §10, "Residual clauses", "A TOASTed
+ * column read more than once").  The value is the same either way.
  */
 static bool
 lion_resid_test(void *arg, HeapTuple tuple)
@@ -1622,9 +1631,25 @@ lion_resid_test(void *arg, HeapTuple tuple)
 		slot->tts_isnull[i] = true;
 	}
 	for (i = 0; i < st->nresidcol; i++)
-		slot->tts_values[st->residslotcol[i]] =
-			heap_getattr(tuple, st->residheapattno[i], hdesc,
-						 &slot->tts_isnull[st->residslotcol[i]]);
+	{
+		int			c = st->residslotcol[i];
+		Datum		d;
+
+		d = heap_getattr(tuple, st->residheapattno[i], hdesc,
+						 &slot->tts_isnull[c]);
+		if (st->residonce[i] && !slot->tts_isnull[c] &&
+			TupleDescAttr(hdesc, st->residheapattno[i] - 1)->attlen == -1 &&
+			(VARATT_IS_EXTERNAL(DatumGetPointer(d)) ||
+			 VARATT_IS_COMPRESSED(DatumGetPointer(d))))
+		{
+			MemoryContext oldcxt =
+				MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+
+			d = PointerGetDatum(detoast_attr((struct varlena *) DatumGetPointer(d)));
+			MemoryContextSwitchTo(oldcxt);
+		}
+		slot->tts_values[c] = d;
+	}
 	ExecStoreVirtualTuple(slot);
 
 	econtext->ecxt_scantuple = slot;

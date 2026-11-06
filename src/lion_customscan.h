@@ -3474,6 +3474,8 @@ typedef struct LionCountScanState
 	AttrNumber *residattno;		/* the PARENT's numbering (DESIGN.md §16) */
 	AttrNumber *residheapattno; /* ... and the relation counted's, set when
 								 * it is made so (lion_open_relation()) */
+	bool	   *residonce;		/* ... read more than once by the clauses: a
+								 * TOASTed value is detoasted once a row */
 
 	/*
 	 * Whether the statement leaves the relation being counted alone
