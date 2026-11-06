@@ -113,11 +113,13 @@ END $$;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF)
 SELECT id, k FROM ns WHERE c = 3 AND NOT (tags && '{a1}') ORDER BY k;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 
 SELECT q, lion_ns(q) FROM (VALUES
 	-- arrays: overlap, containment, NULL arrays, empty arrays, NULL elements
