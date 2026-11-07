@@ -1978,22 +1978,34 @@ lion_leave_out_slice_pages(RelOptInfo *rel)
 
 
 /*
- * Does a bitmap scan of path leave its phrases to the heap?  A scan of two
- * index quals or more, of one column or several, is answered by intersecting
- * their sets (lion_getbitmap_choice()), which takes a phrase's or a weight's
- * superset and has the bitmap heap scan recheck it; only a scan of one qual
- * decides it from stored positions (lion_emit_query()).  A plain scan decides
- * it from them either way (lion_source_build()).
+ * Does a bitmap scan of path leave its phrases to the heap?  A scan whose
+ * quals are two set trees or walks or more, of one column or several, is
+ * answered by intersecting them (lion_getbitmap_choice()), which takes a
+ * phrase's or a weight's superset and has the bitmap heap scan recheck it;
+ * a scan of one decides it from stored positions (lion_emit_query()).  The
+ * count is lion_scan_choose()'s, as lion_cost_col_quals() mirrors it: an
+ * `IS NOT NULL` beside a strict qual of its column is implied and not
+ * counted, so a phrase beside its own column's `IS NOT NULL` is a scan of
+ * one.  A plain scan decides a phrase from positions either way
+ * (lion_source_build()).
  */
 static bool
 lion_bitmap_skips_positions(IndexPath *path)
 {
-	int			nquals = 0;
-	ListCell   *lc;
+	int			nanswer = 0;
+	bool		nomatch = false;
+	int			c;
 
-	foreach(lc, path->indexclauses)
-		nquals += list_length(((IndexClause *) lfirst(lc))->indexquals);
-	return nquals >= 2;
+	for (c = 0; c < path->indexinfo->nkeycolumns; c++)
+	{
+		LionCostCol cc;
+
+		lion_cost_col_quals(path, c, &cc);
+		nanswer += list_length(cc.sets) + (cc.walk != NULL ? 1 : 0);
+		nomatch |= cc.nomatch;
+		lion_cost_col_free(&cc);
+	}
+	return nanswer >= 2 && !nomatch;
 }
 
 /*

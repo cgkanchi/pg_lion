@@ -4932,10 +4932,23 @@ lion_correct_rel_rows(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
  * heap scan is offered again without the credit once the relation's paths
  * are built (lion_bitmap_offer_credited()).  Unparameterized paths only, as
  * the remainders above; noted again, a path's credit is replaced.
+ *
+ * Only a path whose every index clause is one of its relation's restriction
+ * clauses is noted: core's own index paths over them, which create_index_paths()
+ * also offers as a bitmap heap scan alone.  The index paths core builds for an
+ * OR's arms (generate_bitmap_or_paths()) and those lion builds to price a set
+ * (lion_ordered.c, lion_probejoin.c) answer clauses that are not, and a bitmap
+ * heap scan of one alone would drop the rows of the OR's other arms: its recheck
+ * keeps only the restrictions the index quals do not imply.  The pointer stays
+ * good for the planner run: add_path() never frees an IndexPath, and core frees
+ * only a partial one (build_index_paths()), which an index without
+ * amcanparallel - lion's - has none of; the relation is kept beside it so that
+ * another relation's credits are passed over without reading their paths.
  */
 typedef struct LionBitmapCredit
 {
 	IndexPath  *path;
+	RelOptInfo *rel;
 	Cost		credit;
 } LionBitmapCredit;
 
@@ -4947,8 +4960,17 @@ lion_bitmap_note_credit(PlannerInfo *root, IndexPath *path, Cost credit)
 	MemoryContext oldcxt;
 	ListCell   *lc;
 
-	if (root == NULL || root->glob == NULL || credit <= 0)
+	if (root == NULL || root->glob == NULL || credit <= 0 ||
+		path->indexinfo->amcanparallel)
 		return;
+	foreach(lc, path->indexclauses)
+	{
+		IndexClause *iclause = lfirst_node(IndexClause, lc);
+
+		if (!list_member_ptr(path->indexinfo->rel->baserestrictinfo,
+							 iclause->rinfo))
+			return;
+	}
 	cache = lion_probe_cache_for(root);
 	foreach(lc, cache->bmcredits)
 	{
@@ -4962,6 +4984,7 @@ lion_bitmap_note_credit(PlannerInfo *root, IndexPath *path, Cost credit)
 	oldcxt = MemoryContextSwitchTo(cache->run.cxt);
 	c = (LionBitmapCredit *) palloc(sizeof(LionBitmapCredit));
 	c->path = path;
+	c->rel = path->indexinfo->rel;
 	c->credit = credit;
 	cache->bmcredits = lappend(cache->bmcredits, c);
 	MemoryContextSwitchTo(oldcxt);
@@ -4997,8 +5020,7 @@ lion_bitmap_offer_credited(PlannerInfo *root, RelOptInfo *rel)
 		LionBitmapCredit *c = (LionBitmapCredit *) lfirst(lc);
 		IndexPath  *copy;
 
-		if (c->credit <= 0 || c->path->indexinfo->rel != rel ||
-			c->path->path.param_info != NULL)
+		if (c->credit <= 0 || c->rel != rel)
 			continue;
 		copy = makeNode(IndexPath);
 		memcpy(copy, c->path, sizeof(IndexPath));

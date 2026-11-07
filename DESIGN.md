@@ -7140,7 +7140,10 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     *A bitmap scan of two quals or more runs no filter* (2026-11-07): it intersects the quals'
     sets (`lion_emit_columns()`, `lion_emit_intersect()`) and leaves a phrase's or a weight's
     superset to the bitmap heap scan's recheck; only a bitmap scan of one qual decides it from
-    positions (`lion_emit_query()`). The index path is shared by the plain scan, which does
+    positions (`lion_emit_query()`). The quals are counted as the scan classifies them
+    (`lion_cost_col_quals()`): an `IS NOT NULL` beside a strict qual of its column is implied and
+    dropped, so a phrase beside its own column's `IS NOT NULL` is a scan of one and runs the
+    filter. The index path is shared by the plain scan, which does
     decide from positions, and by every lion path built over it (LionOrdered's walks among them),
     so it keeps the price; the filter is noted as the bitmap's credit
     (`lion_bitmap_note_credit()`), and once the relation's paths are built its bitmap heap scan,
@@ -7148,7 +7151,10 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     (`lion_bitmap_offer_credited()`, after the other hooks). The rows rechecked are the index
     path's: core estimates a phrase as its lexemes' AND, the superset the bitmap emits. The bitmap
     paths core built over the index path itself, and its ANDs and ORs, stay dearer by the credit;
-    a parameterized one keeps it. Without the credit the narrow index of two lion indexes, one over
+    a parameterized one keeps it. Only an index path whose every clause is a restriction of the
+    relation is credited: one of an OR's arms (or one lion builds to price a set) answers clauses
+    that are not, and a bitmap heap scan of it alone would keep only that arm's rows, as its
+    recheck drops the restrictions its index quals imply. Without the credit the narrow index of two lion indexes, one over
     `(t, title, f, e)` and one over `(t, title, e)`, won `t @@ P AND f @@ 'w1 <-> w2'` of two
     common words: 2M synthetic rows, the wide bitmap priced at 20,066 of which 19,296 the filter
     it never ran (bitmap 3 to 4 ms; 28 to 33 ms in all, against the narrow index's 37). The filter

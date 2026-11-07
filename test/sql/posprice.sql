@@ -217,6 +217,26 @@ SELECT (SELECT count(*) FROM pq_wide
 		WHERE t @@ 'p3'::tsquery AND f @@ 'alpha <-> beta'::tsquery) =
 	   (SELECT count(*) FROM (SELECT t, f FROM pq_wide OFFSET 0) s
 		WHERE t @@ 'p3'::tsquery AND f @@ 'alpha <-> beta'::tsquery) AS same_rows;
+-- a phrase beside its own column's IS NOT NULL is a scan of one qual (the
+-- IS NOT NULL is implied), which runs the filter: priced as the phrase alone
+SELECT a.cost = b.cost AS notnull_pays_positions
+FROM pq_wide_scans($q$SELECT id FROM pq_wide
+	WHERE f @@ 'alpha <-> beta'::tsquery$q$, true) a,
+	pq_wide_scans($q$SELECT id FROM pq_wide
+	WHERE f @@ 'alpha <-> beta'::tsquery AND f IS NOT NULL$q$, true) b;
+-- an OR's arm of two quals is not offered as a bitmap scan alone, which would
+-- drop the other arm's rows
+BEGIN;
+SET LOCAL pg_lion.enable_count_pushdown = off;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_indexscan = off;
+SELECT (SELECT count(*) FROM pq_wide
+		WHERE (t @@ 'p3'::tsquery AND f @@ 'alpha <-> beta'::tsquery)
+			OR t @@ 'p4'::tsquery) =
+	   (SELECT count(*) FROM (SELECT t, f FROM pq_wide OFFSET 0) s
+		WHERE (t @@ 'p3'::tsquery AND f @@ 'alpha <-> beta'::tsquery)
+			OR t @@ 'p4'::tsquery) AS or_same_rows;
+ROLLBACK;
 DROP FUNCTION pq_wide_scans(text, bool);
 DROP TABLE pq_wide;
 
