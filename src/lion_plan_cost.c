@@ -7489,6 +7489,39 @@ lion_cost_posfilter(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	return cost;
 }
 
+
+/*
+ * An index qual `col op query` with its query as the plan prices it: a value
+ * that is not a Const - a STABLE call over constants, a custom plan's bound
+ * parameter - folded as core's selectivity functions fold it
+ * (estimate_expression_value()), as lioncostestimate() prices the scan's sets
+ * (DESIGN.md §17, "A query known only at run time").  The clause itself where
+ * there is nothing to fold or the value does not fold to a Const.
+ */
+static Node *
+lion_cost_folded_clause(PlannerInfo *root, Node *clause)
+{
+	OpExpr	   *op;
+	OpExpr	   *copy;
+	Node	   *arg;
+	Node	   *folded;
+
+	if (root == NULL || clause == NULL || !IsA(clause, OpExpr) ||
+		list_length(((OpExpr *) clause)->args) != 2)
+		return clause;
+	op = (OpExpr *) clause;
+	arg = lion_strip((Node *) lsecond(op->args));
+	if (arg == NULL || IsA(arg, Const))
+		return clause;
+	folded = estimate_expression_value(root, (Node *) lsecond(op->args));
+	if (lion_strip(folded) == NULL || !IsA(lion_strip(folded), Const))
+		return clause;
+	copy = (OpExpr *) palloc(sizeof(OpExpr));
+	memcpy(copy, op, sizeof(OpExpr));
+	copy->args = list_make2(linitial(op->args), folded);
+	return (Node *) copy;
+}
+
 /*
  * The position filters of one scan of the AM (lion_scan.c): a plain or bitmap
  * scan puts the superset of each multi-key qual decided from stored positions
@@ -7517,8 +7550,9 @@ lion_cost_scan_posfilter(PlannerInfo *root, IndexPath *path, double cand)
 
 			cost += lion_cost_posfilter_clause(root, idx->rel, idx,
 											   (AttrNumber) (iclause->indexcol + 1),
-											   (Node *) rinfo->clause, false,
-											   cand, 1.0);
+											   lion_cost_folded_clause(root,
+																	   (Node *) rinfo->clause),
+											   false, cand, 1.0);
 		}
 	}
 	return cost;

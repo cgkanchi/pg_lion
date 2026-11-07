@@ -1976,6 +1976,26 @@ lion_leave_out_slice_pages(RelOptInfo *rel)
 	}
 }
 
+
+/*
+ * Does a bitmap scan of path leave its phrases to the heap?  A scan of two
+ * index quals or more, of one column or several, is answered by intersecting
+ * their sets (lion_getbitmap_choice()), which takes a phrase's or a weight's
+ * superset and has the bitmap heap scan recheck it; only a scan of one qual
+ * decides it from stored positions (lion_emit_query()).  A plain scan decides
+ * it from them either way (lion_source_build()).
+ */
+static bool
+lion_bitmap_skips_positions(IndexPath *path)
+{
+	int			nquals = 0;
+	ListCell   *lc;
+
+	foreach(lc, path->indexclauses)
+		nquals += list_length(((IndexClause *) lfirst(lc))->indexquals);
+	return nquals >= 2;
+}
+
 /*
  * Cost estimate: the generic estimate, with four corrections and the heap
  * correlation.  A scan that has to walk the whole index is priced as one
@@ -2179,8 +2199,25 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		 * to the scan's candidates (DESIGN.md §17, "The price") - a nested
 		 * loop's inner scan once a repetition.
 		 */
-		costs.indexTotalCost += lion_cost_scan_posfilter(root, path,
-														 costs.numIndexTuples);
+		{
+			Cost		posfilter = lion_cost_scan_posfilter(root, path,
+															 costs.numIndexTuples);
+
+			costs.indexTotalCost += posfilter;
+
+			/*
+			 * ... by a plain scan.  A bitmap scan of two quals or more
+			 * intersects their sets and leaves the superset to the heap's
+			 * recheck (lion_emit_columns(), lion_emit_intersect()), so the
+			 * filter is not its cost: noted, its bitmap heap scan is offered
+			 * again without it once the relation's paths are built
+			 * (lion_bitmap_note_credit()).
+			 */
+			if (posfilter > 0.0 && idxloops <= 1.0 &&
+				path->path.param_info == NULL &&
+				lion_bitmap_skips_positions(path))
+				lion_bitmap_note_credit(root, path, posfilter);
+		}
 	}
 
 	/*

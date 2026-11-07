@@ -256,6 +256,7 @@ typedef struct LionProbeCache
 	LionRunCache run;
 	List	   *ends;			/* LionEndpoint */
 	List	   *remainders;		/* LionPlainRemainder */
+	List	   *bmcredits;		/* LionBitmapCredit */
 	List	   *isects;			/* LionIsect: the intersection probe's */
 	int			nisectprobes;	/* ... how many it has made */
 	int64		isectbuffers;	/* ... and the buffers they accessed */
@@ -1055,6 +1056,7 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 static void lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 										Index rti, RangeTblEntry *rte);
 static void lion_skew_reprice_params(PlannerInfo *root, RelOptInfo *rel);
+static void lion_bitmap_offer_credited(PlannerInfo *root, RelOptInfo *rel);
 static void lion_skew_reprice_lists(PlannerInfo *root, RelOptInfo *rel,
 									RangeTblEntry *rte);
 
@@ -4922,6 +4924,96 @@ lion_correct_rel_rows(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 }
 
 /*
+ * What lioncostestimate() charges an index path for that its bitmap scan does
+ * not do (DESIGN.md §17, "The price"): the position filters a plain scan
+ * decides a phrase's or a weight's superset with, where a bitmap scan of two
+ * quals or more leaves the superset to the heap's recheck.  The plain scan,
+ * and every lion path built on the index path, keeps the price; the bitmap
+ * heap scan is offered again without the credit once the relation's paths
+ * are built (lion_bitmap_offer_credited()).  Unparameterized paths only, as
+ * the remainders above; noted again, a path's credit is replaced.
+ */
+typedef struct LionBitmapCredit
+{
+	IndexPath  *path;
+	Cost		credit;
+} LionBitmapCredit;
+
+void
+lion_bitmap_note_credit(PlannerInfo *root, IndexPath *path, Cost credit)
+{
+	LionProbeCache *cache;
+	LionBitmapCredit *c;
+	MemoryContext oldcxt;
+	ListCell   *lc;
+
+	if (root == NULL || root->glob == NULL || credit <= 0)
+		return;
+	cache = lion_probe_cache_for(root);
+	foreach(lc, cache->bmcredits)
+	{
+		c = (LionBitmapCredit *) lfirst(lc);
+		if (c->path == path)
+		{
+			c->credit = credit;
+			return;
+		}
+	}
+	oldcxt = MemoryContextSwitchTo(cache->run.cxt);
+	c = (LionBitmapCredit *) palloc(sizeof(LionBitmapCredit));
+	c->path = path;
+	c->credit = credit;
+	cache->bmcredits = lappend(cache->bmcredits, c);
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * Each index path of rel with a bitmap credit noted is offered again as the
+ * bitmap heap scan it is, plain and partial as create_index_paths() offers a
+ * bitmap path: over a copy of the index path whose index cost is less the
+ * credit.  The bitmap heap scans built from the index path itself are left
+ * as they are, dearer than the new ones by the credit, and add_path() drops
+ * those the new ones beat; so are the ANDs and ORs core built over it, which
+ * stay dearer by it.  The rows to recheck are the index path's: core's
+ * estimate of a phrase is that of its lexemes' AND, which is the superset the
+ * bitmap emits.  A credit is used once.
+ *
+ * Run after the other hooks, LionOrdered's among them, whose walks decide the
+ * superset from positions as the plain scan does and keep its price.
+ */
+static void
+lion_bitmap_offer_credited(PlannerInfo *root, RelOptInfo *rel)
+{
+	LionProbeCache *cache;
+	ListCell   *lc;
+
+	if (root == NULL || root->glob == NULL ||
+		(cache = lion_probe_cache_find(root)) == NULL ||
+		cache->bmcredits == NIL || IS_DUMMY_REL(rel))
+		return;
+
+	foreach(lc, cache->bmcredits)
+	{
+		LionBitmapCredit *c = (LionBitmapCredit *) lfirst(lc);
+		IndexPath  *copy;
+
+		if (c->credit <= 0 || c->path->indexinfo->rel != rel ||
+			c->path->path.param_info != NULL)
+			continue;
+		copy = makeNode(IndexPath);
+		memcpy(copy, c->path, sizeof(IndexPath));
+		copy->indextotalcost = Max(copy->indextotalcost - c->credit, 0.0);
+		c->credit = 0;
+
+		add_path(rel, (Path *) create_bitmap_heap_path(root, rel,
+													   (Path *) copy, NULL,
+													   1.0, 0));
+		if (rel->consider_parallel && rel->lateral_relids == NULL)
+			create_partial_bitmap_paths(root, rel, (Path *) copy);
+	}
+}
+
+/*
  * Each plain lion path of rel with a remainder noted pays it, and is offered
  * again with the bitmap heap scan of the same index path beside it, which
  * add_path() may have discarded for the plain one - the paths added here are
@@ -5049,6 +5141,9 @@ lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 
 	if (lion_prev_set_rel_pathlist_hook != NULL)
 		lion_prev_set_rel_pathlist_hook(root, rel, rti, rte);
+
+	/* the bitmap heap scans that do not filter by positions, without it */
+	lion_bitmap_offer_credited(root, rel);
 
 	/* last, so that every hook's parameterized paths are there to reprice */
 	lion_skew_reprice_params(root, rel);

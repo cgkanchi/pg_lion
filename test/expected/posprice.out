@@ -177,6 +177,98 @@ SELECT count(*) FROM pq_fact f JOIN pq_dim d ON f.fk = d.pk
 (1 row)
 
 DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN EXECUTE 'RESET enable_eager_aggregate'; END IF; END$$;
+/*
+ * A bitmap scan of two quals or more intersects their sets and leaves a
+ * phrase's superset to the heap's recheck: it runs no position filter, and
+ * is not priced for one.  A plain scan of the same quals decides the phrase
+ * from positions and keeps that price.  `p3` is in a fiftieth of the rows;
+ * `alpha` and `beta` in most, the phrase in fewer.  The wide index answers
+ * both quals, the narrow one `t` only, with the phrase tested on the heap.
+ */
+SELECT setseed(0.5);
+ setseed 
+---------
+ 
+(1 row)
+
+CREATE TABLE pq_wide (id int, t tsvector, f tsvector) WITH (autovacuum_enabled = off);
+INSERT INTO pq_wide
+SELECT i, to_tsvector('simple', 'p' || (i % 50) || ' q' || (i % 7)),
+	(SELECT to_tsvector('simple', string_agg(CASE WHEN r < 0.12 THEN 'alpha'
+			WHEN r < 0.24 THEN 'beta' ELSE 'w' || (r * 1000)::int END, ' '))
+	 FROM (SELECT random() AS r FROM generate_series(1, 12) k WHERE k > i * 0) s)
+FROM generate_series(1, 50000) i;
+CREATE INDEX pq_wide_tf ON pq_wide USING lion (t, f);
+CREATE INDEX pq_wide_t ON pq_wide USING lion (t);
+VACUUM (FREEZE, ANALYZE) pq_wide;
+CREATE FUNCTION pq_wide_scans(q text, bitmap bool) RETURNS TABLE (node text, idx text, cost float8)
+LANGUAGE plpgsql AS $$
+DECLARE
+	e jsonb;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	-- both, as a call inside a transaction sees the one before it's
+	PERFORM set_config('enable_indexscan', CASE WHEN bitmap THEN 'off' ELSE 'on' END, true);
+	PERFORM set_config('enable_bitmapscan', CASE WHEN bitmap THEN 'on' ELSE 'off' END, true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO e;
+	RETURN QUERY SELECT x->>'Node Type', x->>'Index Name', (x->>'Total Cost')::float8
+		FROM jsonb_path_query(e, 'strict $.** ? (exists (@."Index Name"))') x;
+END $$;
+-- chosen: the wide index's bitmap, for a literal phrase and for a STABLE call
+SELECT node, idx FROM pq_wide_scans($q$SELECT id FROM pq_wide
+	WHERE t @@ 'p3'::tsquery AND f @@ 'alpha <-> beta'::tsquery$q$, true);
+       node        |    idx     
+-------------------+------------
+ Bitmap Index Scan | pq_wide_tf
+(1 row)
+
+SET default_text_search_config = 'simple';
+SELECT node, idx FROM pq_wide_scans($q$SELECT id FROM pq_wide
+	WHERE t @@ 'p3'::tsquery AND f @@ phraseto_tsquery('alpha beta')$q$, true);
+       node        |    idx     
+-------------------+------------
+ Bitmap Index Scan | pq_wide_tf
+(1 row)
+
+-- the plain scan of the wide index pays the filter the bitmap does not run,
+-- the literal and the STABLE call alike
+BEGIN;
+DROP INDEX pq_wide_t;
+SELECT p.cost > b.cost * 3 AS plain_pays_positions
+FROM pq_wide_scans($q$SELECT id FROM pq_wide
+	WHERE t @@ 'p3'::tsquery AND f @@ 'alpha <-> beta'::tsquery$q$, false) p,
+	pq_wide_scans($q$SELECT id FROM pq_wide
+	WHERE t @@ 'p3'::tsquery AND f @@ 'alpha <-> beta'::tsquery$q$, true) b;
+ plain_pays_positions 
+----------------------
+ t
+(1 row)
+
+SELECT p.cost > b.cost * 3 AS plain_pays_positions
+FROM pq_wide_scans($q$SELECT id FROM pq_wide
+	WHERE t @@ 'p3'::tsquery AND f @@ phraseto_tsquery('alpha beta')$q$, false) p,
+	pq_wide_scans($q$SELECT id FROM pq_wide
+	WHERE t @@ 'p3'::tsquery AND f @@ phraseto_tsquery('alpha beta')$q$, true) b;
+ plain_pays_positions 
+----------------------
+ t
+(1 row)
+
+ROLLBACK;
+RESET default_text_search_config;
+-- the same rows as a sequential scan
+SELECT (SELECT count(*) FROM pq_wide
+		WHERE t @@ 'p3'::tsquery AND f @@ 'alpha <-> beta'::tsquery) =
+	   (SELECT count(*) FROM (SELECT t, f FROM pq_wide OFFSET 0) s
+		WHERE t @@ 'p3'::tsquery AND f @@ 'alpha <-> beta'::tsquery) AS same_rows;
+ same_rows 
+-----------
+ t
+(1 row)
+
+DROP FUNCTION pq_wide_scans(text, bool);
+DROP TABLE pq_wide;
 DROP FUNCTION pq_plan(text);
 DROP FUNCTION pq_cost(text, text);
 DROP FUNCTION pq_count(text, text);
