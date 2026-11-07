@@ -413,9 +413,10 @@ visibility map (`Visibility Map Checks`, `Pages Pinned`); with `TIMING` on, also
 `Join Lookup Time`, `Join Count Time`, `Fact Filter Locate Time` (the fact filters located, a range
 among them collected into memory, which can be most of a run) and `Fact Filter Collect Time`, summed
 over parallel workers and the partitions of a partitioned fact table. When the dimension's keys
-repeat (`Join Keys: distinct, sorted`), a parallel plan runs the dimension's plan once, in one
-process, which sorts the keys and shares the distinct ones with the others while they wait (`Join
-Key Set Builds`, one a run).
+repeat (`Join Keys: distinct, sorted`), a parallel plan whose workers start runs the dimension's
+plan once, in one process, which sorts the keys and shares the distinct ones with the others while
+they wait (`Join Key Set Builds`, one a run); a run without workers sorts them in the leader, and
+shows no such line.
 A join whose result is counts alone (no `GROUP BY`, no dimension column in the output) adds the
 dimension rows' counts up inside the node and hands up one row per process.
 

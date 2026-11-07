@@ -991,7 +991,26 @@ lion_shared_keys_empty(LionCountScanState *st, LionSharedKeys *ks)
 
 	pg_atomic_write_u32(&ks->builder, 0);
 	ks->done = false;
-	oldcxt = MemoryContextSwitchTo(st->css.ss.ps.state->es_query_cxt);
+
+	/*
+	 * The accessor, and the read buffer it grows, live in a context of their
+	 * own, emptied when a rescan makes the set again: sts_initialize() hands
+	 * out a new accessor each time, and core has no call that frees one.  No
+	 * row of the last run's is left in the slot that read it.
+	 */
+	if (js->sort.stscxt == NULL)
+		js->sort.stscxt =
+			AllocSetContextCreate(st->css.ss.ps.state->es_query_cxt,
+								  "lion shared key set",
+								  ALLOCSET_SMALL_SIZES);
+	else
+	{
+		if (js->sort.mslot != NULL)
+			ExecClearTuple(js->sort.mslot);
+		js->sort.sts = NULL;
+		MemoryContextReset(js->sort.stscxt);
+	}
+	oldcxt = MemoryContextSwitchTo(js->sort.stscxt);
 	js->sort.sts = sts_initialize(LION_SHARED_KEYS_STS(ks), 1, 0, 0, 0,
 								  &ks->fileset, "lionkeys");
 	MemoryContextSwitchTo(oldcxt);

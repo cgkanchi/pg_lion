@@ -2402,7 +2402,8 @@ typedef struct LionJoinSort
 	bool		havestats;
 	TuplesortInstrumentation stats;
 	struct LionSharedKeys *shkeys;
-	SharedTuplestoreAccessor *sts;
+	SharedTuplestoreAccessor *sts;	/* in stscxt, made again each run */
+	MemoryContext stscxt;
 	TupleTableSlot *mslot;
 	bool		shared;
 	int64		builds;

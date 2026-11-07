@@ -12987,7 +12987,8 @@ it in another; an EXISTS with one is not pulled up to a semi join at all, an IN 
 run once that cannot happen any more, but the refusal stays: a plan run without its workers still
 sorts in the leader alone, and nothing has measured the volatile case. `Join Keys Looked Up` summed
 over the participants is the distinct keys exactly, which the tests check, and over rescans of the
-Gather each run's.
+Gather each run's - of an unpartitioned fact table: over a partitioned one, a key is looked up in
+the partitions in turn until one holds it (`lion_join_count_parts()`), so the sum can be more.
 
 ### One sort per query (2026-11-07)
 
