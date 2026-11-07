@@ -934,7 +934,7 @@ lion_join_part_maybe_switch(LionCountScanState *st, int p)
  * the run is reset (lion_reset_run()).
  */
 static void
-lion_join_sort_keys(LionCountScanState *st)
+lion_join_sort_child(LionCountScanState *st)
 {
 	LionJoinState *js = lion_st_join(st);
 	EState	   *estate = st->css.ss.ps.state;
@@ -965,44 +965,29 @@ lion_join_sort_keys(LionCountScanState *st)
 	tuplesort_performsort(js->sort.tuplesort);
 	tuplesort_get_stats(js->sort.tuplesort, &js->sort.stats);
 	js->sort.havestats = true;
-	js->sort.done = true;
 }
 
 /*
- * The next distinct key of the sorted child rows, as the row that carries it,
- * or NULL when there are no more.  A row whose key the sort operator's
- * equality - the join operator's, for the key's type - finds equal to the
- * previous distinct key's is skipped: its fact rows are that key's, and have
- * been counted.
- *
- * In a parallel plan every participant has sorted every row, so the distinct
- * keys come out in the same sequence in each, and they are divided by their
- * position in it: a participant counts the keys of the runs of
- * LION_FKJOIN_UNIQUE_CHUNK it claims from the shared counter, and passes over
- * the others, which another participant claimed.  A participant claims the
- * run after its last one only once it has finished that one, so the counter
- * never gives out a run behind the participant's position, and every run is
- * counted by exactly one of them - however many start, and whether the leader
- * takes part or not.  A plan run without its workers, or a node that is not
- * parallel-aware, has no shared counter and counts every key.
+ * The next distinct key of the sorted child rows, into prevkey (in sort.cxt),
+ * or false when there are no more.  A key the sort operator's equality - the
+ * join operator's, for the key's type - finds equal to the previous distinct
+ * key is skipped: its fact rows are that key's.
  */
-static TupleTableSlot *
-lion_join_next_key(LionCountScanState *st)
+static bool
+lion_join_sorted_next(LionCountScanState *st)
 {
 	LionJoinState *js = lion_st_join(st);
-	TupleTableSlot *slot = js->sort.slot;
 
 	for (;;)
 	{
 		Datum		key;
 		bool		isnull;
-		int64		chunk;
 		MemoryContext oldcxt;
 
 		CHECK_FOR_INTERRUPTS();
 		if (!tuplesort_getdatum(js->sort.tuplesort, true, false, &key, &isnull,
 								NULL))
-			return NULL;
+			return false;
 		Assert(!isnull);
 		if (js->sort.haveprev &&
 			DatumGetBool(FunctionCall2Coll(&js->sort.eqfn, js->sort.coll,
@@ -1010,12 +995,197 @@ lion_join_next_key(LionCountScanState *st)
 			continue;
 
 		/* the sort's copy lasts until the next key: keep one of our own */
-		ExecClearTuple(slot);
+		ExecClearTuple(js->sort.slot);
 		MemoryContextReset(js->sort.cxt);
 		oldcxt = MemoryContextSwitchTo(js->sort.cxt);
 		js->sort.prevkey = datumCopy(key, js->keybyval, js->keylen);
 		MemoryContextSwitchTo(oldcxt);
 		js->sort.haveprev = true;
+		return true;
+	}
+}
+
+/* prevkey as the key column of the sort's slot, the child's shape */
+static TupleTableSlot *
+lion_join_key_slot(LionCountScanState *st)
+{
+	LionJoinState *js = lion_st_join(st);
+	TupleTableSlot *slot = js->sort.slot;
+
+	ExecClearTuple(slot);
+	memset(slot->tts_isnull, true,
+		   sizeof(bool) * slot->tts_tupleDescriptor->natts);
+	slot->tts_values[js->keyresno - 1] = js->sort.prevkey;
+	slot->tts_isnull[js->keyresno - 1] = false;
+	return ExecStoreVirtualTuple(slot);
+}
+
+/* The wait for the shared key set, as pg_stat_activity names it. */
+static uint32
+lion_join_keys_wait_event(void)
+{
+#if PG_VERSION_NUM >= 170000
+	static uint32 event = 0;
+
+	if (event == 0)
+		event = WaitEventExtensionNew("LionJoinKeySetBuild");
+	return event;
+#else
+	return PG_WAIT_EXTENSION;
+#endif
+}
+
+/*
+ * Does this participant read the run's keys from the shared key set
+ * (DESIGN.md §27, "One sort per query")?  A worker always does - the leader
+ * made the set in the DSM it attached - and the leader once any worker has
+ * started: a plan run without its workers sorts the keys itself, as a serial
+ * one does.
+ */
+static bool
+lion_join_shares_keys(LionCountScanState *st)
+{
+	LionJoinState *js = lion_st_join(st);
+
+	if (js->sort.shkeys == NULL || js->sort.sts == NULL)
+		return false;
+	if (IsParallelWorker())
+		return true;
+	return js->pcopy.pcxt != NULL && js->pcopy.pcxt->nworkers_launched > 0;
+}
+
+/*
+ * The shared key set (LionSharedKeys): built by the first participant to get
+ * here - the child run and its keys sorted, as a serial node does, and each
+ * distinct key written, in order, to the shared store as a row of the child's
+ * shape - and waited for by the others; then read by all of them, each
+ * claiming chunks of it in turn (lion_join_next_key()).
+ */
+static void
+lion_join_share_keys(LionCountScanState *st)
+{
+	LionJoinState *js = lion_st_join(st);
+	LionSharedKeys *ks = js->sort.shkeys;
+	uint32		expected = 0;
+
+	if (pg_atomic_compare_exchange_u32(&ks->builder, &expected, 1))
+	{
+		lion_join_sort_child(st);
+		while (lion_join_sorted_next(st))
+		{
+			TupleTableSlot *slot = lion_join_key_slot(st);
+			bool		shouldfree;
+			MinimalTuple tup = ExecFetchSlotMinimalTuple(slot, &shouldfree);
+
+			sts_puttuple(js->sort.sts, NULL, tup);
+			if (shouldfree)
+				pfree(tup);
+		}
+		sts_end_write(js->sort.sts);
+		tuplesort_end(js->sort.tuplesort);
+		js->sort.tuplesort = NULL;
+
+		/*
+		 * Only a finished build wakes the others.  One that fails ends the
+		 * query: its error goes up in this participant, and from a worker to
+		 * the leader, which rethrows it from its own wait if it is waiting
+		 * (ConditionVariableSleep() answers interrupts) and whose abort ends
+		 * the workers that are.
+		 */
+		SpinLockAcquire(&ks->mutex);
+		ks->done = true;
+		SpinLockRelease(&ks->mutex);
+		ConditionVariableBroadcast(&ks->cv);
+		js->sort.builds++;
+	}
+	else
+	{
+		ConditionVariablePrepareToSleep(&ks->cv);
+		for (;;)
+		{
+			bool		done;
+
+			SpinLockAcquire(&ks->mutex);
+			done = ks->done;
+			SpinLockRelease(&ks->mutex);
+			if (done)
+				break;
+			ConditionVariableSleep(&ks->cv, lion_join_keys_wait_event());
+		}
+		ConditionVariableCancelSleep();
+	}
+	sts_begin_parallel_scan(js->sort.sts);
+	js->sort.shared = true;
+	js->sort.haveprev = false;
+}
+
+static void
+lion_join_sort_keys(LionCountScanState *st)
+{
+	LionJoinState *js = lion_st_join(st);
+
+	if (lion_join_shares_keys(st))
+		lion_join_share_keys(st);
+	else
+		lion_join_sort_child(st);
+	js->sort.done = true;
+}
+
+/*
+ * The next distinct key, as the row that carries it, or NULL when there are
+ * no more.
+ *
+ * Read from the shared key set (sort.shared), the keys are distinct already
+ * and each participant's come in the chunks of the store it claims: every key
+ * to exactly one participant, however many start, and whether the leader
+ * takes part or not.
+ *
+ * Sorted here, in a plan run without its workers, the keys are divided by
+ * their position in the sorted sequence: a participant counts the keys of the
+ * runs of LION_FKJOIN_UNIQUE_CHUNK it claims from the shared counter, and
+ * passes over the others.  A participant claims the run after its last one
+ * only once it has finished that one, so the counter never gives out a run
+ * behind its position.  A node that is not parallel-aware has no shared
+ * counter and counts every key.
+ */
+static TupleTableSlot *
+lion_join_next_key(LionCountScanState *st)
+{
+	LionJoinState *js = lion_st_join(st);
+
+	if (js->sort.shared)
+	{
+		MinimalTuple tup;
+		Datum		key;
+		bool		isnull;
+		MemoryContext oldcxt;
+
+		CHECK_FOR_INTERRUPTS();
+		tup = sts_parallel_scan_next(js->sort.sts, NULL);
+		if (tup == NULL)
+			return NULL;
+		ExecStoreMinimalTuple(tup, js->sort.mslot, false);
+		key = slot_getattr(js->sort.mslot, js->keyresno, &isnull);
+		if (isnull)
+			elog(ERROR, "LionCount: a NULL key in the shared key set");
+
+		/* the store's buffer lasts until the next key: keep one of our own */
+		ExecClearTuple(js->sort.slot);
+		MemoryContextReset(js->sort.cxt);
+		oldcxt = MemoryContextSwitchTo(js->sort.cxt);
+		js->sort.prevkey = datumCopy(key, js->keybyval, js->keylen);
+		MemoryContextSwitchTo(oldcxt);
+		ExecClearTuple(js->sort.mslot);
+		js->sort.haveprev = true;
+		return lion_join_key_slot(st);
+	}
+
+	for (;;)
+	{
+		int64		chunk;
+
+		if (!lion_join_sorted_next(st))
+			return NULL;
 
 		chunk = js->sort.keypos++ / LION_FKJOIN_UNIQUE_CHUNK;
 		if (st->shared != NULL)
@@ -1026,12 +1196,7 @@ lion_join_next_key(LionCountScanState *st)
 			if (js->sort.chunk != chunk)
 				continue;
 		}
-
-		memset(slot->tts_isnull, true,
-			   sizeof(bool) * slot->tts_tupleDescriptor->natts);
-		slot->tts_values[js->keyresno - 1] = js->sort.prevkey;
-		slot->tts_isnull[js->keyresno - 1] = false;
-		return ExecStoreVirtualTuple(slot);
+		return lion_join_key_slot(st);
 	}
 }
 

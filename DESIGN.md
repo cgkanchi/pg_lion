@@ -12971,23 +12971,65 @@ counted by both, its fact rows twice. Three plans were measured (the table below
   cheapest path. It divides only the dimension scan, which is the small part: 118.6 ms against the
   serial node's 118.5 for the first row of the table, 98.4 against 94.7, 142.0 against 141.7, 435.9
   against 441.5 and 460.2 against 434.9 for the 139,929 and 199,000 rows - no gain anywhere;
-- **the keys partitioned** (taken): every participant runs the dimension's WHOLE plan - its cheapest
-  path that may run in a worker, which is not its cheapest path when that is a Gather - and sorts all
-  of the keys, so that all of them have the same sorted sequence of distinct keys, and they divide it
-  by position in runs of `LION_FKJOIN_UNIQUE_CHUNK` (64), each claimed from an atomic counter in the
-  Gather's dynamic shared memory. A participant claims the run after its last one only once it has
-  finished that one, so the counter never gives out a run behind the participant's position, and
-  every run is counted by exactly one participant, however many start and whether the leader takes
-  part; a plan run without its workers counts every key in the leader, and a rescan's
-  `ReInitializeDSMCustomScan` sets the counter back to the first run. The child, the sort and the
-  copy of the fact filters are every participant's, as a hash join's table below a Gather is, and
-  are charged so; the counts are divided. 1.2 to 2.3 times faster than serial on four shared cores.
+- **the keys partitioned** (taken): the node runs over the dimension's WHOLE plan - its cheapest
+  path that may run in a worker, which is not its cheapest path when that is a Gather - and the
+  sorted sequence of distinct keys is divided among the participants. Until 2026-11-07 every
+  participant ran that whole child and sorted all of its keys, and they divided the sequence by
+  position in runs of `LION_FKJOIN_UNIQUE_CHUNK` (64) claimed from an atomic counter. Now the child
+  runs once ("One sort per query", below). The child and the sort are charged in full, as a hash
+  join's table below a Gather is (one participant runs them while the others wait, so the plan's
+  elapsed cost carries all of it); the counts are divided. 1.2 to 2.3 times faster than serial on
+  four shared cores, measured when every participant still ran the child.
 
-Every participant has to see the same rows, so the parallel path is not offered when a dimension
-qual has a volatile function in it (which could keep a row in one participant and drop it in
-another; an EXISTS with one is not pulled up to a semi join at all, an IN is). `Join Keys Looked Up`
-summed over the participants is then the distinct keys exactly, which the tests check, and over
-rescans of the Gather each run's.
+Every participant used to see the child's rows for itself, so the parallel path is not offered when
+a dimension qual has a volatile function in it (which could keep a row in one participant and drop
+it in another; an EXISTS with one is not pulled up to a semi join at all, an IN is). With the child
+run once that cannot happen any more, but the refusal stays: a plan run without its workers still
+sorts in the leader alone, and nothing has measured the volatile case. `Join Keys Looked Up` summed
+over the participants is the distinct keys exactly, which the tests check, and over rescans of the
+Gather each run's.
+
+### One sort per query (2026-11-07)
+
+Every participant of a parallel forward semi join used to run the whole child, side by side with
+the others, so a child that costs more than the counts made the plan spend most of its time - and
+its buffer hits, times the participants - on the same rows. Running the child in every participant
+was the price of dividing its sorted keys by position. Now it runs once (`lion_join_share_keys()`,
+lion_exec_fkjoin.c; `LionSharedKeys`):
+
+- **When.** A parallel-aware node over a forward semi join's keys, in a Gather whose workers
+  started and whose DSM was made. A plan run without its workers sorts in the leader, as a serial
+  plan does, and divides the keys by position as before (it is the only participant).
+- **Built once.** The first participant to want the keys claims the build from an atomic flag, runs
+  the child, sorts its keys within `work_mem` as the serial node does, and writes each DISTINCT key,
+  in order, to a `SharedTuplestore` in a `SharedFileSet` of the plan's DSM - as a row of the child's
+  shape, all columns but the key NULL. The others wait on a condition variable (wait event
+  `LionJoinKeySetBuild` from PostgreSQL 17, `Extension` before) until it says the store is written.
+  A participant that starts late finds it done, or waits.
+- **Divided.** Every participant then reads the store with `sts_parallel_scan_next()`, which hands
+  out its 32 kB chunks one participant at a time: every key goes to exactly one participant, and
+  each participant's keys come in ascending runs, which keeps the lookups in index order. The
+  dedup is the serial node's (the sort operator's equality, so a nondeterministic collation's
+  equal keys are one key), done once by the builder.
+- **Why it is the same count.** The keys are the serial node's distinct keys, from one run of the
+  child under the query's snapshot, and each is counted by exactly one participant against its own
+  located fk set, as before; only which participant counts which key changed.
+- **Errors, cancels and rescans.** Only a finished build wakes the waiters. A build that fails ends
+  the query: a worker's error is rethrown in the leader - from its own wait, if it is waiting, since
+  a condition variable's sleep answers interrupts - and the leader's abort ends the workers that
+  wait. A rescan's `ReInitializeDSMCustomScan` ends the leader's read, deletes the store's files and
+  makes it empty again, and the next run builds it again with its own parameters. A participant's
+  read ends when it shuts down, before the Gather detaches the DSM.
+- **EXPLAIN ANALYZE.** `Join Child Rows` is the one run's rows, where it was the dimension's rows
+  times the participants; `Join Keys Sorted` the builder's sort, summed over the runs; and `Join Key
+  Set Builds`, new, how many runs built a shared set (one a run).
+- **Cost.** Unchanged: the child and the sort were already charged in full to the elapsed cost.
+  The store's write and read (about 24 bytes a key of an `int8` key in temporary files, read back
+  once) are not priced.
+- **Measured** (PostgreSQL 18, four cores, three workers and the leader; an EXISTS over a 3M-row
+  dimension with a CPU-heavy filter, 1.8M distinct keys, against a 24M-row fact): 4.45 s before,
+  3.5 s after; `Join Child Time` summed over the participants 6.8 s before, 1.6 s after, the same
+  count. The gain grows with the participants, since every one of them ran the child before.
 
 **Cost.** The child's total cost and the sort's are the node's startup: `LION_FKJOIN_SORT_COMPARE_COST`
 (a quarter of a `cpu_operator_cost`) a comparison, N log2 N of them, and `LION_FKJOIN_SORT_KEY_COST`

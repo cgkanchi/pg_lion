@@ -767,7 +767,16 @@ lion_reset_run(LionCountScanState *st)
 		/* ... and the account of a plan that probes them, begun again */
 		lion_join_switch_reset(st);
 
-		/* ... and a forward semi join's sorted keys, sorted again next run. */
+		/*
+		 * ... and a forward semi join's sorted keys, sorted again next run -
+		 * or this participant's read of the shared key set ended, the set
+		 * built again before the next (lion_reinitialize_dsm()).
+		 */
+		if (js->sort.shared)
+		{
+			sts_end_parallel_scan(js->sort.sts);
+			js->sort.shared = false;
+		}
 		if (js->sort.tuplesort != NULL)
 		{
 			tuplesort_end(js->sort.tuplesort);
@@ -943,7 +952,7 @@ lion_rescan_custom_scan(CustomScanState *node)
  * none of these, or one run without a Gather, never gets here.
  */
 static Size
-lion_dsm_counted_off(LionCountScanState *st)
+lion_dsm_keys_off(LionCountScanState *st)
 {
 	LionJoinState *js;
 
@@ -953,6 +962,39 @@ lion_dsm_counted_off(LionCountScanState *st)
 	return MAXALIGN(sizeof(LionJoinShared)) +
 		(Size) ((js->collect && st->npart > 0) ? st->npart : 1) *
 		lion_shared_copy_size();
+}
+
+/*
+ * ... then a forward semi join's shared key set (DESIGN.md §27, "One sort per
+ * query"), and its store ...
+ */
+static Size
+lion_dsm_counted_off(LionCountScanState *st)
+{
+	Size		off = lion_dsm_keys_off(st);
+
+	if (st->join != NULL && st->join->sort.unique)
+		off += MAXALIGN(LION_SHARED_KEYS_SIZE);
+	return off;
+}
+
+/*
+ * The shared key set as it is before anyone builds it: no builder, nothing
+ * written, the store empty.  The leader's accessor of it is made here too,
+ * in the query's memory, which outlives the runs.
+ */
+static void
+lion_shared_keys_empty(LionCountScanState *st, LionSharedKeys *ks)
+{
+	LionJoinState *js = lion_st_join(st);
+	MemoryContext oldcxt;
+
+	pg_atomic_write_u32(&ks->builder, 0);
+	ks->done = false;
+	oldcxt = MemoryContextSwitchTo(st->css.ss.ps.state->es_query_cxt);
+	js->sort.sts = sts_initialize(LION_SHARED_KEYS_STS(ks), 1, 0, 0, 0,
+								  &ks->fileset, "lionkeys");
+	MemoryContextSwitchTo(oldcxt);
 }
 
 /*
@@ -1040,6 +1082,29 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	 */
 	if (js != NULL)
 		js->pcopy.pcxt = pcxt;
+
+	/*
+	 * A forward semi join's key set, built once by whichever participant
+	 * wants it first: in files of a set of its own, which go when the last
+	 * process detaches from the DSM.  Not where the DSM could not be made,
+	 * and the plan runs in the leader alone, which sorts the keys itself.
+	 */
+	if (js != NULL && js->sort.unique && pcxt->seg != NULL)
+	{
+		LionSharedKeys *ks;
+
+		shared->keysoff = lion_dsm_keys_off(st);
+		ks = LION_JOIN_SHARED_KEYS(shared);
+		memset(ks, 0, sizeof(LionSharedKeys));
+		pg_atomic_init_u32(&ks->builder, 0);
+		SpinLockInit(&ks->mutex);
+		ConditionVariableInit(&ks->cv);
+		ks->seg = dsm_segment_handle(pcxt->seg);
+		SharedFileSetInit(&ks->fileset, pcxt->seg);
+		js->sort.shkeys = ks;
+		lion_shared_keys_empty(st, ks);
+	}
+
 	if (collect && pcxt->seg != NULL && js->part.leaf == NULL)
 	{
 		lion_shared_copy_init(LION_JOIN_SHARED_COPY(shared), pcxt->seg,
@@ -1108,6 +1173,23 @@ lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	shared->sorted = 0;
 	SpinLockRelease(&shared->mutex);
 
+	/*
+	 * A forward semi join's shared key set: the leader's read of the last one
+	 * closed - its own node's rescan may come after this - its files deleted,
+	 * and the set built again by the next run, whose parameters may be
+	 * others.
+	 */
+	if (js != NULL && js->sort.shkeys != NULL)
+	{
+		if (js->sort.shared)
+		{
+			sts_end_parallel_scan(js->sort.sts);
+			js->sort.shared = false;
+		}
+		SharedFileSetDeleteAll(&js->sort.shkeys->fileset);
+		lion_shared_keys_empty(st, js->sort.shkeys);
+	}
+
 	/* a parallel GROUP BY's or count's ranges, cut again over the heap now */
 	if (st->ranged != NULL)
 		shared->nranges = lion_key_ranges(RelationGetNumberOfBlocks(st->heap),
@@ -1166,6 +1248,22 @@ lion_initialize_worker(CustomScanState *node, shm_toc *toc, void *coordinate)
 	if (st->shared->nclause != st->nclause)
 		elog(ERROR, "LionCount: a worker of %d clauses, the plan's %d",
 			 st->nclause, st->shared->nclause);
+
+	/* a forward semi join's shared key set, and the file set of its store */
+	if (js != NULL && LION_JOIN_SHARED_KEYS(st->shared) != NULL)
+	{
+		LionSharedKeys *ks = LION_JOIN_SHARED_KEYS(st->shared);
+		dsm_segment *seg = dsm_find_mapping(ks->seg);
+		MemoryContext oldcxt;
+
+		if (seg == NULL)
+			elog(ERROR, "lion index: a parallel worker has not attached its plan's shared memory");
+		SharedFileSetAttach(&ks->fileset, seg);
+		js->sort.shkeys = ks;
+		oldcxt = MemoryContextSwitchTo(node->ss.ps.state->es_query_cxt);
+		js->sort.sts = sts_attach(LION_SHARED_KEYS_STS(ks), 0, &ks->fileset);
+		MemoryContextSwitchTo(oldcxt);
+	}
 
 	/*
 	 * The fact filters' copy, and the file set its chunks may spill to: only
@@ -1259,6 +1357,13 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		lion_posting_set_release(&js->filter);
 		js->pcopy.viewshared = false;
 	}
+
+	/* ... and so does its read of the shared key set's file */
+	if (js != NULL && js->sort.shared)
+	{
+		sts_end_parallel_scan(js->sort.sts);
+		js->sort.shared = false;
+	}
 	if (js != NULL && js->part.leaf != NULL)
 	{
 		int			p;
@@ -1298,7 +1403,8 @@ lion_shutdown_custom_scan(CustomScanState *node)
 			shared->switchkeys += js->switchkeys;
 			for (i = 0; i < LION_JT_N; i++)
 				INSTR_TIME_ADD(shared->time[i], js->time[i]);
-			shared->sorted = Max(shared->sorted, js->sort.sorted);
+			shared->sorted += js->sort.sorted;
+			shared->keybuilds += js->sort.builds;
 			shared->batches += js->batch.batches;
 			shared->copies += js->pcopy.copies;
 			shared->copychunks += js->pcopy.chunks;
@@ -1341,6 +1447,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		w->filterrows = shared->filterrows;
 		w->spilled = shared->spilled;
 		w->sorted = shared->sortedruns + shared->sorted;
+		w->keybuilds = shared->keybuilds;
 		w->batches = shared->batches;
 		w->childrows = shared->childrows;
 		w->posting = shared->posting;

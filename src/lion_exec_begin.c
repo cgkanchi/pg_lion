@@ -1972,6 +1972,9 @@ lion_begin_join_distinct_key(LionCountScanState *st, EState *estate)
 		fmgr_info_cxt(get_opcode(eqop), &js->sort.eqfn, estate->es_query_cxt);
 		js->sort.slot = ExecInitExtraTupleSlot(estate, childdesc,
 											   &TTSOpsVirtual);
+		/* ... and the distinct keys read back from a shared key set */
+		js->sort.mslot = ExecInitExtraTupleSlot(estate, childdesc,
+												&TTSOpsMinimalTuple);
 		js->sort.cxt = AllocSetContextCreate(estate->es_query_cxt,
 											 "LionCount join key",
 											 ALLOCSET_SMALL_SIZES);

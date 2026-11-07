@@ -1175,14 +1175,14 @@ lion_fkjoin_dim_volatile(PlannerInfo *root, const LionFkJoin *fj)
  * the node looks up, `found` those of them expected to have fact rows at all,
  * and the child is always a whole path of the dimension, whose rows the node
  * sorts to make the keys distinct before it looks any up.  In a parallel plan
- * every participant runs that whole child and sorts all of it - a partial
+ * one participant runs that whole child and sorts all of it, and writes the
+ * distinct keys to a store the participants then divide among themselves
+ * (DESIGN.md §27, "One sort per query"; lion_join_share_keys()) - a partial
  * child would give each participant keys the others may have too, and a key
- * counted by two participants counts its fact rows twice - and the
- * participants divide the sorted, distinct keys among themselves instead, in
- * runs of LION_FKJOIN_UNIQUE_CHUNK (lion_join_next_key()).  So the child and
- * the sort are charged to every participant in full, and the lookups and
- * counts are one participant's share of the keys, as the making of the fact
- * filters' copy is.
+ * counted by two participants counts its fact rows twice.  The others wait
+ * for it, so the child and the sort are charged in full to the elapsed cost,
+ * and the lookups and counts are one participant's share of the keys, as
+ * the making of the fact filters' copy is.
  *
  * The node streams one row per dimension row that joins (a partial count, or
  * the row itself for count(DISTINCT)), so it starts when its child does, and
