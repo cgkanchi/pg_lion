@@ -425,8 +425,8 @@ SELECT lion_nj_sortcost(q, '80kB') = lion_nj_sortcost(q, '64MB') AS fits_in_80kb
   FROM (VALUES ('SELECT count(*) FROM lion_nf f WHERE f.fk IN (SELECT d.k FROM lion_ndh d)')) v(q);
 DROP FUNCTION lion_nj_sortcost(text, text);
 
--- ---- 7. parallel: every participant sorts all the keys, and they divide the
--- distinct ones among themselves ---------------------------------------------------
+-- ---- 7. parallel: one participant runs the child and sorts the keys, and they
+-- all divide the distinct ones among themselves -------------------------------------
 SET max_parallel_workers_per_gather = 2;
 SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
@@ -511,16 +511,28 @@ SELECT lion_nj_par('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SEL
 SELECT lion_nj_par('SELECT count(DISTINCT f.fk) FROM lion_nf f WHERE f.fk IN (SELECT d.k FROM lion_nd d WHERE d.attr < 4)');
 SELECT lion_nj_par('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk) HAVING count(*) > 100');
 -- each distinct key is looked up once, by whichever participant claimed its
--- run; every participant sorted all of them
+-- chunk of the shared key set; the child ran once, and its keys were sorted
+-- once, by the participant that built the set
 SELECT lion_nj_counter('SELECT count(*) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)', 'Join Keys Looked Up')
 	= (SELECT count(DISTINCT k) FROM lion_nd) AS one_lookup_a_key,
 	   lion_nj_counter('SELECT count(*) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)', 'Join Keys Sorted')
-	= (SELECT count(k) FROM lion_nd) AS every_key_sorted;
+	= (SELECT count(k) FROM lion_nd) AS every_key_sorted_once,
+	   lion_nj_counter('SELECT count(*) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)', 'Join Child Rows')
+	= (SELECT count(*) FROM lion_nd) AS child_ran_once,
+	   lion_nj_counter('SELECT count(*) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)', 'Join Key Set Builds') AS key_set_builds;
+-- ... and the same over a key with many duplicates and NULLs, and with the
+-- fact filters collected into their shared copy as well
+SELECT lion_nj_counter('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_ndh d WHERE d.k = f.fk)', 'Join Keys Looked Up')
+	= (SELECT count(DISTINCT k) FROM lion_ndh) AS one_lookup_a_key,
+	   lion_nj_counter('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_ndh d WHERE d.k = f.fk)', 'Join Child Rows')
+	= (SELECT count(*) FROM lion_ndh) AS child_ran_once;
 -- with the leader taking part too
 SET parallel_leader_participation = on;
 SELECT lion_nj_par('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk AND d.region = ''eu'')');
 SELECT lion_nj_counter('SELECT count(*) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)', 'Join Keys Looked Up')
-	= (SELECT count(DISTINCT k) FROM lion_nd) AS one_lookup_a_key;
+	= (SELECT count(DISTINCT k) FROM lion_nd) AS one_lookup_a_key,
+	   lion_nj_counter('SELECT count(*) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)', 'Join Child Rows')
+	= (SELECT count(*) FROM lion_nd) AS child_ran_once;
 SET parallel_leader_participation = off;
 -- a generic plan's parameters, evaluated in every participant
 SELECT lion_nj_prep('SELECT count(*) FROM lion_nf f WHERE f.x = $1 AND EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk AND d.region = $2)', '3, ''eu''');
@@ -534,7 +546,8 @@ SELECT lion_nj_par('SELECT g, s.c FROM generate_series(1, 4) g LEFT JOIN (SELECT
 SELECT lion_nj_counter('SELECT g, s.c FROM generate_series(1, 4) g LEFT JOIN (SELECT count(*) AS c FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)) s ON s.c > g', 'Join Keys Looked Up')
 	= 4 * (SELECT count(DISTINCT k) FROM lion_nd) AS one_lookup_a_key_a_run,
 	   lion_nj_counter('SELECT g, s.c FROM generate_series(1, 4) g LEFT JOIN (SELECT count(*) AS c FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)) s ON s.c > g', 'Join Keys Sorted')
-	= 4 * (SELECT count(k) FROM lion_nd) AS every_key_sorted_a_run;
+	= 4 * (SELECT count(k) FROM lion_nd) AS every_key_sorted_once_a_run,
+	   lion_nj_counter('SELECT g, s.c FROM generate_series(1, 4) g LEFT JOIN (SELECT count(*) AS c FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)) s ON s.c > g', 'Join Key Set Builds') AS key_set_builds;
 RESET enable_material;
 RESET enable_memoize;
 -- a volatile dimension filter could keep a row in one participant and drop it

@@ -156,9 +156,11 @@
 
 #include "port/atomics.h"
 #include "port/pg_bitutils.h"
+#include "storage/condition_variable.h"
 #include "storage/predicate.h"
 #include "storage/shm_toc.h"
 #include "storage/spin.h"
+#include "utils/sharedtuplestore.h"
 #include "utils/tuplesort.h"
 
 #include "lion.h"
@@ -399,11 +401,10 @@
 /*
  * How many distinct keys of a forward semi join over a non-unique key
  * (DESIGN.md §27, "Forward semi joins over a non-unique key") a participant of
- * a parallel plan claims at a time.  Every participant sorts all of the keys,
- * and they divide the sorted, distinct sequence between them in runs of this
- * many, each run counted by the one participant that claimed it: a count is 3
- * to 10 us, so a run is a fraction of a millisecond, and a participant that
- * finishes early is never more than one run behind the others.
+ * a parallel plan claims at a time when it has sorted all of the keys itself:
+ * a plan run without its workers, the one way left that does (the shared key
+ * set, LionSharedKeys, is divided by its own chunks).  A count is 3 to 10 us,
+ * so a run is a fraction of a millisecond.
  */
 #define LION_FKJOIN_UNIQUE_CHUNK	64
 
@@ -2371,10 +2372,17 @@ typedef struct LionFactGroupState
  * first, a datum sort by op under coll, and a key eqfn finds equal to the
  * previous distinct one, prevkey (in cxt), is skipped; each distinct key is
  * handed on as the key column of slot, a row of the child's shape whose other
- * columns nothing reads.  keypos numbers the distinct keys, and in a parallel
- * plan chunk is the run of them this participant claimed last, -1 before the
- * first.  sorted is the keys sorted, and stats what the sort did, for EXPLAIN
- * ANALYZE.
+ * columns nothing reads.  keypos numbers the distinct keys, and in a plan run
+ * without its workers chunk is the run of them this participant claimed last,
+ * -1 before the first.  sorted is the keys sorted, and stats what the sort
+ * did, for EXPLAIN ANALYZE.
+ *
+ * In a parallel plan whose workers started the child is run and sorted ONCE
+ * (DESIGN.md §27, "One sort per query"): shkeys is the shared key set in the
+ * Gather's DSM, sts this participant's accessor of the store its distinct
+ * keys are written to, and mslot the slot of the child's shape they are read
+ * back through.  shared says this run reads them from there, and builds how
+ * many runs this participant was the one that built them.
  */
 typedef struct LionJoinSort
 {
@@ -2393,6 +2401,12 @@ typedef struct LionJoinSort
 	int64		sorted;
 	bool		havestats;
 	TuplesortInstrumentation stats;
+	struct LionSharedKeys *shkeys;
+	SharedTuplestoreAccessor *sts;	/* in stscxt, made again each run */
+	MemoryContext stscxt;
+	TupleTableSlot *mslot;
+	bool		shared;
+	int64		builds;
 } LionJoinSort;
 
 /*
@@ -2491,6 +2505,7 @@ typedef struct LionJoinWorkerSums
 	int64		filterrows;
 	int64		spilled;
 	int64		sorted;
+	int64		keybuilds;
 	int64		batches;
 	int64		copies;
 	int64		copychunks;
@@ -3679,16 +3694,49 @@ lion_st_join(LionCountScanState *st)
 }
 
 /*
+ * ONE SORT PER QUERY (DESIGN.md §27, "One sort per query").  The child of a
+ * parallel forward semi join over a non-unique key is a whole path of the
+ * dimension, not a partial one, and every participant used to run all of it
+ * and sort all of its keys, to divide the distinct ones between them: as many
+ * runs of the child as processes, each reading all it reads, side by side.
+ * Now the first participant to want the keys claims the build (builder): it
+ * runs the child, sorts its keys and writes the distinct ones, in order, to a
+ * shared tuplestore in the plan's file set, then says so (done, under mutex)
+ * and wakes the others, which wait on cv until it has.  Every participant
+ * then reads the store in parallel, each claiming its chunks of it in turn -
+ * so the keys come to each in ascending runs, one participant to a chunk, and
+ * every key to exactly one participant.  One that attaches late reads what
+ * chunks are left.  seg is the plan's DSM, which a worker attaches the file
+ * set through, and the store itself follows this struct
+ * (LION_SHARED_KEYS_STS).  An error or a cancel in any participant ends the
+ * query, a waiting one answering it in ConditionVariableSleep().
+ */
+typedef struct LionSharedKeys
+{
+	pg_atomic_uint32 builder;	/* 0 until a participant claims the build */
+	slock_t		mutex;
+	bool		done;			/* the keys are all written */
+	ConditionVariable cv;
+	dsm_handle	seg;
+	SharedFileSet fileset;
+} LionSharedKeys;
+
+#define LION_SHARED_KEYS_STS(ks) \
+	((SharedTuplestore *) ((char *) (ks) + MAXALIGN(sizeof(LionSharedKeys))))
+#define LION_SHARED_KEYS_SIZE \
+	(MAXALIGN(sizeof(LionSharedKeys)) + MAXALIGN(sts_estimate(1)))
+
+/*
  * What the participants of a parallel FK-side join add up for EXPLAIN
  * ANALYZE, in the Gather's dynamic shared memory (lion_shutdown_custom_scan()).
  * filterrows is the largest copy any participant made of the fact filters,
- * -1 when none did.  sorted is the keys a participant of this run sorted -
- * every participant sorts all of them - and sortedruns the same summed over
- * the runs before it (lion_reinitialize_dsm()).
+ * -1 when none did.  sorted is the keys the participant that sorted them
+ * this run sorted, and sortedruns the same summed over the runs before it
+ * (lion_reinitialize_dsm()); keybuilds the shared key sets the workers built.
  *
- * nextchunk is one of the two things the participants share while they run:
- * the next run of LION_FKJOIN_UNIQUE_CHUNK distinct keys of a forward semi
- * join over a non-unique key that nobody has claimed yet.  The other is the
+ * The participants share two things while they run.  One is a forward semi
+ * join's distinct keys, sorted once (keysoff: a LionSharedKeys that far into
+ * the chunk, 0 for none).  The other is the
  * fact filters' copy (copyready: a LionSharedCopy after this struct, in the
  * same DSM chunk), and copies and copychunks are what its participants
  * indexed and collected of it, summed; switches and switchkeys the copies
@@ -3721,6 +3769,7 @@ typedef struct LionJoinShared
 	int64		spilled;
 	int64		sorted;
 	int64		sortedruns;
+	int64		keybuilds;
 	int64		batches;
 	int64		childrows;
 	int64		posting;
@@ -3744,6 +3793,7 @@ typedef struct LionJoinShared
 	int			nranges;
 	uint32		ckeys;
 	bool		copyready;		/* a LionSharedCopy follows this struct */
+	Size		keysoff;		/* the LionSharedKeys, this far in, or 0 */
 	int			nclause;		/* the workers' LionClauseState.counted, */
 	Size		countedoff;		/* ORed: nclause of them, this far in
 								 * (LION_JOIN_SHARED_COUNTED) */
@@ -3987,6 +4037,9 @@ typedef struct LionAntiState
 #define LION_JOIN_SHARED_PART_COPY(shared, p) \
 	((LionSharedCopy *) ((char *) LION_JOIN_SHARED_COPY(shared) + \
 						 (Size) (p) * lion_shared_copy_size()))
+#define LION_JOIN_SHARED_KEYS(shared) \
+	((shared)->keysoff == 0 ? NULL : \
+	 (LionSharedKeys *) ((char *) (shared) + (shared)->keysoff))
 #define LION_JOIN_SHARED_COUNTED(shared) \
 	((uint8 *) ((char *) (shared) + (shared)->countedoff))
 

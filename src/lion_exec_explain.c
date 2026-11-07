@@ -1864,16 +1864,20 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 
 	/*
 	 * A forward semi join's keys: the child rows with one, sorted - by
-	 * every participant of a parallel plan, so what one of them sorted
-	 * in each run, summed over the runs - and how the sort went here,
-	 * if it ran here.  "Looked Up" below is then the DISTINCT keys,
-	 * each by one participant.
+	 * one participant of a parallel plan each run, which wrote the
+	 * distinct ones to the shared key set the others read ("One sort per
+	 * query"), so summed over the runs - how many runs did that, and how
+	 * the sort went here, if it ran here.  "Looked Up" below is then the
+	 * DISTINCT keys, each by one participant.
 	 */
 	if (js->sort.unique)
 	{
+		int64		builds = js->sort.builds + js->worker.keybuilds;
+
 		ExplainPropertyInteger("Join Keys Sorted", NULL,
-							   Max(js->sort.sorted,
-								   js->worker.sorted), es);
+							   js->sort.sorted + js->worker.sorted, es);
+		if (builds > 0)
+			ExplainPropertyInteger("Join Key Set Builds", NULL, builds, es);
 		if (js->sort.havestats)
 		{
 			ExplainPropertyText("Join Key Sort Method",
@@ -1890,9 +1894,9 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 	/*
 	 * Where a key's time goes (DESIGN.md §27): the rows the child
 	 * returned - the keys looked up, and the NULL keys, which join
-	 * nothing; every participant's, so for a forward semi join over a
-	 * non-unique key, whose participants each run the whole child,
-	 * that many times the dimension's rows - ...
+	 * nothing; every participant's, which for a forward semi join over
+	 * a non-unique key is the one run of the child that built its key
+	 * set - ...
 	 */
 	ExplainPropertyInteger("Join Child Rows", NULL,
 						   js->childrows + js->worker.childrows,
