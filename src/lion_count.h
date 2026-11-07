@@ -2393,6 +2393,8 @@ extern void lion_amcostestimate(PlannerInfo *root, IndexPath *path,
  */
 extern void lion_plain_note_remainder(PlannerInfo *root, IndexPath *path,
 									  Cost remainder);
+extern void lion_bitmap_note_credit(PlannerInfo *root, IndexPath *path,
+									Cost credit);
 extern void lion_plain_pay_remainders(PlannerInfo *root, RelOptInfo *rel,
 									  RangeTblEntry *rte);
 
