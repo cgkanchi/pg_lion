@@ -12,6 +12,7 @@
 #include "postgres.h"
 
 #include "pgstat.h"
+#include "utils/wait_event.h"
 
 #include "lion_customscan.h"
 
