@@ -980,6 +980,87 @@ BEGIN
 END $$;
 DROP TABLE lion_bigset;
 
+-- ---------------------------------------------------------------------
+-- 20. A GROUP BY over INLINE entries reads each leaf once.
+--
+-- A GROUP BY hands a row up per group, and the walk lets go of its leaf
+-- before each (DESIGN.md §28, "A walk that returns rows").  It used to drop
+-- the INLINE copies still to come with the leaf's pin and read the leaf again
+-- for the next group: a leaf per group.  The walk now counts the groups up to
+-- the leaf's last INLINE copy before the first of their rows goes up, so it
+-- reads each leaf once, whatever the WHERE: none, one that is collected, one
+-- that never is.  Every tenth key has 40 rows more, CHAIN under an
+-- inline_limit of 64 bytes, so that the leaves mix the two; a CHAIN copy after
+-- the last INLINE one is kept across the pause and read from the batch.
+-- ---------------------------------------------------------------------
+CREATE TABLE lion_gw (k int, c int NOT NULL);
+INSERT INTO lion_gw SELECT CASE WHEN i % 101 = 0 THEN NULL ELSE i % 4000 END, i % 3
+  FROM generate_series(1, 12000) i;
+INSERT INTO lion_gw SELECT (i % 400) * 10, i % 3 FROM generate_series(1, 16000) i;
+CREATE INDEX lion_gw_k ON lion_gw USING lion (k) WITH (inline_limit = 64);
+CREATE INDEX lion_gw_c ON lion_gw USING lion (c);
+VACUUM (FREEZE, ANALYZE) lion_gw;
+-- both kinds of entry, and enough leaves that the check below - under two
+-- directory reads a leaf, the root's and lion_gw_c's included - is far below
+-- a read for each of the 3,600 INLINE groups
+SELECT entries > inline_entries AND inline_entries > 0 AS mixed,
+	   leaf_pages > 10 AS several_leaves
+  FROM lion_index_stats('lion_gw_k');
+
+CREATE FUNCTION lion_gw_check(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	j json;
+	ln text;
+	pushed boolean := false;
+	pages bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+	EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, BUFFERS OFF, FORMAT JSON) '
+		|| q INTO j;
+	pages := (j -> 0 -> 'Plan' ->> 'Directory Pages Read')::bigint;
+	EXECUTE format('CREATE TEMP TABLE lion_gw_on AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	EXECUTE format('CREATE TEMP TABLE lion_gw_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_gw_on EXCEPT ALL SELECT * FROM lion_gw_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_gw_off EXCEPT ALL SELECT * FROM lion_gw_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_gw_on, lion_gw_off';
+	RETURN format('%s, %s, %s',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  CASE WHEN ndiff = 0 THEN 'same rows' ELSE ndiff || ' rows differ' END,
+				  CASE WHEN pages < (SELECT 2 * leaf_pages
+									   FROM lion_index_stats('lion_gw_k'))
+					   THEN 'under two reads a leaf'
+					   ELSE pages || ' directory pages read' END);
+END $$;
+
+-- no WHERE
+SELECT lion_gw_check('SELECT k, count(*) FROM lion_gw GROUP BY k');
+-- a HAVING that rejects most groups
+SELECT lion_gw_check('SELECT k, count(*) FROM lion_gw GROUP BY k HAVING count(*) > 3');
+-- coalesce(k, c): the NULL entry's rows and 10's make one group
+SELECT lion_gw_check('SELECT coalesce(k, 10), count(*) FROM lion_gw GROUP BY coalesce(k, 10)');
+-- a WHERE whose sets the counts read until they collect them
+SELECT lion_gw_check('SELECT k, count(*) FROM lion_gw WHERE c = 1 GROUP BY k');
+-- a WHERE that is never collected: a negated source alone
+SELECT lion_gw_check('SELECT k, count(*) FROM lion_gw WHERE c <> 1 GROUP BY k');
+DROP FUNCTION lion_gw_check(text);
+DROP TABLE lion_gw;
+
 DROP OPERATOR CLASS lion_rev_ops USING lion;
 DROP OPERATOR CLASS lion_rev_btree USING btree;
 DROP OPERATOR <# (int4, int4);

@@ -58,6 +58,7 @@ double		lion_cold_stream_page_cost;
 double		lion_probe_entry_cost;
 double		lion_probe_rescan_cost;
 double		lion_entry_count_cost;
+double		lion_inline_entry_count_cost;
 double		lion_list_group_cost;
 double		lion_distinct_test_cost;
 double		lion_range_entry_cost;
@@ -180,6 +181,8 @@ static const LionCostSetting lion_cost_settings[] = {
 	/* lion_plan_cost.c: the count's walks (§20, §26, §28, §32) */
 	{"pg_lion.entry_count_cost", &lion_entry_count_cost, 50.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each count a lion GROUP BY makes, per entry or pair of entries"},
+	{"pg_lion.inline_entry_count_cost", &lion_inline_entry_count_cost, 20.0, LION_TUPLE,
+	 "Sets the planner's estimate of the cost of each count a lion GROUP BY's walk, or a sum over every entry, makes of an entry small enough to be INLINE, when no copy of its WHERE is counted against"},
 	{"pg_lion.list_group_cost", &lion_list_group_cost, 18.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each count of a lion GROUP BY whose groups an IN list drives"},
 	{"pg_lion.distinct_test_cost", &lion_distinct_test_cost, 50.0, LION_TUPLE,

@@ -180,9 +180,10 @@ SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags && $1', '''{t1,NULL}''
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE nums @> $1', '''{3,3}''');
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE nums && $1', '''{7,29}''');
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE nums @> $1', '''{}''');
--- @@: AND and OR of lexemes are exact; a phrase is the AND of its lexemes and
--- a weight the lexeme at any weight, both rechecked; `a & !b` is `a`,
--- rechecked; a prefix and `!a` are every row; an empty query nothing
+-- @@: AND and OR of lexemes are exact, and so is `a & !b`, a's rows less
+-- b's; a phrase is the AND of its lexemes and a weight the lexeme at any
+-- weight, both rechecked; `a & !b:A` is `a`, rechecked; a prefix, `!a` and
+-- `a | !b` are every row; an empty query nothing
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1''');
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1 & x2''');
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1 | x2''');
@@ -191,6 +192,9 @@ SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''(w1 | w2) <-
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1:A''');
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1:A & x1''');
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1 & !x1''');
+SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''!x1 & w1 & !x2''');
+SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1 & !x1:A''');
+SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''(w1 <-> x2) & !x1''');
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1 | !x1''');
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''!w1''');
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1:*''');
@@ -235,6 +239,7 @@ SELECT lion_mk('SELECT g, count(*) FROM lion_mk_t WHERE tags && $1 AND g = 2 GRO
 SELECT lion_mk('SELECT k, g, count(*) FROM lion_mk_t WHERE tsv @@ $1 GROUP BY k, g', '''w2:A''');
 SELECT lion_mk('SELECT count(DISTINCT k) FROM lion_mk_t WHERE tags && $1', '''{t1,NULL}''');
 SELECT lion_mk('SELECT g, count(DISTINCT k) FROM lion_mk_t WHERE tsv @@ $1 GROUP BY g', '''w4 & !x4''');
+SELECT lion_mk('SELECT g, count(DISTINCT k) FROM lion_mk_t WHERE tsv @@ $1 GROUP BY g', '''w4 & !x4:B''');
 -- under an OR the query has to be a literal: not pushed
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1 OR k = 3', '''{t1}''');
 

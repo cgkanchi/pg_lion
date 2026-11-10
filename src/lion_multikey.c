@@ -162,6 +162,38 @@ lion_keynode_op(LionKeyNodeKind kind, LionKeyNode **args, int nargs)
 	return n;
 }
 
+/*
+ * pos less the rows of neg: an ANDNOT node, or neg one more child of pos when
+ * pos is an ANDNOT already, so that `a & !b & !c` reads b and c beside each
+ * other rather than one ANDNOT under another.  Both are taken over.
+ */
+static LionKeyNode *
+lion_keynode_andnot(LionKeyNode *pos, LionKeyNode *neg)
+{
+	LionKeyNode *n;
+
+	if (pos->kind == LION_KN_ANDNOT)
+	{
+		LionKeyNode **args = (LionKeyNode **)
+			palloc(sizeof(LionKeyNode *) * (pos->nargs + 1));
+
+		memcpy(args, pos->args, sizeof(LionKeyNode *) * pos->nargs);
+		args[pos->nargs] = neg;
+		pfree(pos->args);
+		pos->args = args;
+		pos->nargs++;
+		return pos;
+	}
+
+	n = (LionKeyNode *) palloc0(sizeof(LionKeyNode));
+	n->kind = LION_KN_ANDNOT;
+	n->nargs = 2;
+	n->args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * 2);
+	n->args[0] = pos;
+	n->args[1] = neg;
+	return n;
+}
+
 /* A flat AND (or OR) over keys 0 .. nkeys-1. */
 static LionKeyNode *
 lion_keynode_flat(LionKeyNodeKind kind, int nkeys)
@@ -507,6 +539,21 @@ lion_extract_internal(LionState *state, Datum value, Datum **keys,
  * --------------------------------------------------------------------- */
 
 /*
+ * Item i's operand when item i is a NOT, -1 otherwise: the item an AND takes
+ * away from its other operand (lion_tsquery_tree()).  A NOT's one operand
+ * follows it (ts_type.h); that it lies inside the array is checked where it
+ * is walked.
+ */
+static int32
+lion_tsquery_negand(const QueryItem *items, int32 size, int32 i)
+{
+	if (i < 0 || i >= size || items[i].type != QI_OPR ||
+		items[i].qoperator.oper != OP_NOT)
+		return -1;
+	return i + 1;
+}
+
+/*
  * Build the key tree of a tsquery (DESIGN.md §17).
  *
  * A TSQuery is an array of QueryItems in prefix order: an operator is
@@ -517,12 +564,17 @@ lion_extract_internal(LionState *state, Datum value, Datum **keys,
  * item -> key map gin_extract_tsquery() builds for its consistent function,
  * recomputed here rather than fished out of extra_data.
  *
- * Only AND and OR of plain lexemes become a tree.  Everything else sets *ok
+ * AND and OR of plain lexemes become a tree, and so does an AND one of whose
+ * two operands is a NOT: `x & !y` is the rows of x less the rows of y, an
+ * ANDNOT node (lion_keynode_andnot()).  Outside a phrase, which never gets
+ * here, TS_execute() decides `!y` as "the row does not match y", so the set
+ * difference is exactly the operator's answer.  Everything else sets *ok
  * false and makes the whole query a rechecking scan:
  *
- *	- OP_NOT has no complement over posting sets that does not need the set of
- *	  all rows (`!a` is "every row minus a's"), and the ALL fallback is that
- *	  set anyway;
+ *	- any other OP_NOT - alone, under an OR, or both operands of an AND - has
+ *	  no complement over posting sets that does not need the set of all rows
+ *	  (`!a` is "every row minus a's"), and the ALL fallback is that set
+ *	  anyway;
  *	- OP_PHRASE needs lexeme positions, which the index does not store;
  *	- a prefix lexeme (`foo:*`) matches a RANGE of keys; by the time a
  *	  query gets here lion_tsquery_expand_prefixes() has replaced every prefix
@@ -590,6 +642,35 @@ lion_tsquery_tree(QueryItem *items, int32 size, int32 i, const int *map,
 					return NULL;
 				}
 
+				/* `x & !y`, either way round: x's rows less y's */
+				if (item->qoperator.oper == OP_AND)
+				{
+					int32		rneg = lion_tsquery_negand(items, size, i + 1);
+					int32		lneg = lion_tsquery_negand(items, size,
+														   i + (int32) left);
+
+					if (rneg >= 0 && lneg >= 0)
+					{
+						/* `!x & !y` is every row but some: not a set tree */
+						*ok = false;
+						return NULL;
+					}
+					if (rneg >= 0 || lneg >= 0)
+					{
+						LionKeyNode *pos;
+						LionKeyNode *neg;
+
+						pos = lion_tsquery_tree(items, size,
+												rneg >= 0 ? i + (int32) left : i + 1,
+												map, ok);
+						neg = lion_tsquery_tree(items, size,
+												rneg >= 0 ? rneg : lneg, map, ok);
+						if (!*ok)
+							return NULL;
+						return lion_keynode_andnot(pos, neg);
+					}
+				}
+
 				args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * 2);
 
 				/* Right operand first, exactly as ts_type.h lays them out. */
@@ -603,7 +684,7 @@ lion_tsquery_tree(QueryItem *items, int32 size, int32 i, const int *map,
 			}
 
 		default:
-			/* OP_NOT, OP_PHRASE */
+			/* OP_NOT but as an AND's operand, OP_PHRASE */
 			*ok = false;
 			return NULL;
 	}
@@ -854,6 +935,22 @@ lion_raw_key_unusable(const LionRawQuery *raw, int k)
 		(raw->nulls != NULL && raw->nulls[k]);
 }
 
+/* Can every leaf of tree be looked up: no partial key, no NULL one? */
+static bool
+lion_raw_tree_usable(const LionKeyNode *tree, const LionRawQuery *raw)
+{
+	int			i;
+
+	if (tree->kind == LION_KN_KEY)
+		return !lion_raw_key_unusable(raw, tree->keyno);
+	for (i = 0; i < tree->nargs; i++)
+	{
+		if (!lion_raw_tree_usable(tree->args[i], raw))
+			return false;
+	}
+	return true;
+}
+
 /*
  * The superset form of lion_tsquery_tree(): a tree that selects AT LEAST the
  * rows the tsquery rooted at item i matches, or NULL for "every row".  *lossy
@@ -864,7 +961,14 @@ lion_raw_key_unusable(const LionRawQuery *raw, int k)
  *	- a prefix lexeme, or one extractQuery flagged partial or NULL, is every
  *	  row: an expandable prefix was already rewritten into the OR of its keys
  *	  by lion_tsquery_expand_prefixes(), so one left over is past the cap;
- *	- `!a` is every row: no posting set is the complement of another;
+ *	- `x & !y` is x's superset less y's rows, as lion_tsquery_tree() makes
+ *	  it, where y has an exact tree and the extraction is the plain one: no
+ *	  ambiguous key (DESIGN.md §17, "Long lexemes"), whose set may hold rows
+ *	  without its lexeme, is ever taken away.  Not inside a phrase
+ *	  (inphrase), where a NOT is about positions - `(a & !b) <-> c` matches a
+ *	  row with b elsewhere - and not where x's superset is every row;
+ *	- any other `!a` is every row: no posting set is the complement of
+ *	  another;
  *	- `a <N> b` is `a & b`: a phrase matches only where both of its operands
  *	  match, at positions the index does not store, and an operand that is
  *	  itself every row (`!a <-> b`) constrains nothing;
@@ -873,7 +977,8 @@ lion_raw_key_unusable(const LionRawQuery *raw, int k)
  */
 static LionKeyNode *
 lion_tsquery_superset(QueryItem *items, int32 size, int32 i, const int *map,
-					 const LionRawQuery *raw, bool *lossy, bool *ok)
+					 const LionRawQuery *raw, bool inphrase, bool *lossy,
+					 bool *ok)
 {
 	QueryItem  *item;
 
@@ -930,10 +1035,46 @@ lion_tsquery_superset(QueryItem *items, int32 size, int32 i, const int *map,
 					return NULL;
 				}
 
+				if (item->qoperator.oper == OP_AND && !inphrase &&
+					raw->searchMode == GIN_SEARCH_MODE_DEFAULT)
+				{
+					int32		rneg = lion_tsquery_negand(items, size, i + 1);
+					int32		lneg = lion_tsquery_negand(items, size,
+														   i + (int32) left);
+					LionKeyNode *neg = NULL;
+					bool		negok = true;
+
+					if ((rneg >= 0) != (lneg >= 0))
+						neg = lion_tsquery_tree(items, size,
+												rneg >= 0 ? rneg : lneg, map,
+												&negok);
+					if (negok && neg != NULL && lion_raw_tree_usable(neg, raw))
+					{
+						LionKeyNode *pos;
+
+						pos = lion_tsquery_superset(items, size,
+													rneg >= 0 ? i + (int32) left : i + 1,
+													map, raw, false, lossy, ok);
+						if (!*ok)
+							return NULL;
+						if (pos == NULL)
+						{
+							/* every row less some is no set tree */
+							*lossy = true;
+							return NULL;
+						}
+						return lion_keynode_andnot(pos, neg);
+					}
+				}
+
 				rt = lion_tsquery_superset(items, size, i + 1, map, raw,
+										   inphrase ||
+										   item->qoperator.oper == OP_PHRASE,
 										   lossy, ok);
 				lt = lion_tsquery_superset(items, size, i + (int32) left, map,
-										   raw, lossy, ok);
+										   raw, inphrase ||
+										   item->qoperator.oper == OP_PHRASE,
+										   lossy, ok);
 				if (!*ok)
 					return NULL;
 
@@ -1331,7 +1472,7 @@ lion_extract_query_superset(LionState *state, Relation index, Datum query,
 				/* the numbering lion_tsquery_plan() relies on, checked alike */
 				if (j == raw.nkeys)
 					tree = lion_tsquery_superset(items, tsq->size, 0, map,
-												 &raw, &lossy, &ok);
+												 &raw, false, &lossy, &ok);
 				pfree(map);
 				break;
 			}

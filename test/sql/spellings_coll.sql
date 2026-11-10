@@ -1,0 +1,137 @@
+-- The spellings of spellings.sql (DESIGN.md §10, "Other spellings of
+-- answered clauses") under collations that do not order strings as bytes.
+-- `col LIKE 'p%'` is a range only where the column's collation orders strings
+-- as bytes: under another the range holds strings that do not begin with p,
+-- and the clause is the ordinary plan's.  A LIKE with no wildcard is an
+-- equality under any deterministic collation, which compares the bytes, and
+-- nothing under a nondeterministic one.  Every answer is compared with a
+-- sequential scan's.
+--
+-- The collations are ICU's; the test is skipped without them
+-- (test/expected/spellings_coll_1.out).
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+
+-- the collations, where the build has ICU and the database is UTF8
+SET client_min_messages = warning;
+DO $$
+BEGIN
+	IF getdatabaseencoding() = 'UTF8' THEN
+		CREATE COLLATION spc_en (provider = icu, locale = 'en');
+		CREATE COLLATION spc_ci (provider = icu, locale = 'und-u-ks-level2',
+								 deterministic = false);
+	END IF;
+EXCEPTION WHEN feature_not_supported THEN
+	NULL;						-- a build without ICU
+END $$;
+RESET client_min_messages;
+SELECT NOT EXISTS (SELECT 1 FROM pg_collation WHERE collname = 'spc_ci')
+	   AS spc_skip \gset
+\if :spc_skip
+\echo 'no ICU collations, or not a UTF8 database: skipped'
+\else
+-- An English column, where 'pa' < 'PA' < 'pb' and 'p-a' sorts among the
+-- 'pa's, and a case-insensitive one, where 'PAID' = 'paid'.
+CREATE TABLE spc (id int, e text COLLATE spc_en, c text COLLATE spc_ci,
+				  ce text[] COLLATE spc_ci)
+	WITH (autovacuum_enabled = off);
+INSERT INTO spc
+SELECT i, w, w, ARRAY[w]
+  FROM generate_series(1, 2000) i,
+	   LATERAL (SELECT (ARRAY['pa', 'PA', 'paid', 'PAID', 'p-a', 'pA', 'pb', 'Pb', 'p', NULL])[1 + i % 10] AS w) x;
+CREATE INDEX spc_e ON spc USING lion (e);
+CREATE INDEX spc_c ON spc USING lion (c);
+CREATE INDEX spc_ce ON spc USING lion (ce);
+VACUUM (FREEZE, ANALYZE) spc;
+DELETE FROM spc WHERE id % 97 = 0;
+
+CREATE FUNCTION spc_q(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	used boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionCount\)' THEN
+			used := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE spc_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE spc_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM spc_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM spc_on EXCEPT ALL SELECT * FROM spc_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM spc_off EXCEPT ALL SELECT * FROM spc_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE spc_on, spc_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows', CASE WHEN used THEN 'count' ELSE 'no count' END,
+				  nrows);
+END $$;
+
+SELECT q, spc_q(q) FROM (VALUES
+	-- English: no range, but an equality
+	('SELECT count(*) FROM spc WHERE e LIKE ''pa%'''),
+	('SELECT count(*) FROM spc WHERE e LIKE ''paid'''),
+	('SELECT count(*) FROM spc WHERE e LIKE ''%'''),
+	('SELECT count(*) FROM spc WHERE e LIKE ''pa%'' COLLATE "C"'),
+	('SELECT count(*) FROM spc WHERE e LIKE ''paid'' COLLATE "C"'),
+	('SELECT count(*) FROM spc WHERE e COLLATE "C" LIKE ''pa%'''),
+	('SELECT count(*) FROM spc WHERE e IS NOT DISTINCT FROM ''paid'''),
+	-- case-insensitive: neither, and its equalities are its own
+	('SELECT count(*) FROM spc WHERE c LIKE ''paid'' COLLATE "C"'),
+	('SELECT count(*) FROM spc WHERE c IS NOT DISTINCT FROM ''paid'''),
+	('SELECT count(*) FROM spc WHERE ''paid'' = ANY (ce)'),
+	('SELECT count(*) FROM spc WHERE ''paid'' COLLATE "C" = ANY (ce)')
+) v(q);
+
+-- LIKE under the nondeterministic collation itself: the ordinary plan's from
+-- PostgreSQL 18 on, an error in every plan before it; lion takes no part in
+-- either.
+CREATE FUNCTION spc_plan(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionCount\)' THEN
+			RETURN 'count';
+		END IF;
+	END LOOP;
+	RETURN 'no count';
+EXCEPTION WHEN feature_not_supported THEN
+	RETURN 'no count';
+END $$;
+SELECT q, spc_plan(q) FROM (VALUES
+	('SELECT count(*) FROM spc WHERE c LIKE ''pa%'''),
+	('SELECT count(*) FROM spc WHERE c LIKE ''paid''')
+) v(q);
+DROP TABLE spc;
+DROP FUNCTION spc_q(text);
+DROP FUNCTION spc_plan(text);
+\endif
+SET client_min_messages = warning;
+DROP COLLATION IF EXISTS spc_en;
+DROP COLLATION IF EXISTS spc_ci;
+RESET client_min_messages;
