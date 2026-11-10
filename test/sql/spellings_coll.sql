@@ -87,6 +87,8 @@ BEGIN
 				  nrows);
 END $$;
 
+-- with the keys' tests off, which count what no range does (where_keytest.sql)
+SET pg_lion.enable_key_tests = off;
 SELECT q, spc_q(q) FROM (VALUES
 	-- English: no range, but an equality
 	('SELECT count(*) FROM spc WHERE e LIKE ''pa%'''),
@@ -102,6 +104,7 @@ SELECT q, spc_q(q) FROM (VALUES
 	('SELECT count(*) FROM spc WHERE ''paid'' = ANY (ce)'),
 	('SELECT count(*) FROM spc WHERE ''paid'' COLLATE "C" = ANY (ce)')
 ) v(q);
+RESET pg_lion.enable_key_tests;
 
 -- LIKE under the nondeterministic collation itself: the ordinary plan's from
 -- PostgreSQL 18 on, an error in every plan before it; lion takes no part in
