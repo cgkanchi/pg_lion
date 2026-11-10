@@ -28,13 +28,13 @@ setup
 
 	/*
 	 * 'alpha' and 'beta' are CHAIN entries (inline_limit = 64), each with a
-	 * position tree of one leaf: one chunk, a 10-byte header and each row's
+	 * position tree of one leaf: one chunk, a 22-byte header and each row's
 	 * three bytes - the delta of its code (1), its count of positions (1)
 	 * and its position (20 for 'alpha': a position is stored shifted left by
 	 * two, over its weight).
 	 */
 	CREATE TABLE vn (id int, d tsvector) WITH (autovacuum_enabled = off);
-	INSERT INTO vn SELECT i, 'alpha:5 beta:6' FROM generate_series(1, 600) i;
+	INSERT INTO vn SELECT i, 'alpha:5 beta:6' FROM generate_series(1, 150) i;
 	CREATE INDEX vn_d ON vn USING lion (d)
 	  WITH (store_positions = true, inline_limit = 64);
 
@@ -74,8 +74,9 @@ setup
 
 	/*
 	 * The delta of the first member of the position leaf whose first chunk
-	 * starts with 'alpha''s first member, at 10 of the chunk, from 1 to 2 in
-	 * the relation file: every member moves one offset on, and the leaf - a
+	 * starts with 'alpha''s first member, at 22 of the chunk, from 1 to 2,
+	 * and the chunk's last code, the uint32 at 10, one up with it, in the
+	 * relation file: every member moves one offset on, and the leaf - a
 	 * page flagged LION_PAGE_POSITIONS (128, the low byte of the flags at
 	 * 26 of the special area, the last 32 bytes) at level 0 (24) - holds
 	 * nothing for (0,1).  The leaves damaged, which must be one.
@@ -87,6 +88,7 @@ setup
 		blk int8;
 		lp bytea;
 		item int8;
+		last int8;
 		damaged int := 0;
 	BEGIN
 		FOR blk IN 1 .. pg_relation_size('vn_d') / bs - 1 LOOP
@@ -94,9 +96,16 @@ setup
 				OR pg_read_binary_file(path, blk * bs + bs - 32 + 24, 2) <> '\x0000';
 			lp := pg_read_binary_file(path, blk * bs + 24, 4);
 			item := get_byte(lp, 0) + (get_byte(lp, 1) & 127) * 256;
-			CONTINUE WHEN pg_read_binary_file(path, blk * bs + item + 10, 3) <> '\x010114';
+			CONTINUE WHEN pg_read_binary_file(path, blk * bs + item + 22, 3) <> '\x010114';
+			lp := pg_read_binary_file(path, blk * bs + item + 10, 4);
+			last := get_byte(lp, 0) + get_byte(lp, 1) * 256 + get_byte(lp, 2) * 65536 +
+					get_byte(lp, 3)::int8 * 16777216 + 1;
 			EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
-						   format('cat >/dev/null; printf ''\002'' | dd of=%s bs=1 seek=%s conv=notrunc 2>/dev/null',
+						   format('cat >/dev/null; printf ''\002'' | dd of=%s bs=1 seek=%s conv=notrunc 2>/dev/null; '
+								  'printf ''%s'' | dd of=%s bs=1 seek=%s conv=notrunc 2>/dev/null',
+								  path, blk * bs + item + 22,
+								  (SELECT string_agg('\' || lpad(to_oct((last >> (8 * i)) & 255), 3, '0'), '' ORDER BY i)
+									 FROM generate_series(0, 3) i),
 								  path, blk * bs + item + 10));
 			damaged := damaged + 1;
 		END LOOP;
