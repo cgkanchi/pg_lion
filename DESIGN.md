@@ -2145,6 +2145,51 @@ that share one leaf and INLINE keys on leaves of their own; `serializable_moves.
 between the read and the insert by each of the three transfers above; `reader_serializable.spec`
 has every reader's absent key.
 
+### The map pages a reader keeps pinned (2026-11-10)
+
+Step 3 reads the map once per container (`lion_vm_allvisible_mask()`, lion_count_int.h) through a
+SET of map pins (`LionVmPins`, lion_vm.h) rather than one: map page m in slot m % 8, filled only as
+pages are asked for. A single pin, core's index-only scan's (`ioss_VMBuffer`), is enough for a
+reader that crosses the heap once, in order. A count per key - an FK-side join's, a semi join's -
+crosses it once per key, each key's rows scattered over it, and let go of the pin and took it again
+at every step from one map page to the next: 590,478 pins for a semi join's count over 250,000 keys
+of a 750 MB, three-map-page heap, a sixth of its 382 ms. With the set it pins three pages and takes
+319 ms. A map page covers some 255 MB of heap at 8 kB pages, so eight slots hold the map of a heap
+up to 2 GB; past that, pages that share a slot take turns in it. The set moves from count to count
+in the node's cache as the single pin did (`LionVisCache.vm`, `lion_vis_cache_take_vm()`,
+`lion_vis_cache_keep_vm()`), and LionOrdered's index-only rows (§40.4) and LionProbeJoin's map
+checks use one too (`lion_vm_all_visible()`).
+
+Nothing about the interlock changes: the bytes are read off the pinned page when the container is
+counted, after it was copied under its pins, exactly as with one pin, never remembered from an
+earlier read; a map page is no index page and nothing waits for its pin. On a pool small for its
+connections - the backend's fair share (`lion_pin_fair_share()`) under 32 buffers - the set has one
+slot, so the pin budget (§15, "The pin budget"), which leaves room for one map page, still holds. A
+set holds at most eight map pages, and every set over the same heap pins the same pages, so one
+heap's map takes no more buffers of the pool than it has pages, one per 255 MB of heap, however many
+sets and backends read it: at most eight for a heap up to 2 GB. Past that the bound is eight a set,
+and a backend can hold several: one for each node of its plan that reads the map, and one for each
+group or column context a count rechecks through.
+
+The read itself is a word at a time: a container's sixteen map bytes (at 8 kB pages; eight at 16 kB,
+four at 32 kB) as two 64-bit words, each word's 32 all-visible bits squeezed together in five
+shift-and-mask steps (`lion_vm_allvisible_bytes()`), where it was a byte at a time for the bytes
+with a wanted block. A container with members on every block - a low-cardinality column's - paid
+sixteen byte steps, some 40% of `GROUP BY c200` over 5M rows: 23.5 ms before, 17.4 ms after. A
+one-member container (a sparse segment's, §13) now reads two words for its one byte and is no
+slower. The rare container that straddles two map pages still reads bytes, each half on its own
+page. `test/unit/vm_test.c` checks the word read against a bit-at-a-time reader of the documented
+layout at every alignment and byte value; assert builds still check every mask against
+`visibilitymap_get_status()` (`LION_VM_MASK_CHECK`), though a disagreement is settled by reading the
+bytes again from the page each block belongs on, so that check vouches for the reading of the bytes
+and not for which page they were read from. `test/sql/vm_pages.sql` does that: a heap of two map
+pages, one row to a block, with rows deleted on the second page at bytes whose twins on the first
+still say all-visible, and on both halves of the straddling container. Its counts, grouped counts,
+per-key join counts and index-only rows are compared with core's, the blocks taken from the map
+and rechecked are counted exactly, and the join's count over 167 keys, each on both pages, pins
+the two pages once each (a single slot pins them 236 times). Taking a block's bits from the wrong
+page, or one half of the straddling container from the other's page, fails it.
+
 ## 10. Phase 2b: CustomScan for `count(*) [GROUP BY k] FROM t WHERE k1 = c1 AND ...` (`lion_plan_*.c`, `lion_exec_*.c`)
 
 Planner integration
@@ -2496,7 +2541,9 @@ Planner integration
     (`lion_key_containers()`). A GROUP BY runs one merge per ENTRY of its column - every entry is
     counted, whatever the WHERE leaves of it - with the entry's own set as a source, and one per
     pair of two columns (§20), plus each count's set-up, `LION_ENTRY_COUNT_COST`
-    (`LION_LIST_GROUP_COST` for a group of an IN list that drives them), and each set of a union
+    (`LION_LIST_GROUP_COST` for a group of an IN list that drives them, and
+    `LION_INLINE_ENTRY_COUNT_COST` for an entry small enough to be INLINE in a walk counted one entry
+    at a time, §28 "A walk that returns rows", or in the sum over every entry of §14), and each set of a union
     source rebuilt at every count, `LION_UNION_SET_COST`. Before, every container was two
     cpu_operator_cost whatever it held, members and probes were free, and a group was charged the
     containers of its share of the WHERE's rows rather than of its own set. Since 2026-10-20 a
@@ -3273,6 +3320,7 @@ calibrated in §10's first version, before the posting tree, and never again.
 | an IN list value's search | nothing but its leaf's page | a descent (§21: a leaf's binary search, the levels above it too when the values are sparser than the leaves) | 1,000 values over 1M keys: 7.6 ms, chosen over a 1.8 ms btree index-only scan at 1,032 |
 | `LION_ENTRY_COUNT_COST` (each count of a GROUP BY: one per entry of its column, per pair of two) | `cpu_tuple_cost` | 50 `cpu_tuple_cost` | 1.0 us a test of a walk of 20,000 entries; 1.3 us a group of 200 of six RUN containers |
 | `LION_LIST_GROUP_COST` (the same, a group of an IN list that drives them) | `cpu_tuple_cost` | 18 `cpu_tuple_cost` | 0.35 us a group over 1,000 of them |
+| `LION_INLINE_ENTRY_COUNT_COST` (2026-11-10; the same, an entry small enough to be INLINE, of a walk counted one entry at a time: no copy of the WHERE, no top k) | `LION_ENTRY_COUNT_COST` | 20 `cpu_tuple_cost` | 0.27 to 0.5 us a group over the merge's units (14 to 25 `cpu_tuple_cost`), unfiltered walks of 489k to 5M groups of 1 to 5 rows on PostgreSQL 18.7; the 1.0 us before it included reading the leaf again for each group (§28, "A walk that returns rows"). The sum over every entry of `k IS NOT NULL` alone (§14), priced as the same walk, never read a leaf twice: 0.22 us an entry all told (11 `cpu_tuple_cost`) over 2M INLINE entries of a row each, which `LION_ENTRY_COUNT_COST` priced at five times its time |
 | `LION_UNION_SET_COST` (a set of a union source, rebuilt by every count of a GROUP BY; `LION_FKJOIN_SET_COST` is it) | 0 (80 `cpu_tuple_cost` in the FK join) | 100 `cpu_tuple_cost` | 2 us a set for 4 groups ANDed with a 1,000-value list; 2.7 and 6 us for 200 groups ANDed with a two-arm OR and a two-value list |
 | `LION_RECHECK_TID_COST` / `LION_RECHECK_GROUP_TID_COST` (a candidate TID of the heap recheck) | `cpu_tuple_cost` | 1.5 / 6 `cpu_tuple_cost` | 24 to 29 ns a TID on pages holding 68 to 150 candidates, up to 70 ns at 34; 130 ns in a 200-group count of a wholly dirty table, 1.6M of 2M pages answered from the visibility cache. *(The grouped one is 2 since 2026-11-01, below what it fits: see below.)* |
 | `LION_DISTINCT_TEST_COST` | 50 `cpu_tuple_cost` | unchanged | 1.0 us (§26) |
@@ -3559,6 +3607,96 @@ against the same plan counting: `SELECT DISTINCT country ... WHERE status = 'pai
 8.3 ms to 0.23 ms, 150 containers visited (core: 113 ms); `country, kind ... GROUP BY 1, 2` with
 the same WHERE (1,000 pairs) 24 ms to 8.1 ms (core: 113 ms); `DISTINCT kind` under an IN list of
 three countries 5.7 ms to 0.7 ms (core: 69 ms).
+
+### Other spellings of answered clauses (2026-11-10)
+
+Three clauses that test what the posting sets already answer, written another way, used to leave
+the count to the ordinary plan: `'t1' = ANY (tags)`, `status IS NOT DISTINCT FROM 'paid'` and
+`status LIKE 'pa%'`. Each is now rewritten, as the clause analysis meets it, into the clause it is
+true of the same rows as, and that clause is what the cost model, EXPLAIN and a partition's bounds
+see (`LionLeafInfo.costclause`, with `costexact`) - or, where that clause's own analysis makes a
+clause for the cost model (`tags IS NOT DISTINCT FROM '{}'` is the `tags = '{}'` of §17), that one.
+Being true of the same rows is what a WHERE, a
+FILTER and an OR's arm ask of a clause: false and NULL are the same there. The rewrites are not
+the same value, which only a NOT could tell apart, and none is taken under one: the planner has
+already turned each NOT it can into the operator's negator (`NOT (c = ANY (tags))` is `c <> ALL
+(tags)`, which stays with the ordinary plan), and lion_analyze_leaf()'s own NOT branch takes no
+leaf that has a costclause. Neither GIN nor a B-tree answers the first two, so they are gains over
+core, not parity. `test/sql/spellings.sql` checks every form against a sequential scan, over NULL
+columns, arrays with NULL elements, empty arrays, partitions and dead and updated rows;
+`test/sql/spellings_coll.sql` does the same under ICU collations.
+
+**`c = ANY (array_col)`** (`lion_any_column_as_contains()`): the array column on the right of the
+ANY, which no index matches. The ANY is true where some element equals c, NULL where none does but
+one is NULL, and NULL for a NULL array. `array_col @> ARRAY[c]` is true where some element equals
+c - array_contain_compare() tests with the element type's default equality, under the clause's
+collation - and false or NULL everywhere else. So the two select the same rows when the ANY's
+operator is that equality: with c of the element's type, or of one binary-coercible to it (text
+against a varchar[] column, which the parser coerces to text[] with an ArrayCoerceExpr that only
+relabels, and which the array is built of the column's element type for, as array_contains()
+insists); or the integer family's equality across two widths, `1 = ANY (ids)` of a bigint[] column
+with its int4 literal, which compares the numbers, so that the literal as the element's type is the
+same test, and one the element's type cannot hold is declined. A literal c is a literal
+containment, answered exactly (§17); a value the executor has once per scan - a generic plan's `$1
+= ANY (tags)` - is the run-time `tags @> ARRAY[$1]` of §17, "A query known only at run time",
+answered from a superset and rechecked, but only where it is of the element's own type, the one
+array its value is put in: a `text` `$1` against a varchar[] column, or an int4 one against
+bigint[], keeps the ordinary plan. A NULL selects nothing either way.
+
+**`col IS NOT DISTINCT FROM c`** (`lion_not_distinct_as_eq()`), which the planner keeps as a NOT
+over a DistinctExpr, for a constant c. Where col is NULL it is false and `col = c` NULL; everywhere
+else both are the equality, so it is `col = c`, and `col IS NULL` for a NULL c (the planner folds
+the untyped literal NULL itself). A value known only at run time is not taken: one that comes out
+NULL makes the clause `col IS NULL`, where an equality with a NULL parameter selects nothing
+(`col IS DISTINCT FROM $1` has its own kind, §35, which a NULL turns into `IS NOT NULL`).
+
+**`col LIKE 'p%'`** (`lion_like_as_and()`). Under a deterministic collation LIKE compares the
+characters themselves, so a pattern with no wildcard is `col = 'p'`, an equality that under any
+deterministic collation compares the bytes; a pattern of `%`s alone is `col IS NOT NULL`; and a
+prefix p followed by `%`s alone is the strings that begin with p, `col >= 'p' AND col < q` for q
+the least string above all of them, where the column's collation orders strings as bytes (C, POSIX,
+the builtin provider's: `collate_is_c`). That is the range core derives for a B-tree
+(like_support.c), but core's upper bound need not be the least (make_greater_string() may drop
+characters), so core keeps the LIKE as a filter; q is the least (`lion_like_prefix_upper()`), so the
+range is exact and the LIKE is not tested again:
+
+- under UTF-8, whose byte order is code point order, q is p with its last character replaced by
+  the next code point, past the surrogates no string holds: a string at or above p and below q
+  begins with p's other characters and then a character at least p's last and below the next one,
+  which is the last. The last byte plus one would not do: U+043F ends in 0xBF, whose next byte is no
+  continuation byte, and U+007F's next byte 0x80 starts no character. U+10FFFF has no next code
+  point, and its pattern is declined;
+- under another encoding q is p with its last byte one higher - for byte strings the least above
+  every one with p's bytes - taken only when it is itself a string of the encoding.
+
+The clauses compare the column as the LIKE does, relabels and all, under the column's own
+collation, which an index on it was built under; an index under another collation answers none of
+them (`lion_index_answers()`, as for any clause). They share the restriction's position, as `NOT
+IN`'s `<>`s do (above), and the range's two bounds are gathered into one range of the column
+(§28); in an OR's arm they are two range leaves of the arm (§32), and the OR is taken or declined
+as one written with the range would be. The ordinary plan keeps: a range under any other
+collation; anything after the first wildcard but `%` (`p_d`, `p%d`), which no range is; a pattern
+that ends in the escape character, an error LIKE raises on the rows it gets that far into (and on
+no other: `'pa' LIKE 'pa\'` is false); `NOT LIKE`, `ILIKE`, `LIKE` over a nondeterministic
+collation, and a pattern known only at run time.
+
+Measured on PostgreSQL 18.7 over 2,000,000 synthetic rows (five statuses, fifty countries, a
+twenty-value `int` with one row in ten NULL, two-element `text[]` and `bigint[]`), one lion index
+per column, a database whose default collation is C, warm, `count(*)` the fastest of three runs.
+"Before" is main's plan for the clause as written; "written out" is the clause it is counted as,
+written by hand, on this change:
+
+| clause | before | after | speedup | written out |
+|---|---:|---:|---:|---:|
+| `'t1' = ANY (tags)` | 342.7 ms | 3.2 ms | 108x | 2.8 ms |
+| `7 = ANY (ids)` (`bigint[]`, `int` literal) | 324.7 ms | 0.38 ms | 850x | 0.44 ms |
+| `'t1' = ANY (tags) AND status = 'paid'` | 168.0 ms | 1.0 ms | 170x | 1.0 ms |
+| `status IS NOT DISTINCT FROM 'paid'` | 179.4 ms | 7.2 ms | 25x | 7.2 ms |
+| `n IS NOT DISTINCT FROM 3` | 160.9 ms | 2.6 ms | 62x | 3.9 ms |
+| `n IS NOT DISTINCT FROM 3`, `GROUP BY country` | 170.1 ms | 33.8 ms | 5.0x | 33.0 ms |
+| `status LIKE 'pa%'` | 117.9 ms | 8.2 ms | 14x | 7.8 ms |
+| `country LIKE 'c1%' AND status = 'paid'` | 108.8 ms | 16.3 ms | 6.7x | 15.2 ms |
+| `country LIKE 'c4%'`, `GROUP BY status` | 186.6 ms | 40.3 ms | 4.6x | 39.5 ms |
 
 ### Grouping sets (2026-10-11)
 
@@ -4905,6 +5043,14 @@ algebra get as real containers, and it is unchanged by the stream format.)
   beyond the last item simply starts a new segment when the preceding one is full. A full segment
   all of whose pairs share one ckey cannot be split in half; that state is unreachable under the
   policy, and the insert promotes the ckey to a container instead of failing.
+  An insert decodes a segment it adds to once: `lion_sparse_probe()` gives, from one pass over the
+  stream, whether the pair is there, how many pairs its ckey has, the last ckey, the size with the
+  pair in and where in the stream it goes, and `lion_sparse_insert_probed()` inserts from that. A
+  segment is decoded again only when it changes shape: when the pair promotes its ckey to a
+  container, or the segment is full and splits. In an INLINE payload the walk still fetches and
+  checks every item, as the rewrite copies them all, but decodes none and compares only their first
+  ckeys: the last item whose first ckey is at or below the ckey and the item after it are the only
+  possible targets, and only they are probed.
   A key's first TID is a one-pair segment (9 to 11 bytes: the header and its lo), not a one-member
   ARRAY container (10), and every pair after it two or three bytes instead of ten for a container.
   A container built by promoting a ckey out of a segment gets one `lion_container_optimize()` call,
@@ -5879,9 +6025,10 @@ and the paused cursor's other groups come out as its snapshot saw them after VAC
 its copy of the WHERE set still lists and an insert has taken their slots back.
 
 The counts of one node share two things (2026-09-28, §27 "The per-key path, end to end"): the
-scratch memory they work in, reset after each, and the visibility-map page the last one left
-pinned, which the node keeps between rows as core's index-only scan keeps its map page. Neither
-is an index page or part of the §9 interlock, and no VACUUM waits for a map page's pin; it goes
+scratch memory they work in, reset after each, and the visibility-map pages the last one left
+pinned (§9, "The map pages a reader keeps pinned"), which the node keeps between rows as core's
+index-only scan keeps its map page. Neither is an index page or part of the §9 interlock, and no
+VACUUM waits for a map page's pin; they go
 when the node is done, rescanned or ended, or moves to another partition
 (`lion_vis_cache_release_vm()`). `test/sql/countpause.sql`'s check - no page of a lion index
 pinned by a paused cursor - holds as before.
@@ -6759,10 +6906,11 @@ KEYS trees:
   `gin_extract_tsquery()` numbers the keys it returns by scanning that array from 0 and counting
   QI_VAL items, so the j'th key is the j'th QI_VAL in array order; the same item -> key map is
   recomputed rather than fished out of extra_data.  QI_VAL with no prefix flag and weight mask 0
-  becomes a leaf; OP_AND and OP_OR become AND and OR nodes; **OP_NOT, OP_PHRASE, a prefix and a
-  weight mask make the whole query ALL**.  (`!a` has no complement over posting sets that is not
-  "every row minus a's", and the ALL fallback is that set anyway; a phrase needs lexeme positions
-  and a weight needs weights, neither of which the index stores.)
+  becomes a leaf; OP_AND and OP_OR become AND and OR nodes, and an OP_AND one of whose operands is
+  an OP_NOT an ANDNOT node (below, "A NOT beside an AND"); **any other OP_NOT, OP_PHRASE, a prefix
+  and a weight mask make the whole query ALL**.  (`!a` has no complement over posting sets that is
+  not "every row minus a's", and the ALL fallback is that set anyway; a phrase needs lexeme
+  positions and a weight needs weights, neither of which the index stores.)
 - `<@` is unreachable (extractQuery says INCLUDE_EMPTY first) and would be ALL.
 
 ### Bitmap scans (`lion_scan.c`)
@@ -7074,7 +7222,7 @@ literal is exact.
 
 `test/sql/countmultikey.sql` runs every shape against the pushdown off, with the node's recheck
 counters beside the answer: `@>`, `&&` over text[] and int[] and `@@` in generic plans with values
-that are exact, select nothing, are NULL, widen (a NULL element, a phrase, a weight, `a & !b`, a
+that are exact, select nothing, are NULL, widen (a NULL element, a phrase, a weight, `a & !b:A`, a
 prefix beside a lexeme) and are every row (`{}`, `!a`, `a:*`, `a | !b`), queries built by
 `to_tsquery($1)` and `websearch_to_tsquery($1)`, `ARRAY[$1, $2]`; beside other clauses, two such
 clauses and an `IS NOT NULL` read by the sequential scan, `count(col)`, GROUP BY (one column and two),
@@ -7133,6 +7281,40 @@ the price, which is now the superset's size rather than the index's: a rare phra
 median 120 words, warm).  The count's gain over GIN is the heap-skipping kind only where the
 superset is narrow; on a wide superset both do the same detoast per candidate.  Exact phrase
 counts need stored positions, which is a separate design.
+
+### A NOT beside an AND (2026-11-10)
+
+`x & !y` is a set difference: outside a phrase `TS_execute()` decides `!y` as "the row does not
+match y", so the rows the operator selects are x's less y's, and the shared evaluator already has the
+node for it, `LION_KN_ANDNOT` (§14, `IS NOT NULL`), whose first child's containers are taken the
+others' members away at the keys the first child stands at.  `lion_tsquery_tree()` builds one for an
+AND exactly one of whose operands is a NOT - either way round, the other operand and the NOT's
+operand both exact trees themselves (`(a <-> c) & !b` is not one, and is the superset's below) -
+and folds a run of them into one node (`a & !b & !c` is ANDNOT(a, b, c)); a NOT that is itself an
+OR's operand (`a | !b`), one alone, or one on both sides of an AND still needs every row and stays
+ALL, while an ANDNOT under an OR (`(a & !b) | c`) is an ordinary operand of it.  The query is then
+KEYS: exact for the scans (no recheck), the count (no row filter, no position filter) and every
+count shape that takes an exact multi-key leaf - GROUP BY, count(DISTINCT), the FK-side join,
+counts by cells, whose mask test reads an ANDNOT as its first child's keys and none of the others'
+(`lion_cells_tree()`), and LionOrdered's lazy set.
+
+The superset (`lion_tsquery_superset()`) does the same wherever it would have dropped the NOT, so
+`(a <-> c) & !b` decides positions only for the rows of `a & c` that lack `b`, but not inside a
+phrase, where a NOT is about positions (`(a & !b) <-> c` matches a row that has `b` somewhere
+else), not where y is not exact (`a & !b:A`, `a & !(b <-> c)`, which stay `a`), not where the other
+side's superset is every row, and never for an extraction that is not the plain one: an ambiguous
+long lexeme's set ("Long lexemes") may hold rows without its lexeme, and taking those away would
+lose rows.  The cost model's superset share (`lion_tsquery_walk_sel()`) follows the same rule,
+an ambiguous long lexeme anywhere in the query included (`lion_tsquery_ambiguous()`); a prefix past
+the expansion cap, which the planner cannot see, it takes as expanded, as it takes every prefix.
+
+On 500,000 synthetic documents (PostgreSQL 18.7, warm, serial), `count(*) WHERE tsv @@ 'w2 & !w5'`
+of a lexeme in nearly every row and one in 93% of them took 55 ms, every candidate of `w2` decided
+by the position filter; it now takes 1.9 ms, where `w2 & w5` takes 1.6 to 2.4.  `test/sql/tsvector.sql`
+compares the rows with a sequential scan for nested and folded NOTs, under an OR, a NOT inside and
+of a phrase, under a weight and of a prefix; `countcells.sql`, `countmultikey.sql`,
+`positions.sql`, `indexscan.sql` and `ordered_lazy_query.sql` show the shapes that became exact and
+keep one that still rechecks.
 
 ### Stored positions: position trees (in progress, 2026-10-07)
 
@@ -13566,9 +13748,12 @@ from what the code does where it does not; the fixes of 2026-09-28 are marked.
    released it at the end - a buffer lookup and two atomic operations on the header of the one
    or two map pages of the heap that every count, and every participant of a parallel plan,
    pins. *Fixed*: the page stays pinned in the node's cache from one count to the next
-   (`LionVisCache.vmbuf`), between the node's rows as well, as an index-only scan keeps its map
+   (`LionVisCache.vm`), between the node's rows as well, as an index-only scan keeps its map
    page (`ioss_VMBuffer`), and is let go when the node is done, rescanned or ended or moves to
-   another partition (`lion_vis_cache_release_vm()`). A map page is no index page and no part of
+   another partition (`lion_vis_cache_release_vm()`). Since 2026-11-10 that is every map page a
+   count needs, up to eight, not only the last (§9, "The map pages a reader keeps pinned"): a
+   key's rows scattered over a heap of several map pages moved the single pin back and forth
+   once per key. A map page is no index page and no part of
    the §9 interlock: VACUUM sets a bit under the page's content lock and never waits for its
    pins, and only a truncation of the map would, under an AccessExclusiveLock this query's own
    lock excludes. `Visibility Map Pages Pinned` counts what is left: a pin per map page a run
@@ -16116,6 +16301,47 @@ bitmap heap scan (the walks off) against the walk:
 With nothing disabled the inner join's plan is core's hash join, over the same walk: 824 ms
 serially against 1,777 over the bitmap heap scan, and 689 against 1,194 on two workers.
 
+### A VALUES list as the dimension (2026-11-10)
+
+`SELECT count(*) FROM fact f JOIN (VALUES ('paid'), ('void')) v(k) ON v.k = f.status WHERE
+f.country = 'c7'` was declined: the dimension's own table had to be a plain table or a
+materialized view (`lion_fkjoin_rel_ok()`), and the plan was core's nested loop over a bitmap scan
+per listed value, 30 to 80 times the node's time for the same counts written as `f.status IN
+('paid', 'void')`.
+
+Nothing in the node needs the dimension to be a table. It runs the dimension as a child plan and
+counts each of its rows' keys under the fact filters, and an inner join's count is the sum of those
+counts whatever the rows hold ("What is computed, and why it is exact"): a value listed twice pairs
+with each matching fact row twice, as the join does, and is counted twice; a NULL matches nothing
+under a strict operator. So a VALUES list is taken as the dimension's own table
+(`lion_fkjoin_values_ok()`, beside `lion_fkjoin_rel_ok()` in `lion_fkjoin_pick_dim()`), the Values
+Scan its child, when it has no LATERAL reference - a list that names a column of another table is
+one - and is not proved empty. It is never the fact, which has to have an index.
+
+**Uniqueness** is asked of it where it is asked of a table: a GROUP BY of its column, its keys
+united, and folding it into a fact filter beside a dimension ("A second dimension that only
+filters"). A table proves it with a unique index; a list proves it from its values
+(`lion_values_column_unique()`): each has to be a constant by then (`preprocess_expression()` folds
+what it can; a parameter a generic plan keeps, `VALUES ($1), ($2)`, proves nothing, whatever values
+it is given), they are sorted by the `<` of a btree family whose equality is the join operator,
+under the join's collation, and no two neighbours may compare equal. The btree contract makes "compares
+equal" that family's equality, which is the join's: `(VALUES (1.0), (1.00))` is not unique to
+numeric's `=`, and a GROUP BY of it is then left to the rows the node emits per listed row and the
+Finalize Agg above, as for any non-unique key. NULLs do not count against it, as they do not
+against a unique index. A list longer than `lion_array_batch_size()` is not examined.
+
+`lion_fkjoin_key_unique()` is the proof for whichever the dimension table is; the index proof alone
+(`lion_column_is_unique()`) stays for everything that descends the index it names.
+
+A list compared through a cast (`(VALUES (3), (4)) v(n) ON v.n = f.numeric_col`, whose list side
+is `v.n::numeric`) is not a column and is declined, as a table's would be. `x IN (VALUES ...)` is
+core's own `= ANY` from PostgreSQL 18 (`convert_VALUES_to_ANY()`) where the list has two rows or
+more and every value folds to a constant; before 18, and on 18 for a list of the parameters a
+generic plan keeps, it is a semi join whose inner side is the list, taken here as the forward semi
+join of "Forward semi joins over a non-unique key".
+
+Tests: `test/sql/fkjoin_values.sql`.
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
@@ -16125,7 +16351,8 @@ serially against 1,777 over the bitmap heap scan, and 689 against 1,194 on two w
   its bounds do not imply; an old-style inheritance parent as the fact; partitionwise aggregation
   turned on, as for a count (§16); and run-time pruning of the leaves ("A partitioned fact table",
   which counts every other one). A partitioned,
-  inheritance or subquery DIMENSION is declined for want of an index list to prove uniqueness
+  inheritance or subquery DIMENSION is declined (a VALUES list is taken, "A VALUES list as the
+  dimension") for want of an index list to prove uniqueness
   from; `innerrel_is_unique()` would prove some of those and is the natural v2.
 - **An inner or outer join inside the dimension**, composite keys, snowflake chains: a dimension
   that is a join is taken only as one table with others semi- or anti-joined to it ("A dimension
@@ -16802,9 +17029,32 @@ Why the copies may outlive the lock is §21's argument, applied per leaf instead
 **A walk that returns rows pauses.** A GROUP BY hands a row to the executor per group, and a cursor
 can hold that row for ever, so the node calls `lion_entry_scan_pause()` whenever it returns a row. A
 batch that still holds INLINE copies drops them with their pin, and the next call reads the leaf
-again from the last entry handed out. A GROUP BY over INLINE entries therefore still reads a leaf per
-group, as it always did; it emits a row per group anyway. A batch of CHAIN copies survives the pause.
-The node's located sets give their pins up at the same point (§15, "Paused and finished counts").
+again from the last entry handed out. A batch of CHAIN copies survives the pause. The node's located
+sets give their pins up at the same point (§15, "Paused and finished counts").
+
+So the GROUP BY's walk does not hand a row up while the batch still holds an INLINE copy (2026-11-10,
+`lion_group_walk_fill()`). It takes the next entry and counts it, as it always did, and then every
+entry after it up to the batch's last INLINE copy (`lion_entry_scan_pinned_left()`), each counted
+under its own pin as soon as it is taken and its set released; their keys and counts wait in the
+batch of rows (`gbkey`, `gbcount`) and go up one a call. When the first of them goes up the last
+INLINE copy has been handed out and its pin let go of, so the pause has nothing to drop, and the CHAIN
+copies after it stay in the batch. Until then a GROUP BY over INLINE entries - any column of more
+than a few thousand values - read a leaf per group: 993,227 directory pages for the 993k groups of an
+unfiltered `GROUP BY` over a 5M-row table whose index has 6,725 leaves, and about half its time. It
+now reads 6,728, and the walk takes 0.73 s instead of 2.0 (PostgreSQL 18.7, release build); a
+2M-row table's GROUP BY of a unique column went from 3.6 s to 0.79, one of four rows a key from
+0.94 s to 0.29. A count is made earlier than it was - before the previous group's row goes up
+rather than after - under the same snapshot, by `lion_group_count()` as before, so the answers are
+the same: the WHERE may still hold its pins then, which no count needs, and it is collected when
+`lion_group_count()` decides. The count that collects it ends the fill: the groups after it are
+counted in batches as before, and the leaf it stood on is read once more for them, once a walk.
+GROUP BY coalesce(g, c) adds the NULL entry's and c's counts into its one group there. A CHAIN entry with no INLINE copy after it is
+taken alone, so nothing is counted ahead that a pause would have kept, and that a LIMIT above may
+never ask for. The WHERE collected and its groups counted in batches (§10, "The groups of a walk,
+counted together") never paused within a batch, and is unchanged. `directory.sql` §20 checks that
+such walks read each leaf once - with no WHERE, a HAVING, coalesce, a WHERE collected and one never
+collected, over leaves that mix INLINE and CHAIN entries - and `countpause.sql` that they pin
+nothing while paused.
 The sums never pause: the sum over a range, the sum-over-all of §14, the count(DISTINCT) walk of §26
 and `lion_index_count_group_stats()` each walk to the end within one call. §28's pinned-GROUP-BY
 test (`range.sql` §14, at most one leaf pinned) holds as before.
@@ -23463,6 +23713,42 @@ expression is computed for the groups that come out, so an error only another gr
 raise (`ClientIP + 1` at the type's maximum) is not raised; the ordinary plan computes it for
 every row.
 
+### Expressions of columns not grouped
+
+`GROUP BY upper(status)` or `GROUP BY kind / 5` names no column, so neither has the groups of the
+walk. Each is the GROUP BY of the columns it reads, merged: where every row of a column's group
+holds the same value (the value rule of §10), an immutable expression of those columns
+(`lion_group_dependent()`) is the same for every row of the group, so each group of the
+expressions is a union of the columns' groups. `lion_count_path_derive_groups()` makes each column
+the expressions read, and the GROUP BY does not name, a grouping column under its type's own
+equality and the column's collation: a finer grouping than any the expressions make. The node
+counts those groups and emits them as partial rows; the projection computes the expressions from
+each group's key, and core's Finalize HashAggregate adds up the rows that share a value:
+
+```
+Finalize HashAggregate
+  Group Key: upper(t)
+  ->  Custom Scan (LionCount)
+        Lion Indexes: lion_ge_t (t)
+        Group Key: t
+```
+
+The expressions are computed once per group with rows, from the value each of those rows holds,
+which is the value the ordinary plan computes them from, so they raise the errors the ordinary
+plan raises and no others: a key whose rows are all deleted, or all taken out by the WHERE, is not
+emitted. Two grouping columns at most, with the expressions' columns counted in (the nested loop of
+§20); the merge needs partial aggregation and hashable expressions. Declined beside the columns'
+groups: a count(DISTINCT), whose partial counts cannot be added; a SELECT DISTINCT; filtered counts;
+the FK-side and anti joins; aggregates over the entries (§37); the top k, which needs finished
+groups. A partitioned table's leaves are merged by the same Finalize Agg. The plan's group estimate
+is the columns' groups; the Finalize Agg's is core's estimate of the expressions', capped by it.
+Numeric, float and other types whose equal values may differ (`1.0`, `1.00`) fail the value rule
+and stay with core, as do volatile and stable expressions. Where a count by cells (§10) also
+applies, as for a `CASE` over one column's values, the cost model picks; the merge measured faster
+(2.4 ms against 14.8 for a `CASE` over a 20-value column of 2M rows), and `pg_lion.enable_expr_groups`
+turns it off. `test/sql/group_expr.sql` checks every shape against a sequential scan, with deleted
+and updated rows unvacuumed.
+
 ### The keys of a multi-key column (`lion_index_facets()`, §7)
 
 The bound holds for a multi-key column's entries as for a scalar one's: a row is filed under each
@@ -25125,8 +25411,9 @@ reads").
   projection and the quals on the scan slot's type before `BeginCustomScan` runs, and the expression
   machinery specialises on it, so one plan never returns slots of two types.
 - **A row.** `xs_want_itup` is set on the B-tree scan before `index_rescan()`. For a member TID
-  (`lo_fetch_indexonly()`): `VM_ALL_VISIBLE(heapRelation, blkno, &vmbuffer)`, the map's buffer kept
-  across calls and released at rescan and end, as `ioss_VMBuffer` is. All-visible, the row is
+  (`lo_fetch_indexonly()`): `VM_ALL_VISIBLE()` through the node's set of map pins
+  (`lion_vm_all_visible()`, §9 "The map pages a reader keeps pinned"), kept across calls and released
+  at rescan and end, as `ioss_VMBuffer` is. All-visible, the row is
   visible to every snapshot, this one included, and the heap is not read. Not all-visible, the
   heap tuple is fetched into a slot of the table AM's kept for this alone (`index_fetch_heap()` on
   16 to 19, `table_fetch_tid()` and `table_tuple_fetch_row_version()` on 20 - `lo_fetch_btree()`,
@@ -34504,3 +34791,68 @@ and VACUUM, the plans and `EXPLAIN ANALYZE`'s counters, and the declines: a leaf
 not slice the column, until pruning leaves it out, and the switch); `slices_range.sql`'s
 partitioned table now answered; and the isolation spec `slices_partitioned.spec` with a count and a
 sum under a range from slices beside the aggregates.
+
+## 54. Day filters as ranges (2026-11-10)
+
+`count(*) ... WHERE ts::date = '2026-03-05'`, `WHERE date_trunc('day', ts) = '2026-03-05'` and
+`WHERE ts::date BETWEEN '2026-03-01' AND '2026-03-07'` read every row: a function of the column is
+in no operator family, lion's or a B-tree's, and the plan was a sequential scan (192 to 254 ms on 2M
+rows against 1 to 2 ms for the same counts written as ranges of `ts`). For a `timestamp` column
+they are ranges of `ts`, and are now planned as those ranges (`lion_plan_dayrange.c`).
+
+**Why it is exact.** `ts::date` (`date(timestamp)`) and `date_trunc(unit, ts)` of a `timestamp
+without time zone` are immutable and monotone - never smaller for a larger `ts` - and constant over
+buckets `[A, N(A))`, a day for the cast and the unit's bucket for `date_trunc()`. With `[A, N)` the
+bucket of the constant `c`:
+
+| clause | is |
+|---|---|
+| `f(ts) = c` | `ts >= A AND ts < N` (when `f(A) = c`; a `c` inside a bucket equals no `f(ts)`, left alone) |
+| `f(ts) < c` | `ts < A` when `c` is its bucket's value, else `ts < N` |
+| `f(ts) <= c` | `ts < N` |
+| `f(ts) > c` | `ts >= N` |
+| `f(ts) >= c` | `ts >= A` when `c` is its bucket's value, else `ts >= N` |
+
+and the constant on the left is the same with the strategy commuted. `f` of an infinite `ts` is the
+infinite value of the result type, which compares with `c` as `ts` compares with the bounds, and both
+sides are NULL exactly when `ts` is. So the replacement has the clause's value for every row, and is
+made wherever the clause is in a qual: under OR, inside `IS NOT TRUE` or a CASE, in an outer join's
+`ON` clause.
+
+`A` and `N` are computed from the constant at plan time, and checked against the function rather
+than assumed: `A = date_trunc(unit, c)`, `N = A + one step of the unit` (a microsecond up to a
+millennium, a week seven days, a quarter three months), and the bucket is taken only if
+`date_trunc(unit, N) = N` and `date_trunc(unit, N - 1 microsecond) = A`. For the cast, `A` and `N`
+are the timestamps of `c` and `c + 1`, computed as `date2timestamp()` does once `c` is checked to
+lie inside `timestamp`'s range. A constant within two
+thousand years of either end of `timestamp`'s range, an infinite one, or a date past that range is
+left alone, so that computing a bound never raises an error the clause itself would not.
+
+**Where.** The query's quals are rewritten in place, once for each base relation, from the hook
+after `get_relation_info()` (`lion_get_relation_info()`, `build_simple_rel_hook` from 19): it runs
+from `add_base_rels_to_query()`, before `deconstruct_jointree()` makes RestrictInfos of the quals,
+so every estimate, path, EquivalenceClass and partition pruning step after it sees the ranges, and
+the plan shows them (`ts >= '...' AND ts < '...'`). The jointree's quals are implicit-AND lists by
+then (`preprocess_qual_conditions()`), and a top-level member that becomes two clauses becomes two
+members, as if written so; elsewhere it is an AND. Nothing else of the jointree changes, so the
+walk `add_base_rels_to_query()` is in the middle of is undisturbed. An appendrel child's quals are
+its parent's, translated after this, and are not looked at.
+
+**Which relations.** Only a column with a lion index key on it (a plain column, `timestamp`), and
+only a clause no index of the relation has as an expression key - an expression index on
+`(ts::date)` keeps its clause. A table without lion keeps PostgreSQL's plans as they were.
+Only constants: a generic plan's `$1`, `current_date` and other stable expressions are left as
+written, since the bound's conversion could then fail at run time where the clause does not.
+`pg_lion.enable_date_ranges` (on) turns it off.
+
+**Not done.** `timestamptz` columns: the cast and the two-argument `date_trunc()` depend on the
+session's time zone, and a day of some zones' clocks is not one range - the clocks of St. John's,
+Moncton and Goose Bay stepped back across midnight every autumn from 1987 to 2010, and Alaska's by
+a whole day in 1867 - so the exact set is a union of ranges known only at run time. IN lists of
+days, `<>`, and a comparison across types (`ts::date = timestamp '...'`) are left as written.
+
+Tests: `test/sql/dayrange.sql` (every comparison with the constant on either side, every unit on and inside a
+bucket's edge, BC buckets, infinities, NULLs, the clause under OR, NOT, `IS NOT TRUE`, CASE and an
+outer join's `ON`, the declines, an expression index, a table without lion, a partitioned table
+pruned by the range, and a generic plan), each against the same query with the rewrite off and
+sequential scans only.

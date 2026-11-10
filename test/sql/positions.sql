@@ -601,7 +601,8 @@ BEGIN
 	END LOOP;
 END $$;
 CREATE TEMP TABLE pos_def_q (q tsquery);
-INSERT INTO pos_def_q VALUES ('w1 <-> x1'), ('x1 <-> w1'), ('w1:A'), ('w1 & !x1');
+INSERT INTO pos_def_q VALUES ('w1 <-> x1'), ('x1 <-> w1'), ('w1:A'), ('w1 & !x1'),
+	('w1 <-> !x1');
 DROP INDEX pos_def_off;
 SELECT q, pos_def_explain(q) FROM pos_def_q;
 SET enable_seqscan = off;

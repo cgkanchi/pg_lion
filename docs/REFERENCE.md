@@ -219,8 +219,8 @@ Several such quals on one column (`tags && '{a}' AND tags && '{b}'`), like two l
 column, are ANDed in the index, as quals on several columns are, so the heap gets only the rows they
 select together (DESIGN.md §5, SCAN step 5).
 `count(*)` over `@>`, `&&` and an AND/OR tsquery is pushed down like any other clause, and can be
-combined with a `GROUP BY` on a scalar roaring column. Array `=` and `@@@` are answered by bitmap and
-index scans only, as GIN answers them.
+combined with a `GROUP BY` on a scalar roaring column; `'a' = ANY (tags)` is counted as `tags @>
+'{a}'`. Array `=` and `@@@` are answered by bitmap and index scans only, as GIN answers them.
 
 Whether an array is empty is answered from an `array_ops` index too, which keeps a column's NULL
 arrays, its empty ones and the rest apart (DESIGN.md §17, "Non-empty arrays"). `count(*)` pushes
@@ -320,9 +320,12 @@ bytes is not expanded, and every row is rechecked. A `text`, `varchar` or `bytea
 a query is rechecked. An element of another type longer than 2047 bytes is stored compressed, and is
 an error only if that does not fit, as a GIN index tuple that does not fit is.
 
-Without positions, everything a plain AND/OR of key sets cannot express is rechecked in the heap. A
-NULL element and a tsquery phrase, weight or `a & !b` are answered from the rows of their keys (the
-other elements, the phrase's lexemes, `a`), then rechecked, in counts and scans alike. `<@`, `@> '{}'` and a bare `!a` fall back to scanning
+A NOT beside the rest of an AND (`a & !b`, `(a | c) & !(b | d)`) is a set difference: the rows of
+`b` are taken away from the rows of `a`, so it is exact with positions or without, and costs about
+what `a & b` does. Without positions, everything else a plain AND/OR of key sets cannot express is
+rechecked in the heap. A NULL element and a tsquery phrase, weight or `a & !b:A` are answered from
+the rows of their keys (the other elements, the phrase's lexemes, `a`), then rechecked, in counts and
+scans alike. `<@`, `@> '{}'`, a bare `!a` and `a | !b` fall back to scanning
 every indexed row and rechecking it if the Lion index is used; the planner may choose a sequential
 scan instead.
 
@@ -338,7 +341,7 @@ prepared statement's generic plan (`tags @> $1`, `tsv @@ to_tsquery($1)`) or a s
 (`tsv @@ to_tsquery(current_setting('app.q'))`) - is pushed down whatever it turns out to be
 (DESIGN.md §17): exactly when the key sets answer it; from a superset of its rows, each rechecked in
 the heap, when they do not (`@>` with a NULL element counts the other elements' rows, a phrase the
-rows with all of its lexemes, `a & !b` the rows with `a`); and when no key narrows it at all (`@>
+rows with all of its lexemes, `a & !b:A` the rows with `a`); and when no key narrows it at all (`@>
 '{}'`, `!a`, `foo:*`), by rechecking the rows the other clauses select, or every row by a
 sequential scan when there is no other clause. `EXPLAIN ANALYZE` reports the rows the recheck
 turned away as `Rows Removed by Recheck`. A value the planner cannot estimate is priced as the case
@@ -849,6 +852,22 @@ working around a bad choice:
               Cell Columns: t_k (k)
               Cell Predicates: (k = ANY ('{1,2,3}'::integer[])), ((k = 4) OR (k = 5)), (k IS NULL)
               Cells: 4
+- `pg_lion.enable_expr_groups`: count a `GROUP BY` of immutable expressions of one or two
+  Lion-indexed columns it does not name - `GROUP BY upper(status)`, `GROUP BY kind / 5`, `GROUP BY
+  CASE WHEN k IN (1, 2) THEN 'a' ELSE 'b' END` - by the columns' own groups, the expressions
+  computed once a group from its key and the groups that share a value merged by a `Finalize
+  HashAggregate` (DESIGN.md §36, "Expressions of columns not grouped"). The column's index has to
+  store the rows' exact values: not `numeric`, a float or a nondeterministic collation, whose equal
+  values may print differently. Taken beside `count(*)`, `count(col)` of a grouped column, the
+  `WHERE` and a `HAVING`; not beside a `count(DISTINCT)`, a filtered count, a join or the top k.
+  Where both apply, the cost model chooses between this and a count by cells. Off, such a `GROUP
+  BY` goes to a count by cells or the ordinary plan:
+
+      Finalize HashAggregate
+        Group Key: upper(t)
+        ->  Custom Scan (LionCount)
+              Lion Indexes: t_t (t)
+              Group Key: t
 - `pg_lion.enable_count_partial`: let the count pushdown read a partial Lion index whose predicate
   the query's `WHERE` implies - `CREATE INDEX ... USING lion (g, c) WHERE f AND s = 'a'` for a
   query with `WHERE f AND s = 'a' AND c = 3` - leaving out the clauses the predicate implies, as a
@@ -1143,6 +1162,15 @@ working around a bad choice:
   key the visibility map vouches for, in one pass of the bit-plane kernel (`lion_planes_count_strided()`,
   DESIGN.md §50, §52). Off, each slice's container is ANDed with the `WHERE` and counted on its own;
   the answers are the same.
+- `pg_lion.enable_date_ranges`: plan `ts::date <op> constant` and `date_trunc(unit, ts) <op>
+  constant`, with `<op>` one of `=`, `<`, `<=`, `>`, `>=` and the constant on either side, over a
+  `timestamp` column with a lion index, as the range of `ts` they are (`ts::date = '2026-03-05'` is
+  `ts >= '2026-03-05' AND ts < '2026-03-06'`), which every index of `ts` and partition pruning
+  answer (DESIGN.md §54). EXPLAIN shows the range. Off, the clause is left as written. Also left as
+  written: `timestamptz` columns; a constant that is infinite or within 2000 years of either end of
+  `timestamp`'s range; parameters and stable expressions such as `current_date`; `<>`, IN lists and
+  comparisons across types (`ts::date = timestamp '...'`); `date_trunc()` with a unit that isn't a
+  constant; and a clause some index has as an expression key.
 - `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot
@@ -1288,6 +1316,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `probe_entry_cost` | 4.5 | `cpu_operator_cost` | an entry a nested loop's B-tree probe (`LionBtreeScan` parameterized by the outer row, and `LionProbeJoin`'s descents) meets, beyond core's Index Scan of the same B-tree: its test against the set, measured at that Index Scan's own rate (DESIGN.md §49, "The probe's own work") |
 | `probe_rescan_cost` | 16 | `cpu_operator_cost` | a scan of `LionBtreeScan`'s probe beyond core's Index Scan's: its rescan, and its code run beside core's, measured so |
 | `entry_count_cost` | 50 | `cpu_tuple_cost` | a count of a GROUP BY: an entry, or a pair of two |
+| `inline_entry_count_cost` | 20 | `cpu_tuple_cost` | the same of an entry small enough to be INLINE, in a walk counted one entry at a time: a GROUP BY with no copy of its `WHERE`, or the sum over every entry that `k IS NOT NULL` alone counts |
 | `list_group_cost` | 18 | `cpu_tuple_cost` | a count of a group an `IN` list drives |
 | `distinct_test_cost` | 50 | `cpu_tuple_cost` | a test of a `count(DISTINCT)` walk |
 | `range_entry_cost` | 40 | `cpu_tuple_cost` | an entry of a range walk counted on its own |

@@ -21,6 +21,7 @@ bool		lion_enable_filter_switch = true;
 bool		lion_enable_decoded_walk = true;
 bool		lion_enable_count_cells = true;
 int			lion_count_cells_max = 134217728;
+bool		lion_enable_expr_groups = true;
 bool		lion_enable_topk = true;
 bool		lion_enable_count_slices = true;
 bool		lion_enable_slice_decode = true;

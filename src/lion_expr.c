@@ -2338,7 +2338,7 @@ lion_stream_begin_budget(int nsets, LionPostingSet *sets, LionKeyNode *tree,
 	src.sets = sets;
 	src.tree = tree;
 
-	st->cx.vmbuf = InvalidBuffer;
+	lion_vm_pins_init(&st->cx.vm);
 	st->cx.droppins = !keeppins;
 
 	node = lion_source_tree(&src);

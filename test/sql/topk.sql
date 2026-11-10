@@ -24,9 +24,11 @@ SET max_parallel_workers_per_gather = 0;
  * lion_tq() runs q with the LionCount pushdown and every other plan
  * disabled, then as a sequential scan with the pushdown off, and compares the
  * two as multisets.  It says whether the node was used, and whether it was a
- * top k.
+ * top k.  hashagg keeps hash aggregation on, for a plan whose Finalize Agg
+ * hashes: before PostgreSQL 18 a disabled node adds a constant so large that
+ * add_path() finds two disabled plans equal in cost, and keeps the sorted one.
  */
-CREATE FUNCTION lion_tq(q text) RETURNS text
+CREATE FUNCTION lion_tq(q text, hashagg boolean DEFAULT false) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
@@ -38,7 +40,7 @@ BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
-	PERFORM set_config('enable_hashagg', 'off', true);
+	PERFORM set_config('enable_hashagg', hashagg::text, true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln ~ 'Custom Scan \(LionCount\)' THEN
 			used := true;
@@ -250,10 +252,12 @@ SELECT lion_tq('SELECT g, g + 1, (g * 2)::text, count(*) FROM tk GROUP BY g, g +
 SELECT lion_trun('SELECT g + 1, count(*) FROM tk GROUP BY g + 1, g ORDER BY count(*) DESC LIMIT 4');
 SELECT g - 1, g, count(*) FROM tk GROUP BY g - 1, g ORDER BY count(*) DESC LIMIT 4;
 SELECT lion_tq('SELECT g, g % 3, count(*) FROM tk GROUP BY g, g % 3');
--- ... but not a volatile one, one of another column, or one alone.
+-- ... but not a volatile one or one of another column; and one alone is
+-- counted for every group and merged (DESIGN.md §36, "Expressions of columns
+-- not grouped"), never the top k.
 SELECT lion_tq('SELECT g, count(*) FROM tk GROUP BY g, g + (random() * 0)::int ORDER BY count(*) DESC LIMIT 2');
 SELECT lion_tq('SELECT g, h + 1, count(*) FROM tk WHERE g < 1005 GROUP BY g, h + 1');
-SELECT lion_tq('SELECT g + 1, count(*) FROM tk GROUP BY g + 1 ORDER BY count(*) DESC LIMIT 2');
+SELECT lion_tq('SELECT g + 1, count(*) FROM tk GROUP BY g + 1 ORDER BY count(*) DESC LIMIT 2', hashagg => true);
 -- ... nor one of a column whose equal values need not be the same: 'A' and
 -- 'a' are one entry of citext, and two groups of (c, c::text).
 CREATE TABLE tkc (c citext) WITH (autovacuum_enabled = off);
@@ -267,6 +271,6 @@ SELECT lion_tq('SELECT c::text, count(*) FROM tkc GROUP BY c, c::text ORDER BY c
 SELECT c::text, count(*) FROM tkc GROUP BY c, c::text ORDER BY count(*) DESC, 1 LIMIT 3;
 
 DROP FUNCTION lion_trun(text);
-DROP FUNCTION lion_tq(text);
+DROP FUNCTION lion_tq(text, boolean);
 DROP FUNCTION lion_tcost(text);
 DROP TABLE tk, tkc, tkd;

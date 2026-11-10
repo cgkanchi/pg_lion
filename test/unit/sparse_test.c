@@ -393,6 +393,48 @@ compare(const LionContainer *s, const Ref *r, int line)
 
 #define COMPARE(s, r)	compare(&(s)->c, (r), __LINE__)
 
+/*
+ * lion_sparse_probe() of (ckey, lo) against the reference and against the
+ * one-question functions it stands in for (lion_insert.c asks the probe
+ * instead of them).
+ */
+static void
+check_probe(const LionContainer *s, const Ref *r, uint32 ckey, uint16 lo,
+			LionSparseProbe *pr, int line)
+{
+	uint32		last = (r->n > 0) ? r->p[r->n - 1].ckey : s->ckey;
+	bool		covers;
+
+	lion_sparse_probe(s, ckey, lo, pr);
+	covers = (r->n > 0 && ckey >= r->p[0].ckey && ckey <= last);
+
+	check_impl(pr->code == lion_make_code(ckey, lo), line, "probe: the code probed");
+	check_impl(pr->found == ref_contains(r, ckey, lo), line,
+			   "probe: found agrees with the reference");
+	check_impl(pr->found == lion_sparse_contains(s, ckey, lo), line,
+			   "probe: found agrees with contains()");
+	check_impl(pr->ckey_pairs == ref_count(r, ckey), line,
+			   "probe: the ckey's pairs agree with the reference");
+	check_impl(pr->ckey_pairs == lion_sparse_count(s, ckey), line,
+			   "probe: the ckey's pairs agree with count()");
+	check_impl(pr->npairs == r->n, line, "probe: every pair decoded");
+	check_impl(pr->last_ckey == last, line,
+			   "probe: the last ckey agrees with the reference");
+	check_impl(pr->last_ckey == lion_sparse_last_ckey(s), line,
+			   "probe: the last ckey agrees with lion_sparse_last_ckey()");
+	check_impl(lion_sparse_probe_insert_size(s, pr) ==
+			   lion_sparse_insert_size(s, ckey, lo), line,
+			   "probe: insert size agrees with insert_size()");
+	check_impl(r->n == 0 || lion_sparse_probe_covers(s, pr) == covers, line,
+			   "probe: covers agrees with the reference");
+	check_impl(r->n == 0 || lion_sparse_probe_covers(s, pr) ==
+			   lion_item_covers(s, ckey), line,
+			   "probe: covers agrees with lion_item_covers()");
+}
+
+#define CHECK_PROBE(s, r, ckey, lo, pr) \
+	check_probe(&(s)->c, (r), (ckey), (lo), (pr), __LINE__)
+
 /* Fill a segment and its reference with the pairs of codes[0 .. n). */
 static void
 fill_codes(SBuf *b, Ref *r, const uint64 *codes, uint32 n)
@@ -1617,6 +1659,20 @@ damage_exercise_segment(const LionContainer *s, LionContainer *work,
 
 	DAMAGE_MUTATE("insert()", (void) lion_sparse_insert(work, ckey, lo, NULL));
 	{
+		LionSparseProbe pr;
+
+		lion_sparse_probe(s, ckey, lo, &pr);
+		CHECK(pr.npairs <= LION_SPARSE_MAX_PAIRS && pr.off <= pr.end &&
+			  pr.off + pr.len <= pr.end && pr.end <= LION_SPARSE_MAX_BYTES &&
+			  pr.ckey_pairs <= pr.npairs,
+			  "damaged: probe() stays within the stream");
+		CHECK(lion_sparse_probe_insert_size(s, &pr) ==
+			  lion_sparse_insert_size(s, ckey, lo),
+			  "damaged: probe() agrees with insert_size()");
+		DAMAGE_MUTATE("insert_probed()",
+					  (void) lion_sparse_insert_probed(work, &pr, NULL));
+	}
+	{
 		Size		need = lion_sparse_insert_size(s, ckey, lo);
 
 		memcpy(work, s, LION_SPARSE_MAX_SIZE);
@@ -1820,6 +1876,23 @@ test_inplace_growth(void)
 			CHECK(memcmp(p, &full, lion_sparse_size(p)) == 0,
 				  "insert() in place leaves the bytes it leaves in a full buffer");
 			free(p);
+
+			/* the same through a probe of the item, as the in-place insert does */
+			{
+				LionSparseProbe pr;
+
+				p = exact_alloc(alloc);
+				memcpy(p, &ref.c, Min(alloc, lion_sparse_size(&ref.c)));
+				lion_sparse_probe(p, ckey, lo, &pr);
+				CHECK(lion_sparse_probe_insert_size(p, &pr) == alloc,
+					  "probe() of an item says what insert_size() says");
+				r1 = lion_sparse_insert_probed(p, &pr, &dup1);
+				CHECK(r1 && dup1 == dup2, "insert_probed() in place succeeds");
+				CHECK(guard_ok(p, alloc), "insert_probed() in place writes nothing past the item");
+				CHECK(memcmp(p, &full, lion_sparse_size(p)) == 0,
+					  "insert_probed() in place leaves the bytes insert() leaves");
+				free(p);
+			}
 		}
 	}
 }
@@ -1850,8 +1923,27 @@ test_random_ops(const char *name, uint32 nckeys, uint32 nops, uint64 seed)
 		{
 			bool		dup = false;
 			Size		need = lion_sparse_insert_size(&b.c, ckey, lo);
-			bool		ok = lion_sparse_insert(&b.c, ckey, lo, &dup);
-			bool		refok = ref_insert(&r, ckey, lo);
+			bool		ok;
+			bool		refok;
+
+			/* half of them the way lion_insert.c does: probe, then insert */
+			if (op % 2 == 0)
+			{
+				LionSparseProbe pr;
+
+				CHECK_PROBE(&b, &r, ckey, lo, &pr);
+				/* and of a ckey just below and above the probed one */
+				{
+					LionSparseProbe other;
+
+					CHECK_PROBE(&b, &r, ckey - 1, lo, &other);
+					CHECK_PROBE(&b, &r, ckey + 1, (uint16) (lo ^ 0x2A), &other);
+				}
+				ok = lion_sparse_insert_probed(&b.c, &pr, &dup);
+			}
+			else
+				ok = lion_sparse_insert(&b.c, ckey, lo, &dup);
+			refok = ref_insert(&r, ckey, lo);
 
 			if (ok && !dup)
 				CHECK(refok && need == lion_sparse_size(&b.c),

@@ -375,10 +375,10 @@ lion_count_container_vm(LionCountCtx *cx, const LionContainer *c)
 	else
 	{
 		allvis = lion_vm_allvisible_mask(cx->heap, firstblk, members,
-										&cx->vmbuf, &cx->stats.vm_pins);
+										 &cx->vm, &cx->stats.vm_pins);
 		cx->stats.vm_checks++;
 #ifdef LION_VM_MASK_CHECK
-		lion_vm_mask_check(cx->heap, firstblk, members, allvis, &cx->vmbuf);
+		lion_vm_mask_check(cx->heap, firstblk, members, allvis, &cx->vm);
 #endif
 	}
 	lion_count_container_masks(cx, c, members, allvis);
@@ -887,7 +887,8 @@ lion_recheck_heap_heap(LionCountCtx *cx)
 		e = lion_vis_cache_prepare(cx, blk, e);
 
 		buf = ReadBuffer(cx->heap, blk);
-		lion_heap_page_prune_opt(cx->heap, buf, &cx->vmbuf, cx->rel_read_only);
+		lion_heap_page_prune_opt(cx->heap, buf, lion_vm_pins_slot(&cx->vm, blk),
+								 cx->rel_read_only);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		cx->stats.blocks_rechecked++;
 
@@ -1065,7 +1066,8 @@ lion_recheck_heap_filtered(LionCountCtx *cx)
 #else
 		buf = ReadBuffer(cx->heap, blk);
 #endif
-		lion_heap_page_prune_opt(cx->heap, buf, &cx->vmbuf, cx->rel_read_only);
+		lion_heap_page_prune_opt(cx->heap, buf, lion_vm_pins_slot(&cx->vm, blk),
+								 cx->rel_read_only);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		cx->stats.blocks_rechecked++;
 
@@ -2752,25 +2754,10 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	cx.snapshot = snapshot;
 
 	/*
-	 * The visibility-map page the last count of this relation left pinned
-	 * (LionVisCache.vmbuf): the map of a large heap is a few pages, and
-	 * every count of the node asks the same one or two, so a count takes the
-	 * pin over rather than pinning the page again - a buffer lookup and two
-	 * atomic operations on a buffer header that every participant of a
-	 * parallel plan shares.  A pin of another relation's map is let go.
+	 * The visibility-map pages the last count of this relation left pinned
+	 * (LionVisCache.vm, lion_vis_cache_take_vm()).
 	 */
-	cx.vmbuf = InvalidBuffer;
-	if (cache != NULL && BufferIsValid(cache->vmbuf))
-	{
-		if (cache->vmrelid == RelationGetRelid(heap))
-		{
-			cx.vmbuf = cache->vmbuf;
-			cache->vmbuf = InvalidBuffer;
-			cache->vmrelid = InvalidOid;
-		}
-		else
-			lion_vis_cache_release_vm(cache);
-	}
+	lion_vis_cache_take_vm(cache, heap, &cx.vm);
 	/* SerializationNeededForRead() begins with exactly this test; hoisting it
 	 * lets non-serializable counts skip the per-block PredicateLockPage loop. */
 	cx.serializable = IsolationIsSerializable();
@@ -3005,19 +2992,10 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	result = cx.count + cx.recheck_count;
 
 	/*
-	 * The map page stays pinned for the next count, when there is a cache to
-	 * keep it in (and nothing kept there since, which no count does).
+	 * The map pages stay pinned for the next count, when there is a cache to
+	 * keep them in (and nothing kept there since, which no count does).
 	 */
-	if (BufferIsValid(cx.vmbuf))
-	{
-		if (cache != NULL && !BufferIsValid(cache->vmbuf))
-		{
-			cache->vmbuf = cx.vmbuf;
-			cache->vmrelid = RelationGetRelid(heap);
-		}
-		else
-			ReleaseBuffer(cx.vmbuf);
-	}
+	lion_vis_cache_keep_vm(cache, heap, &cx.vm);
 
 	MemoryContextSwitchTo(oldcxt);
 	if (scratch)

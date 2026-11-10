@@ -115,6 +115,27 @@ SELECT lion_cp('SELECT g, count(DISTINCT h) FROM lion_cp WHERE c = 1 GROUP BY g'
 -- one row, and done at once
 SELECT lion_cp('SELECT count(*) FROM lion_cp WHERE c = 1 AND h = 2');
 
+
+/*
+ * A GROUP BY over many INLINE entries (DESIGN.md §28, "A walk that returns
+ * rows"): the walk counts the groups of a leaf up to its last INLINE copy
+ * before the first of their rows goes up, holding the leaf's pin until then,
+ * and so has no copy left to pin while paused.  k has 1,500 keys of two rows
+ * and every tenth of 40 more, CHAIN under an inline_limit of 64 bytes, so the
+ * leaves mix the two; c = 1 is a third of its rows.
+ */
+CREATE TABLE lion_cp2 (k int NOT NULL, c int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lion_cp2 SELECT i % 1500, i % 3 FROM generate_series(1, 3000) i;
+INSERT INTO lion_cp2 SELECT (i % 150) * 10, i % 3 FROM generate_series(1, 6000) i;
+CREATE INDEX lion_cp_k2 ON lion_cp2 USING lion (k) WITH (inline_limit = 64);
+CREATE INDEX lion_cp_c2 ON lion_cp2 USING lion (c);
+VACUUM ANALYZE lion_cp2;
+SELECT lion_cp('SELECT k, count(*) FROM lion_cp2 GROUP BY k');
+SELECT lion_cp('SELECT k, count(*) FROM lion_cp2 WHERE c = 1 GROUP BY k');
+SELECT lion_cp('SELECT k, count(*) FROM lion_cp2 GROUP BY k HAVING count(*) > 2');
+DROP TABLE lion_cp2;
+
 DROP TABLE lion_cp;
 DROP FUNCTION lion_cp(text);
 DROP FUNCTION lion_cp_pinned();
