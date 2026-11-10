@@ -15935,6 +15935,45 @@ bitmap heap scan (the walks off) against the walk:
 With nothing disabled the inner join's plan is core's hash join, over the same walk: 824 ms
 serially against 1,777 over the bitmap heap scan, and 689 against 1,194 on two workers.
 
+### A VALUES list as the dimension (2026-11-10)
+
+`SELECT count(*) FROM fact f JOIN (VALUES ('paid'), ('void')) v(k) ON v.k = f.status WHERE
+f.country = 'c7'` was declined: the dimension's own table had to be a plain table or a
+materialized view (`lion_fkjoin_rel_ok()`), and the plan was core's nested loop over a bitmap scan
+per listed value, 30 to 80 times the node's time for the same counts written as `f.status IN
+('paid', 'void')`.
+
+Nothing in the node needs the dimension to be a table. It runs the dimension as a child plan and
+counts each of its rows' keys under the fact filters, and an inner join's count is the sum of those
+counts whatever the rows hold ("What is computed, and why it is exact"): a value listed twice pairs
+with each matching fact row twice, as the join does, and is counted twice; a NULL matches nothing
+under a strict operator. So a VALUES list is taken as the dimension's own table
+(`lion_fkjoin_values_ok()`, beside `lion_fkjoin_rel_ok()` in `lion_fkjoin_pick_dim()`), the Values
+Scan its child, when it has no LATERAL reference - a list that names a column of another table is
+one - and is not proved empty. It is never the fact, which has to have an index.
+
+**Uniqueness** is asked of it where it is asked of a table: a GROUP BY of its column, its keys
+united, and folding it into a fact filter beside a dimension ("A second dimension that only
+filters"). A table proves it with a unique index; a list proves it from its values
+(`lion_values_column_unique()`): each one a constant by then (`preprocess_expression()` has folded
+every row), they are sorted by the `<` of a btree family whose equality is the join operator, under
+the join's collation, and no two neighbours may compare equal. The btree contract makes "compares
+equal" that family's equality, which is the join's: `(VALUES (1.0), (1.00))` is not unique to
+numeric's `=`, and a GROUP BY of it is then left to the rows the node emits per listed row and the
+Finalize Agg above, as for any non-unique key. NULLs do not count against it, as they do not
+against a unique index. A list longer than `lion_array_batch_size()` is not examined.
+
+`lion_fkjoin_key_unique()` is the proof for whichever the dimension table is; the index proof alone
+(`lion_column_is_unique()`) stays for everything that descends the index it names.
+
+A list compared through a cast (`(VALUES (3), (4)) v(n) ON v.n = f.numeric_col`, whose list side
+is `v.n::numeric`) is not a column and is declined, as a table's would be. `x IN (VALUES ...)` is
+core's own `= ANY` from PostgreSQL 18 (`convert_VALUES_to_ANY()`); before it, it is a semi join
+whose inner side is the list, taken here as the forward semi join of "Forward semi joins over a
+non-unique key".
+
+Tests: `test/sql/fkjoin_values.sql`.
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
@@ -15944,7 +15983,8 @@ serially against 1,777 over the bitmap heap scan, and 689 against 1,194 on two w
   its bounds do not imply; an old-style inheritance parent as the fact; partitionwise aggregation
   turned on, as for a count (§16); and run-time pruning of the leaves ("A partitioned fact table",
   which counts every other one). A partitioned,
-  inheritance or subquery DIMENSION is declined for want of an index list to prove uniqueness
+  inheritance or subquery DIMENSION is declined (a VALUES list is taken, "A VALUES list as the
+  dimension") for want of an index list to prove uniqueness
   from; `innerrel_is_unique()` would prove some of those and is the natural v2.
 - **An inner or outer join inside the dimension**, composite keys, snowflake chains: a dimension
   that is a join is taken only as one table with others semi- or anti-joined to it ("A dimension

@@ -318,6 +318,12 @@ SELECT count(*) AS customers, sum(LEAST(n, 3)) AS capped FROM n;
 whose equal values are always spelled alike: integers, text under a deterministic collation, or
 uuid, for example, but not numeric, where 1.0 and 1.00 are equal.
 
+The dimension may be a `VALUES` list as well as a table: `SELECT count(*) FROM orders o JOIN
+(VALUES ('open'), ('held')) v(s) ON v.s = o.status WHERE o.region = 'eu'` looks up each listed
+value as it would a customer's key, and counts what `o.status IN ('open', 'held')` counts. A value
+listed twice is counted twice, as the join pairs it with each order twice (DESIGN.md §27, "A VALUES
+list as the dimension").
+
 A `LEFT JOIN` from the dimension keeps every customer, one with no order counted 0: `SELECT
 cu.country, count(o.id) FROM customers cu LEFT JOIN orders o ON o.customer_id = cu.id AND o.status =
 'open' GROUP BY cu.country` is pushed down as the JOIN is, each customer emitted with its count
