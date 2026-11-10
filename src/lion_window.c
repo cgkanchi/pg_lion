@@ -361,6 +361,37 @@ lion_window_count_wrap(RelOptInfo *window_rel, PathTarget *target,
 	return &cpath->path;
 }
 
+#if PG_VERSION_NUM < 170000
+/*
+ * PostgreSQL 16 prices a WindowAgg's first row as its input's first row
+ * (cost_windowagg()), though a window over the whole result returns nothing
+ * until it has read every row; under a LIMIT the WindowAgg then looks as if
+ * it stopped after a few rows, and the node, whose count runs before its
+ * first row, never wins.  17 prices the first row after the rows the window
+ * reads first (get_windowclause_startup_tuples()), which for these windows
+ * is every row.  So, when the node is offered, core's WindowAgg paths for
+ * these windows are priced as 17 prices them: a lower WindowAgg's first row
+ * first, then this one's input rows but the first.
+ */
+static void
+lion_window_price_first_row(WindowAggPath *wp)
+{
+	Path	   *in = wp->subpath;
+	double		n = in->rows;
+
+	if (IsA(in, WindowAggPath))
+	{
+		Cost		before = in->startup_cost;
+
+		lion_window_price_first_row((WindowAggPath *) in);
+		wp->path.startup_cost += in->startup_cost - before;
+	}
+	if (n > 1.0)
+		wp->path.startup_cost += (wp->path.total_cost - wp->path.startup_cost) /
+			n * (n - 1.0);
+}
+#endif
+
 /*
  * UPPERREL_WINDOW over input_rel, one base relation (DESIGN.md §10, "A count
  * of every row beside the rows"): where every window function of the query
@@ -453,6 +484,16 @@ lion_try_window_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	count = lion_count_child_path(root, input_rel, window_rel, NIL);
 	if (count == NULL)
 		return;
+
+#if PG_VERSION_NUM < 170000
+	foreach(lc, window_rel->pathlist)
+	{
+		Path	   *p = (Path *) lfirst(lc);
+
+		if (IsA(p, WindowAggPath))
+			lion_window_price_first_row((WindowAggPath *) p);
+	}
+#endif
 
 	/* ... beside each of the relation's paths, in its order */
 	foreach(lc, input_rel->pathlist)
