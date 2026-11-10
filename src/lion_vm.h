@@ -139,8 +139,10 @@ lion_vm_allvisible_bytes(const char *map, int nbytes)
  * share of it (lion_pin_fair_share()) under four times LION_VM_PINS - the set
  * has one slot, the single pin a reader always held, which is what the pin
  * budget of DESIGN.md §15 leaves room for.  The pages are the same for every
- * backend counting the same heap, so at most LION_VM_PINS buffers of the
- * pool are taken by one heap's map however many backends count it.
+ * backend counting the same heap, so one heap's map takes no more buffers of
+ * the pool than it has pages however many backends count it: at most
+ * LION_VM_PINS for a heap up to 2 GB, and past that at most LION_VM_PINS a
+ * backend.
  *
  * Every pin is of the same relation's map; whoever fills the set says which
  * (LionVisCache.vmrelid).  A map page is no index page: no part of the §9

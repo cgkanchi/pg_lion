@@ -2164,9 +2164,10 @@ Nothing about the interlock changes: the bytes are read off the pinned page when
 counted, after it was copied under its pins, exactly as with one pin, never remembered from an
 earlier read; a map page is no index page and nothing waits for its pin. On a pool small for its
 connections - the backend's fair share (`lion_pin_fair_share()`) under 32 buffers - the set has one
-slot, so the pin budget (§15, "The pin budget"), which leaves room for one map page, still holds. The
-pages are the same for every backend that counts the heap, so one heap's map takes at most eight
-buffers of the pool however many backends count it.
+slot, so the pin budget (§15, "The pin budget"), which leaves room for one map page, still holds. A
+backend holds at most eight map pages, and backends counting the same heap pin the same pages, so
+one heap's map takes no more buffers of the pool than it has pages, one per 255 MB of heap, however
+many backends count it: at most eight for a heap up to 2 GB, at most eight a backend past that.
 
 The read itself is a word at a time: a container's sixteen map bytes (at 8 kB pages; eight at 16 kB,
 four at 32 kB) as two 64-bit words, each word's 32 all-visible bits squeezed together in five
