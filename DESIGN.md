@@ -33348,10 +33348,11 @@ percentiles (§52.12).
 
 - **The aggregates**: `count(x)`; `sum(x)` and `avg(x)` of `int2`, `int4` and `int8` - sums of
   integers only: the date and time types have none, and the allowlist's others are not sliced;
-  `min(x)` and `max(x)` of those and of `date`, `time`, `timestamp` and `timestamptz` - of the bare
-  column (a `RelabelType` aside), with no `DISTINCT`, `FILTER` or `ORDER BY`. They are told by
-  `aggfnoid` (`F_SUM_INT4`, `F_MAX_TIMESTAMPTZ`, ...), so a user's aggregate of the same name is
-  not taken. Without `int128` in the compiler, sum and avg are left to the other plans.
+  `min(x)` and `max(x)` of those and of `date`, `time`, `timestamp` and `timestamptz` - of the
+  bare column (a `RelabelType` aside), with no `DISTINCT` or `ORDER BY` (a `FILTER`: §52.14). They
+  are told by `aggfnoid` (`F_SUM_INT4`, `F_MAX_TIMESTAMPTZ`, ...), so a user's aggregate of the
+  same name is not taken. Without `int128` in the compiler, sum and avg are left to the other
+  plans.
 - **The column**: a key column of a whole (not partial) lion index that slices it at its type's
   width (`LionState.sliced`, `slicebits == lion_slice_type_nbits(typid)`), not multi-key. Several
   columns, of one index or several, in one query; a column may also be the grouping column.
@@ -33361,18 +33362,15 @@ percentiles (§52.12).
   (§32) - parameters of a generic plan and stable expressions; `count(*)` and `count(*) FILTER
   (WHERE ...)` beside the aggregates and a `HAVING` over them; a `GROUP BY` of one or two
   lion-indexed columns, an `IN` list on the grouping column driving its groups (§15), or none.
-- **Declined** (`lion_count_path_slices_ok()`): a join (the FK-side join of §27, an anti join), a
-  partitioned table's `GROUP BY` (each partition would answer its own and core's partial
-  aggregates add them up, which needs the partial states of `avg` and `sum(int8)` serialized - not
-  written; the one row of a partitioned table is taken, §52.13), a
+- **Declined** (`lion_count_path_slices_ok()`): a join (the FK-side join of §27, an anti join),
+  `avg` and `sum(int8)` in a partitioned table's `GROUP BY` or beside filters in one (§52.15), a
   residual clause (§10: the slices would have to be counted over the rows the heap keeps), the
   aggregates over keys in the same target list (§37), `count(DISTINCT)`, the top k (§36), the
-  decoded walk of §34, three grouping columns, a filtered count beside a `GROUP BY`, a coalesce
-  group or cells (§10), a parallel plan, and a hot standby, where the pushdown collects nothing
-  (§10) - a plan made on the primary and run there all the same counts every slice beside the
-  `WHERE`'s located sets (`lion_slice_column()`'s standby branch), exact and slow. With no `WHERE`
-  and no `GROUP BY` this and the aggregates over keys (§37) are both offered, and the price
-  decides.
+  decoded walk of §34, three grouping columns, a coalesce group or cells (§10), a parallel plan,
+  and a hot standby, where the pushdown collects nothing (§10) - a plan made on the primary and
+  run there all the same counts every slice beside the `WHERE`'s located sets
+  (`lion_slice_column()`'s standby branch), exact and slow. With no `WHERE` and no `GROUP BY` this
+  and the aggregates over keys (§37) are both offered, and the price decides.
 - **The switches**: `pg_lion.enable_count_slices` (on) turns the whole of it off, and the planner
   builds what it built before; `pg_lion.enable_slice_decode` (on) the decode route alone (§52.4);
   `pg_lion.enable_slice_kernel` (on) the plane kernel alone (§52.5).
@@ -33605,14 +33603,13 @@ Batches Decoded`, `Slice Keys Decoded` and `Slice Rows Decoded` (and `Slice Rows
 `Slice Heap TIDs Rechecked` and `Slice Heap Blocks Rechecked` where the map did not vouch for a
 page.
 
-### 52.9 Not on a standby, a join or a partitioned table's groups
+### 52.9 Not on a standby or a join
 
 Restated from §52.1 because the task asked for each: on a hot standby the planner offers none of
 this (the pushdown collects nothing there, §10), and a plan made on the primary runs exact and
 slow - every slice counted beside the located sets, the descent's steps intersected again, and the
-groups a group at a time; a join (the FK-side join of §27, a semi or anti join) and a partitioned
-table's `GROUP BY` are declined, the latter for want of serialized partial states for core's
-Finalize Agg (§52.12). A partitioned table's one row is answered (§52.13).
+groups a group at a time; a join (the FK-side join of §27, a semi or anti join) is declined. A
+partitioned table's one row is answered (§52.13), and its groups as partial rows (§52.15).
 
 ### 52.10 Measured
 
@@ -33768,11 +33765,12 @@ What the tables say:
   of the pass's combinations, whose rows go up final), or with serialized partial states below a
   Finalize Agg.
 - **Partitioned tables' groups, joins** *(the one row of a partitioned table: done 2026-10-28,
-  §52.13)*: each partition answering its own needs partial states core's
-  Finalize Agg can combine - `sum(int8)` and `avg` keep `internal` states, which the node would
-  have to emit serialized (`int8_avg_serialize()`, `numeric_poly_serialize()`); `min`, `max` and the
-  int8 sums of `sum(int2/int4)` combine as they are. The FK-side join's counts per dimension row
-  (§27) would each need the slices - a group at a time, or decoded by fact key.
+  §52.13; groups as partial rows but for `avg` and `sum(int8)`: 2026-11-10, §52.15)*: each
+  partition answering its own needs partial states core's Finalize Agg can combine - `sum(int8)`
+  and `avg` keep `internal` states, which the node would have to emit serialized
+  (`int8_avg_serialize()`, `numeric_poly_serialize()`); `min`, `max` and the int8 sums of
+  `sum(int2/int4)` combine as they are. The FK-side join's counts per dimension row (§27) would
+  each need the slices - a group at a time, or decoded by fact key.
 - **The decode route on a standby**, which cannot collect the `WHERE`: a walk with the row filter
   and the located sources would do, as §34's does without a copy.
 - **A summed range's collection for C0 is underpriced**: `u4 sum, range 10%` runs at 210 units a
@@ -33840,9 +33838,9 @@ planner keeps (§16):
   a parent pruned to one leaf is priced as that leaf named alone.
 - **EXPLAIN** names no index in `Aggregates From Slices`, as it names none in `Lion Indexes`:
   each leaf reads its own.
-- **Not taken**: a `GROUP BY` (§52.12: core's Finalize HashAggregate combines the leaves'
-  partial groups, and `avg` and `sum(int8)` have `internal` partial states the node would have to
-  serialize; an in-node merge of every leaf's groups is what §16 removed for its memory); a clause
+- **Not taken**: `avg` and `sum(int8)` in a `GROUP BY`, whose `internal` partial states the node
+  would have to serialize for core's Finalize HashAggregate (the rest of a `GROUP BY`: §52.15;
+  an in-node merge of every leaf's groups is what §16 removed for its memory); a clause
   on the partition key with `enable_partition_pruning` off, or one a kept leaf's bounds do not
   imply, which stays residual (§16, "Residual clauses over a partitioned table"); a hot standby,
   as for a table. A range on a sliced column, as the `WHERE` of these aggregates or of a count,
@@ -33856,8 +33854,8 @@ index, every type of the allowlist with NULLs, extremes and infinities, `int8` s
 `bigint`; `WHERE`s on other indexed columns, pruning by the key, the key implied, pruned to
 nothing, pruning off, a generic plan and a LATERAL rescan; a dirty heap - updates that move rows
 between leaves, deletes, this transaction's rows rolled back - and VACUUM, with `EXPLAIN ANALYZE`'s
-counters; and the declines (a leaf with an unsliced, a partial or an expression's index, a
-`GROUP BY`, a residual clause, the switch off; a REINDEX under a cursor refused).
+counters; and the declines (a leaf with an unsliced, a partial or an expression's index, an
+`avg` per group, a residual clause, the switch off; a REINDEX under a cursor refused).
 `test/sql/slices_partitioned_leaf.sql` has the cases pruned to one leaf (of a sub-partitioned
 parent, an empty one, a LIST's NULL partition, one of a HASH's), apart because PostgreSQL 18.0 to
 18.6 drop a disabled path's `disabled_nodes` in an Append of one child (fixed upstream for 18.7):
@@ -33865,7 +33863,116 @@ the plan forced off is not off there and is the cheaper on data this small, so t
 once on those releases.
 `test/isolation/slices_partitioned.spec` runs §52.11's snapshot checks against a parent of three
 leaves, the writer's updates moving rows between them; `slices_plan.sql`'s partitioned table now
-gets its one row from the slices and its `GROUP BY` from core.
+gets its one row and its groups (§52.15) from the slices.
+
+### 52.14 Filtered aggregates (2026-11-10)
+
+An aggregate of §52.1 with a `FILTER` is answered from the slices over its filter's rows:
+
+    SELECT sum(b) FILTER (WHERE h = 1), sum(b) FILTER (WHERE h = 2), sum(b),
+           count(*) FILTER (WHERE h = 1)
+      FROM t WHERE g = 3;
+
+      Custom Scan (LionCount)
+        Lion Indexes: t_g (g = 3)
+        Count Filter 1: t_h (h = 1)
+        Count Filter 2: t_h (h = 2)
+        Aggregates From Slices: t_v (b, filter 1: every bit counted),
+          t_v (b, filter 2: every bit counted), t_v (b: every bit counted)
+
+- **The filter is a filtered count's** (§10, "Filtered counts"): its condition numbered and
+  analysed as a filtered count's is, one filter for each distinct condition, shared by a
+  `count(*) FILTER` of the same condition. A condition the posting sets do not answer declines the
+  query as it declines a filtered count. `count(x) FILTER (WHERE c)` of a sliced column is taken
+  here, from C0's count, with no NOT NULL proof (E holds no NULL), where a column no index slices
+  goes to the filtered counts and their proof.
+- **A sliced column is a column and a run**: `sum(b)`, `sum(b) FILTER (WHERE h = 1)` and `max(b)
+  FILTER (WHERE h = 1)` are two columns of member 25, (b, run 0) and (b, run 1), the second with its
+  sum and its descent. Member 25 has a fifth list, each column's run; a run past the plan's filters
+  is refused on decode.
+- **The executor** answers a run's columns where run 0's were answered, after the run is located
+  and before its sets are released (`lion_count_runs()` calls `lion_slice_run()` or, on a
+  partitioned table, `lion_slice_part()` for every run): C0 = E ∧ (WHERE ∧ filter f), collected
+  from run f's located sources, and then §52.2's counts and descents. A run is counted only where
+  the target list asks for its count (`lion_run_counted()`): a run whose only readers are slice
+  columns is located and collected, not counted, since |C0| is the count those columns need. A run
+  that selects nothing answers 0 and NULLs as §52.2's `WHERE` does.
+- **A range in a filter** on a sliced column is folded from the slices (§53) as a range of the
+  `WHERE` is: `lion_count_path_filters()` marks it a slice range where the build is §53's, and
+  EXPLAIN's `Range From Slices` lists it with its filter, `(32 slices, filter 2)`. §53's build is
+  offered with no `WHERE` when an aggregate has a `FILTER` (`lion_query_may_slice_ranges()`).
+  A range on another column is §10's: a source collected from its entries (§32).
+- **The price** is each run's own: its located sources and collection priced as
+  `lion_count_path_price_runs()` priced that run (`runcost[r]`), its rows the relation's under the
+  `WHERE`'s and the filter's selectivity, and its count only where something counts it - where
+  every run had been priced as the whole multi-run count, which left plans the slices win to
+  core.
+- **Why it is exact**: §52.2's argument, run by run. Run f's sources are located under the node's
+  snapshot with their pins; C0 is a copy made after it, counted only ANDed with a slice located
+  with its pin. Nothing in a run touches another's sets (§10, "Runs").
+
+### 52.15 Partial rows (2026-11-10)
+
+A `GROUP BY` beside filters, and a partitioned table's `GROUP BY`, go up as §10's partial rows
+below core's Finalize HashAggregate:
+
+    SELECT g, count(*), sum(b) FILTER (WHERE h = 1), max(tz) FILTER (WHERE h = 1), min(b)
+      FROM t GROUP BY g;
+
+      Finalize HashAggregate
+        Group Key: g
+        ->  Custom Scan (LionCount)
+              Lion Indexes: t_g (g)
+              Count Filter 1: t_h (h = 1)
+              Group Key: g
+              Aggregates From Slices: t_v (b, filter 1: every bit counted),
+                t_v (tz, filter 1: existence counted, max descent), t_v (b: existence counted, min descent)
+              Slice Groups: one at a time
+
+- **The rows**: each run's groups, and each leaf's, are rows of their own, as §10's filtered
+  counts per group are; a row of run r holds run r's sliced columns, answered a group at a time
+  (§52.3), and NULL in every other run's (`lion_slice_partial_null()`), which the combine
+  functions of `sum`, `min` and `max` skip. Over a partitioned table each leaf's groups go up as
+  that leaf's run is answered (§52.13), and the Finalize Agg adds a group's leaves up.
+- **The aggregates** are those whose partial state is their value (`LION_SAGG_IS_PARTIAL_OK()`):
+  `count(x)` (int8), `sum(int2)` and `sum(int4)` (an int8 sum), `min` and `max`. `avg` and
+  `sum(int8)` keep `internal` partial states core serializes with `int8_avg_serialize()` and
+  `numeric_poly_serialize()`, which the node does not write; a query with one of them in partial
+  rows is declined, here and on a partitioned table, and goes to the counts with an Agg above
+  them or to core's plan. A `GROUP BY` of a table with no filter is §52.3's final rows, as before.
+- **Not the decode route** (§52.4): its batches go up final, so a plan with partial rows answers
+  its groups one at a time. Many groups of a filtered run lose to the ordinary plan, and the
+  price says so (§52.6's per-group counts).
+- **The price**: the rows are the groups the node emits (`outrows`) where the partitioned
+  branch had priced one row.
+
+**Measured** (PostgreSQL 18.7 release build, two parallel workers a gather, warm, best of five; a
+synthetic table of 2 million rows, `amount int4` sliced, five statuses, 50 countries of 40,000
+rows each, 20 kinds, a third of the rows flagged; the partitioned copy in four leaves, each with
+its own indexes; "before" is the plan with `pg_lion.enable_count_slices` off, which is the plan
+these queries got before):
+
+| query | before | from slices | |
+|---|---|---|---|
+| `sum(amount) FILTER (WHERE flag), sum(amount) FILTER (WHERE kind = 3), sum(amount), count(*) ... WHERE country = 'c1'` | 37.8 ms | 7.0 ms | 5.4x |
+| `sum FILTER (flag), max FILTER (kind = 3), min FILTER (status = 'paid')`, no `WHERE` | 93.0 ms | 17.4 ms | 5.3x |
+| `count(*) FILTER (WHERE amount > 5000), sum(amount) FILTER (WHERE amount > 5000), count(*)` | 80.8 ms | 13.7 ms | 5.9x |
+| partitioned: `avg FILTER (kind = 3), max FILTER (status = 'paid') ... WHERE country = 'c2'` | 32.8 ms | 4.5 ms | 7.3x |
+| `status, count(*), sum(amount) FILTER (WHERE flag) GROUP BY status` | 106.4 ms | 16.4 ms | 6.5x |
+| the same with `max FILTER`, `min` and `WHERE country = 'c1'` | 33.5 ms | 30.1 ms | 1.1x |
+| partitioned: `status, sum(amount), max(amount) GROUP BY status` | 108.5 ms | 32.4 ms | 3.3x |
+| partitioned: `status, count(*), sum FILTER (kind = 3) ... WHERE country = 'c2' GROUP BY status` | 35.5 ms | 8.6 ms | 4.1x |
+
+`country, sum(amount), min(amount) ... WHERE status = 'paid' GROUP BY country` over the partitions,
+50 groups of a fifth of the rows in four leaves, is priced at three times core's parallel plan and
+left to it (82 ms against 222 from slices when forced).
+
+`test/sql/slices_plan.sql` (section 8) and `test/sql/slices_partitioned.sql` compare each answer
+with the pushdown off: every type of the allowlist in a filter, a column in several runs, a filter
+that selects nothing, a range in a filter from the entries and from the slices, a `HAVING` over a
+filtered aggregate, one and two grouping columns with filters, a partitioned table's groups with
+and without filters, and the declines (an `avg` or an int8 `sum` in partial rows, a filter the
+posting sets do not answer).
 
 ## 53. Ranges from slices (2026-10-27)
 
@@ -34250,8 +34357,9 @@ What the tables say:
   planner's build decide per partition - the slices' index is matched per relation already
   (§16), but the build is declined whole, as §52's is. *(2026-10-28, §53.11: partitioned
   tables done, every partition's index slicing the column or the build declined.)* The FK-side
-  join's fact filters (§27) and the anti join's take ranges as §32's sources only. A filtered
-  count's condition (§10, "Filtered counts") takes its ranges from the entries.
+  join's fact filters (§27) and the anti join's take ranges as §32's sources only. *(A filtered
+  count's condition (§10, "Filtered counts") takes a range on a sliced column from the slices
+  since 2026-11-10, §52.14.)*
 - **The fold at the WHERE's keys alone**: beside a selective clause, E's keys are mostly keys the
   count never reaches. Folding only at the keys of the other sources (sought as the probe of §32
   seeks a summed range's sets) would make the copy the WHERE's and no longer a source of its own,

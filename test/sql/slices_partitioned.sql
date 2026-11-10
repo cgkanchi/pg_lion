@@ -250,6 +250,19 @@ SELECT spt_q('SELECT sum(b) FROM spr WHERE g = 2 HAVING sum(b) > 0');
 SELECT spt_q('SELECT sum(b) FROM spr WHERE g = 2 HAVING sum(b) < 0');
 -- expressions over the aggregates
 SELECT spt_q('SELECT sum(a) + 1, max(c) - min(c), avg(b) * 2 FROM spr WHERE h = 2');
+-- filtered aggregates (DESIGN.md §52, "Filtered aggregates"): each over its
+-- filter's run, every partition's added up
+SELECT spt_q('SELECT sum(b) FILTER (WHERE h = 1), avg(c) FILTER (WHERE g = 2), max(tz) FILTER (WHERE h = 1), sum(b), count(*) FILTER (WHERE h = 1) FROM spr WHERE g <> 3');
+SELECT spt_q('SELECT sum(a) FILTER (WHERE g = 99), min(d) FILTER (WHERE g = 99), count(c) FILTER (WHERE g = 99) FROM spr');
+-- a GROUP BY: each partition's groups go up as partial rows, which a count,
+-- an int2 or int4 sum, a minimum and a maximum are the partial states of
+-- (§52, "Partial rows") - beside filtered aggregates and counts too
+SELECT * FROM spt_plan('SELECT g, sum(b), min(a), max(tz), count(c) FROM spr GROUP BY g');
+SELECT spt_q('SELECT g, sum(b), min(a), max(tz), count(c), min(d), max(ts), max(c) FROM spr GROUP BY g');
+SELECT spt_q('SELECT g, sum(a), max(b) FROM spr WHERE h = 1 GROUP BY g');
+SELECT spt_q('SELECT g, h, sum(b), min(c) FROM spr WHERE k < 300 GROUP BY g, h');
+SELECT spt_q('SELECT g, sum(b) FILTER (WHERE h = 1), max(d) FILTER (WHERE h = 2), count(*) FILTER (WHERE h = 1), count(*) FROM spr GROUP BY g');
+SELECT spt_q('SELECT g, sum(b) FROM spr GROUP BY g HAVING max(b) > 0');
 
 -- ---------- 2. pruning, and what the bounds imply ----------
 -- a WHERE on the key that prunes to some partitions and to none at all (to
@@ -394,10 +407,12 @@ CREATE INDEX ON spd_3 USING lion (w, v) WITH (slices = on);
 ANALYZE spd;
 SELECT spt_q('SELECT sum(v), max(w) FROM spd WHERE g = 2');
 SELECT spt_q('SELECT sum(v), avg(w), min(v), max(w), count(*) FROM spd');
--- a GROUP BY over a partitioned table is not answered from slices (its
--- groups go up as partial aggregates; an average or an int8 sum would need
--- serialized partial states)
+-- a GROUP BY over a partitioned table goes up as partial rows, which a sum
+-- of an int4 and a maximum are the partial states of (DESIGN.md §52,
+-- "Partial rows"); an average or an int8 sum would need serialized ones
 SELECT spt_q('SELECT g, sum(v), max(w) FROM spd GROUP BY g');
+SELECT spt_q('SELECT g, avg(v) FROM spd GROUP BY g');
+SELECT spt_q('SELECT g, sum(w) FROM spd GROUP BY g');
 -- a residual clause, as on one table
 SELECT spt_q('SELECT sum(v) FROM spd WHERE g = 2 AND w % 3 = 0');
 -- the switch
