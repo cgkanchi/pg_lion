@@ -2457,6 +2457,11 @@ struct RelOptInfo;
 extern double lion_index_slice_pages(Relation index, double heap_pages,
 									 double tuples);
 extern void lion_leave_out_slice_pages(struct RelOptInfo *rel);
+/* day filters as ranges of the column (lion_plan_dayrange.c, DESIGN.md §54) */
+struct PlannerInfo;
+extern bool lion_enable_date_ranges;	/* GUC pg_lion.enable_date_ranges */
+extern void lion_rewrite_day_filters(struct PlannerInfo *root,
+									 struct RelOptInfo *rel);
 /* the entries a lion path's lookups hand their answer out by (lion_amcost.c) */
 extern double lion_cost_path_entries(struct PlannerInfo *root,
 									 struct IndexPath *path);
