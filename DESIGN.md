@@ -3887,6 +3887,89 @@ bitmap heap scan; `c200 = 17 AND payload LIKE 'ab%'` 9.3 to 8.7 against a plain 
 `test/sql/countresid.sql` checks the shapes against the sequential plan, with dead versions the
 residual must not see; `node_contracts.sql` revokes `int4mod` under a residual.
 
+### A test of each key (2026-11-10)
+
+A WHERE clause of one column that no posting set answers as it stands - `lower(status) = 'paid'`,
+`country ILIKE 'c1%'`, `country ~ '^c[12]$'`, `kind % 5 = 0` - is, on a column of few keys, the IN
+list of the keys that pass it. The node walks the column's entries, evaluates the clause once per
+key, and locates the keys that pass as it locates any IN list (§15): a batch at a time past
+`lion_array_batch_size()`, or collected beside a GROUP BY. No row is fetched for it, where a
+residual clause (above) fetches every row the other clauses select and the ordinary plan reads the
+table.
+
+**Which clauses** (`lion_keytest_leaf()`, tried where `lion_analyze_leaf()` finds nothing):
+
+- it reads one user column of the table and nothing else of it - no system column, no expression
+  column (§41) - and is immutable, with no subplan: a key's answer is every row's of that key,
+  however often and wherever it is evaluated. Parameters are allowed, and evaluated with it;
+- the index holds the rows' own values (`lion_index_can_emit_value()`, the value-representation
+  rule above, checked where the index is matched): numeric's 1.0 and 1.00 are one entry, and
+  `n::text = '1.00'` is true of one of them only;
+- it is NULL or false where the column is NULL, proved by folding it with a NULL in the column's
+  place: the NULL entry, which the list never holds, holds no row it selects;
+- it can raise no error on any value of the column (`lion_keytest_cannot_fail()`): every function
+  it calls is leakproof, or one that fails only on its other, constant arguments, which are checked
+  - text's case mapping, lengths, trims, `left()`, `right()`, two-argument `substr()` and `||`;
+  LIKE, ILIKE and the regular expressions of the column against a pattern under a deterministic
+  collation, a constant LIKE pattern not ending in its escape character; a division by a constant
+  other than 0 and -1 (`INT_MIN / -1` overflows), a remainder by one other than 0; a value's text.
+  The walk tests keys a sequential scan may never evaluate the clause on: one whose every row
+  another clause rejects, which the scan tests first because it orders a row's clauses by their
+  cost, so that `z <> 0 AND 12 / z > 1` raises nothing there. A clause that cannot fail does not
+  depend on that order, nor does the cost model's fold of it on the most common values (below),
+  which runs before any row is read;
+- the column has few keys by its statistics: no more than a hundredth of the table's rows
+  (`LION_KEYTEST_MAX_KEY_SHARE`). The list is held whole, as a parameter's of any length is, and
+  every key is tested.
+
+An OR of the one column is one test, taken whole (`c LIKE 'c1%' OR c = 'c5'`); an OR across columns
+is not. The clause may stand in a count, a GROUP BY (§36's derived groups included), a
+count(DISTINCT), over a partitioned table, whose every partition tests its own keys, and in the
+parallel count and GROUP BY, whose participants each make the list. Not in a filtered count's
+condition or beside filtered counts, a count by cells, the FK-side join, the anti join, the decoded
+walk, §37's aggregates over keys, a SELECT DISTINCT's keys or the top k
+(`lion_count_path_keytest_ok()`). Where a build takes a test, it is made once more with the clause
+left to what else would take it - residual, or the ordinary plan - and add_path() keeps the
+cheaper: a few rows the other clauses select are fetched for less than every key is tested, and a
+shape that takes no test may take a residual clause.
+
+**A key no visible row holds** is not tested. The clause cannot fail on the column's value, but it
+fails on any key where its constant does (`c LIKE $1` with a pattern ending in its escape
+character), where a sequential scan over rows that are all deleted never evaluates it. So the walk
+first asks whether a row the snapshot sees holds the key - the existence test of a count(DISTINCT)
+walk (§26), against the key's set alone - and releases the set before the clause runs.
+
+**How it is carried.** The leaf is an ARRAY clause on the column under the type's own equality, its
+value the clause itself, flagged `LION_CLAUSE_KEYTEST` in CLAUSEKINDS (shape 35).
+`lion_plan_custom_path()` adds the column to `custom_scan_tlist` as a resjunk `LION_TL_RESID` one,
+as for a residual clause, so setrefs.c points the clause's Var at it, records its functions as
+plan dependencies and sees its Params. `lion_begin_keytest()` initialises it with ExecInitQual()
+over a virtual slot of the scan tuple, which checks EXECUTE on what it calls; `lion_keytest_values()`,
+at the start of each relation's turn and each run (`lion_locate_where()`), puts each key in the
+column's place, evaluates the clause and makes the array of the keys that pass, in a context of the
+clause's own. A LATERAL value in the clause makes a new list per outer row. Only the relation's own
+items are tested: a partition whose bounds imply the clause (§16) leaves it out and walks nothing.
+
+**The price** (`lion_count_path_keytest_price()`): per key of the column, by its statistics, in each
+relation counted, the entry's read (`LION_RANGE_ENTRY_COST`), the existence test
+(`LION_DISTINCT_TEST_COST`) and the clause's evaluation, all at startup. The rows it selects are
+priced as the IN list of the most common values that pass it, folded on each at plan time
+(`lion_keytest_costclause()`), where those hold all but a hundredth of the column's non-NULL rows,
+and by core's estimate of the clause otherwise.
+
+Measured on 2M rows (PostgreSQL 18.7 release build, warm, `status` of 5 values, `country` of 50,
+`kind` of 20), against the plan with `pg_lion.enable_key_tests` off and a sequential scan:
+`count(*) WHERE lower(status) = 'paid'` 0.4 ms against 458 and 457; `country ILIKE 'C1%'` 2.2
+against 655 and 621; `country ~ '^c[12]$'` 0.5 against 411 and 448; `country LIKE 'c1%' AND status
+= 'paid'` 2.1 against 72 (residual) and 147; `status, count(*) WHERE country ILIKE 'C1%' GROUP BY
+status` 4.1 against 609 and 601; `kind % 5 = 0` 1.2 against 120 and 118.
+
+EXPLAIN prints the clause as itself, `t_c ((c ~~* 'C1%'::text))`, and ANALYZE counts `Keys Tested`
+and `Keys Passed` over every relation, run and participant. `pg_lion.enable_key_tests` turns it
+off. `test/sql/where_keytest.sql` checks the shapes against the sequential plan, with a key only
+deleted rows hold, updated rows, partitions, generic plans, a LATERAL rescan and the clauses
+declined.
+
 ### Filtered counts, residual clauses and complements beside the other shapes
 
 Which of the WHERE's newer forms each of the other shapes takes, every answer compared with the

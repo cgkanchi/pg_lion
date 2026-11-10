@@ -1,0 +1,293 @@
+-- A WHERE clause of one column that no posting set answers as it stands -
+-- lower(s) = 's1', c ILIKE 'C1%', c ~ '^c[12]$', k % 5 = 0 - counted as the
+-- IN list of the column's keys that pass it (DESIGN.md §10, "A test of each
+-- key").  Each key a visible row holds is tested once.
+--
+-- Every answer is compared with a sequential scan with the pushdown off, as a
+-- multiset in both directions, and says how many keys were tested and passed.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+/*
+ * lion_kt() runs a query with every other scan disabled, so that a LionCount
+ * path that is built at all is the plan, and again as a sequential scan with
+ * the pushdown off, and compares the two.  The first run is EXPLAIN ANALYZE's,
+ * whose Keys Tested and Keys Passed say whether the keys were tested.
+ */
+CREATE FUNCTION lion_kt(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	tested bigint;
+	passed bigint;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		ELSIF ln ~ '^\s*Keys Tested: ' THEN
+			tested := coalesce(tested, 0) + substring(ln FROM 'Keys Tested: (\d+)')::bigint;
+		ELSIF ln ~ '^\s*Keys Passed: ' THEN
+			passed := coalesce(passed, 0) + substring(ln FROM 'Keys Passed: (\d+)')::bigint;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_kt_on AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	EXECUTE format('CREATE TEMP TABLE lion_kt_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'SELECT count(*) FROM lion_kt_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_kt_on EXCEPT ALL SELECT * FROM lion_kt_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_kt_off EXCEPT ALL SELECT * FROM lion_kt_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_kt_on, lion_kt_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s, %s rows',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  CASE WHEN tested IS NULL THEN 'no keys tested'
+					   ELSE format('%s of %s keys passed', passed, tested) END,
+				  nrows);
+END $$;
+/* The same under a generic plan, which keeps $n a Param. */
+CREATE FUNCTION lion_kt_prep(q text, args text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	tested bigint;
+	passed bigint;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'PREPARE lion_ktp_on AS ' || q;
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) EXECUTE lion_ktp_on(' || args || ')' LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		ELSIF ln ~ '^\s*Keys Tested: ' THEN
+			tested := coalesce(tested, 0) + substring(ln FROM 'Keys Tested: (\d+)')::bigint;
+		ELSIF ln ~ '^\s*Keys Passed: ' THEN
+			passed := coalesce(passed, 0) + substring(ln FROM 'Keys Passed: (\d+)')::bigint;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_kt_on AS EXECUTE lion_ktp_on(%s)', args);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE 'PREPARE lion_ktp_off AS ' || q;
+	EXECUTE format('CREATE TEMP TABLE lion_kt_off AS EXECUTE lion_ktp_off(%s)', args);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'DEALLOCATE lion_ktp_on';
+	EXECUTE 'DEALLOCATE lion_ktp_off';
+	EXECUTE 'SELECT count(*) FROM lion_kt_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_kt_on EXCEPT ALL SELECT * FROM lion_kt_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_kt_off EXCEPT ALL SELECT * FROM lion_kt_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_kt_on, lion_kt_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s, %s rows',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  CASE WHEN tested IS NULL THEN 'no keys tested'
+					   ELSE format('%s of %s keys passed', passed, tested) END,
+				  nrows);
+END $$;
+/*
+ * 3000 rows.  s: 's0' .. 's9' and 'S0', NULL on every 11th row.  c: 'c0' ..
+ * 'c19'.  k: 0 .. 24.  b: char(3) 'b0' .. 'b3'.  v: varchar 'v0' .. 'v4'.
+ * n: numeric 1.0 and 1.00, which are equal and print differently.  u: unique.
+ */
+CREATE TABLE lion_kt (
+	id	int		NOT NULL,
+	s	text,
+	c	text	NOT NULL,
+	k	int		NOT NULL,
+	b	char(3)	NOT NULL,
+	v	varchar(8) NOT NULL,
+	n	numeric	NOT NULL,
+	u	int		NOT NULL
+);
+INSERT INTO lion_kt
+SELECT i,
+	   CASE WHEN i % 11 = 0 THEN NULL WHEN i % 23 = 0 THEN 'S0'
+			ELSE 's' || (i % 10) END,
+	   'c' || (i % 20),
+	   i % 25,
+	   'b' || (i % 4),
+	   'v' || (i % 5),
+	   CASE WHEN i % 2 = 0 THEN 1.0 ELSE 1.00 END,
+	   i
+  FROM generate_series(1, 3000) i;
+CREATE INDEX lion_kt_s ON lion_kt USING lion (s);
+CREATE INDEX lion_kt_c ON lion_kt USING lion (c);
+CREATE INDEX lion_kt_k ON lion_kt USING lion (k);
+CREATE INDEX lion_kt_b ON lion_kt USING lion (b);
+CREATE INDEX lion_kt_v ON lion_kt USING lion (v);
+CREATE INDEX lion_kt_n ON lion_kt USING lion (n);
+CREATE INDEX lion_kt_u ON lion_kt USING lion (u);
+CREATE UNIQUE INDEX lion_kt_id ON lion_kt (id);
+VACUUM (FREEZE, ANALYZE) lion_kt;
+-- ---- 1. one clause --------------------------------------------------------
+SELECT count(*) FROM lion_kt WHERE lower(s) = 's0';
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE lower(s) = ''s0''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE upper(s) = ''S0''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE lower(s) IN (''s1'', ''s2'')');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE NOT (lower(s) = ''s1'')');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c NOT LIKE ''c1%''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c ILIKE ''C1%''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c NOT ILIKE ''C1_''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c ~ ''^c[12]$''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c !~ ''1''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c ~* ''^C1''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c SIMILAR TO ''c1[0-3]''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1#_'' ESCAPE ''#''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ANY (ARRAY[''c1%'', ''c3''])');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE length(c) = 3');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE left(c, 2) = ''c1''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE s || ''x'' = ''s1x''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE k % 5 = 0');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE k / 5 = 2');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE k::text LIKE ''1%''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE CASE WHEN k < 10 THEN ''low'' ELSE ''high'' END = ''low''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE v ILIKE ''V2''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE lower(s) = ''nothing''');
+-- ---- 2. beside other clauses ---------------------------------------------
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%'' AND s = ''s3''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE lower(s) = ''s1'' AND c ~ ''^c1''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c ILIKE ''c1%'' AND k IN (1, 2, 3)');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE k % 5 = 0 AND k > 10');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%'' AND c <> ''c12''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%'' AND u < 1000');
+-- an OR of the one column is one test; an OR of two columns is not
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%'' OR c = ''c5''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE lower(s) = ''s1'' OR c = ''c5''');
+-- ---- 3. GROUP BY and count(DISTINCT) -------------------------------------
+SELECT lion_kt('SELECT s, count(*) FROM lion_kt WHERE c ILIKE ''c1%'' GROUP BY 1');
+SELECT lion_kt('SELECT c, count(*) FROM lion_kt WHERE c LIKE ''c1%'' GROUP BY 1');
+SELECT lion_kt('SELECT k / 5, count(*) FROM lion_kt WHERE lower(s) IN (''s1'', ''s0'') GROUP BY 1');
+SELECT lion_kt('SELECT upper(s), count(*) FROM lion_kt GROUP BY 1 HAVING upper(s) > ''S1''');
+SELECT lion_kt('SELECT count(DISTINCT k) FROM lion_kt WHERE c LIKE ''c1%''');
+-- ---- 4. declined ---------------------------------------------------------
+-- true where the column is NULL: the NULL entry is never in the list
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE lower(s) IS NULL');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE coalesce(s, ''none'') = ''none''');
+-- may fail on a value: a division by the column, or by -1, the pattern the
+-- column itself
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE k <> 0 AND 100 / k > 10');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE k / -1 = -3');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE ''c12'' LIKE c');
+-- not immutable
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE (''c1'' || to_char(now(), ''""''))');
+-- numeric: 1.0 and 1.00 are one entry, and print differently; char(n),
+-- whose equality ignores trailing spaces, is not known to be any better
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE n::text = ''1.00''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE b LIKE ''b1%''');
+-- a column of many keys
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE u % 7 = 3');
+-- switched off
+SET pg_lion.enable_key_tests = off;
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%''');
+RESET pg_lion.enable_key_tests;
+-- ---- 5. a dirty heap: deleted and updated rows, not vacuumed --------------
+-- c = 'cz' is only in deleted rows: its key is not tested
+INSERT INTO lion_kt SELECT i, 's1', 'cz', 1, 'b1', 'v1', 1, i FROM generate_series(3001, 3050) i;
+DELETE FROM lion_kt WHERE c = 'cz';
+DELETE FROM lion_kt WHERE id % 13 = 0;
+UPDATE lion_kt SET c = 'c1x' WHERE id % 31 = 0;
+UPDATE lion_kt SET s = 'S1' WHERE id % 37 = 0;
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c%''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE upper(s) = ''S1''');
+SELECT lion_kt('SELECT s, count(*) FROM lion_kt WHERE c ~ ''^c1.$'' GROUP BY 1');
+-- ---- 6. parameters, and a rescan per outer row ---------------------------
+SELECT lion_kt_prep('SELECT count(*) FROM lion_kt WHERE c LIKE $1', '''c1%''');
+SELECT lion_kt_prep('SELECT count(*) FROM lion_kt WHERE lower(s) = $1 AND k < $2', '''s0'', 12');
+SELECT lion_kt_prep('SELECT k / 5, count(*) FROM lion_kt WHERE c ~ $1 GROUP BY 1', '''^c[13]''');
+SELECT lion_kt('SELECT x, s.* FROM (VALUES (''c1''), (''c2''), (''zz'')) v(x), LATERAL (SELECT count(*) FROM lion_kt WHERE c LIKE v.x || ''%'') s');
+-- ---- 7. a partitioned table ---------------------------------------------
+CREATE TABLE lion_ktp (id int NOT NULL, s text, c text) PARTITION BY RANGE (id);
+CREATE TABLE lion_ktp1 PARTITION OF lion_ktp FOR VALUES FROM (0) TO (1500);
+CREATE TABLE lion_ktp2 PARTITION OF lion_ktp FOR VALUES FROM (1500) TO (4000);
+INSERT INTO lion_ktp SELECT id, s, c FROM lion_kt;
+CREATE INDEX ON lion_ktp USING lion (s);
+CREATE INDEX ON lion_ktp USING lion (c);
+VACUUM (FREEZE, ANALYZE) lion_ktp;
+SELECT lion_kt('SELECT count(*) FROM lion_ktp WHERE c LIKE ''c1%''');
+SELECT lion_kt('SELECT s, count(*) FROM lion_ktp WHERE c ILIKE ''C1%'' GROUP BY 1');
+SELECT lion_kt('SELECT count(*) FROM lion_ktp WHERE lower(s) = ''s1'' AND c ~ ''^c1''');
+-- a partition whose bounds imply the test leaves it out, and walks nothing:
+-- the one of s1 has no index on s
+CREATE TABLE lion_ktl (id int NOT NULL, s text, c text) PARTITION BY LIST (s);
+CREATE TABLE lion_ktl1 PARTITION OF lion_ktl FOR VALUES IN ('s1');
+CREATE TABLE lion_ktl2 PARTITION OF lion_ktl DEFAULT;
+INSERT INTO lion_ktl SELECT id, s, c FROM lion_kt;
+CREATE INDEX ON lion_ktl2 USING lion (s);
+CREATE INDEX ON lion_ktl USING lion (c);
+VACUUM (FREEZE, ANALYZE) lion_ktl;
+SELECT lion_kt('SELECT count(*) FROM lion_ktl WHERE s = ''s1'' OR upper(s) = ''S2''');
+SELECT lion_kt('SELECT c, count(*) FROM lion_ktl WHERE s = ''s1'' OR upper(s) = ''S2'' GROUP BY 1');
+-- ---- 8. parallel plans: each participant tests the keys ----------------
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET pg_lion.parallel_range_keys = 1;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.enable_ordered_scan = off;
+EXPLAIN (COSTS OFF) SELECT s, count(*) FROM lion_kt WHERE c ILIKE 'C1%' GROUP BY 1;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.enable_ordered_scan;
+-- how many participants tested the keys varies
+SELECT regexp_replace(lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%'''), '\d+ of \d+ keys', 'keys');
+SELECT regexp_replace(lion_kt('SELECT s, count(*) FROM lion_kt WHERE c ILIKE ''C1%'' GROUP BY 1'), '\d+ of \d+ keys', 'keys');
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET pg_lion.parallel_range_keys;
+-- ---- 9. EXPLAIN ---------------------------------------------------------
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.enable_ordered_scan = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_kt WHERE lower(s) = 's1';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_kt WHERE c LIKE 'c1%' AND s = 's3';
+EXPLAIN (COSTS OFF) SELECT s, count(*) FROM lion_kt WHERE c ~ '^c[12]$' GROUP BY 1;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(*) FROM lion_kt WHERE c ILIKE 'C1%';
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.enable_ordered_scan;
+DROP TABLE lion_kt, lion_ktp, lion_ktl;
+DROP FUNCTION lion_kt(text), lion_kt_prep(text, text);

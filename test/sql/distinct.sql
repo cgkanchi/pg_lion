@@ -350,7 +350,12 @@ SELECT lion_dc('SELECT sum(DISTINCT k) FROM lion_dt');
 SELECT lion_dc('SELECT count(DISTINCT k), count(g) FROM lion_dt');
 -- a range on a column the walk does not drive is a source (DESIGN.md §32)
 SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a > 3');
--- a WHERE clause the posting sets cannot answer
+-- a WHERE clause the posting sets cannot answer ...
+SET pg_lion.enable_key_tests = off;
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a % 2 = 1');
+RESET pg_lion.enable_key_tests;
+-- ... unless as the keys of its column that pass it (DESIGN.md §10, "A test
+-- of each key")
 SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a % 2 = 1');
 -- a collation other than the index's: DISTINCT would compare differently
 SELECT lion_dc('SELECT count(DISTINCT t COLLATE "C") FROM lion_dt WHERE a = 3');

@@ -1259,9 +1259,11 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 
 		/*
 		 * Same rule for a pinned column whose value the output prints: an
-		 * index that cannot print it is no index for the clause.
+		 * index that cannot print it is no index for the clause.  Nor for a
+		 * test of each key (DESIGN.md §10), which tests the stored keys in
+		 * place of the rows' values.
 		 */
-		if (idx != NULL && ci->valueout &&
+		if (idx != NULL && (ci->valueout || ci->keytest) &&
 			!lion_index_can_emit_value(idx, col))
 			idx = NULL;
 

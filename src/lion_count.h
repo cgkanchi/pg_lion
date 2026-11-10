@@ -2050,6 +2050,13 @@ extern PGDLLIMPORT int lion_count_cells_max;
 extern PGDLLIMPORT bool lion_enable_expr_groups;
 
 /*
+ * Whether a WHERE clause of one lion-indexed column no posting set answers
+ * may be counted as the list of the column's keys that pass it (DESIGN.md
+ * §10, "A test of each key").  A planner switch.
+ */
+extern PGDLLIMPORT bool lion_enable_key_tests;
+
+/*
  * Whether the count pushdown may test WHERE clauses no posting set answers
  * on the heap rows the others select (DESIGN.md §10, "Residual clauses").
  * A planner switch.

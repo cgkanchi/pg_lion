@@ -835,11 +835,21 @@ SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a > 3');
  pushed down, 1 rows
 (1 row)
 
--- a WHERE clause the posting sets cannot answer
+-- a WHERE clause the posting sets cannot answer ...
+SET pg_lion.enable_key_tests = off;
 SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a % 2 = 1');
          lion_dc         
 -------------------------
  not pushed down, 1 rows
+(1 row)
+
+RESET pg_lion.enable_key_tests;
+-- ... unless as the keys of its column that pass it (DESIGN.md §10, "A test
+-- of each key")
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a % 2 = 1');
+       lion_dc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- a collation other than the index's: DISTINCT would compare differently

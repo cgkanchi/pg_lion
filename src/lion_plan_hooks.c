@@ -22,6 +22,7 @@ bool		lion_enable_decoded_walk = true;
 bool		lion_enable_count_cells = true;
 int			lion_count_cells_max = 134217728;
 bool		lion_enable_expr_groups = true;
+bool		lion_enable_key_tests = true;
 bool		lion_enable_topk = true;
 bool		lion_enable_count_slices = true;
 bool		lion_enable_slice_decode = true;
@@ -1091,6 +1092,50 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			if (!IsA(var, Var) || var->varno != (int) priv.scanrelid ||
 				var->varattno <= 0)
 				elog(ERROR, "LionCount: a residual clause reads more than its table's columns");
+			foreach(l2, ctlist)
+			{
+				Node	   *e = (Node *) ((TargetEntry *) lfirst(l2))->expr;
+
+				if (IsA(e, Var) && ((Var *) e)->varno == var->varno &&
+					((Var *) e)->varattno == var->varattno)
+				{
+					dup = true;
+					break;
+				}
+			}
+			if (dup)
+				continue;
+			ctlist = lappend(ctlist,
+							 makeTargetEntry((Expr *) copyObject(var),
+											 list_length(ctlist) + 1,
+											 NULL, true));
+			kinds = lappend_int(kinds, LION_TL_RESID(var->varattno));
+		}
+		list_free(vars);
+	}
+
+	/*
+	 * ... and the column each test of a key reads (DESIGN.md §10, "A test of
+	 * each key"), the same way: setrefs.c points the clause's Var at its
+	 * place in custom_scan_tlist, where the node puts each key it tests.
+	 */
+	for (o = 0; o < priv.nclause; o++)
+	{
+		List	   *vars;
+
+		if (!priv.clause[o].keytest)
+			continue;
+		vars = pull_var_clause((Node *) list_nth(priv.consts, o),
+							   PVC_INCLUDE_PLACEHOLDERS);
+		foreach(lc, vars)
+		{
+			Var		   *var = (Var *) lfirst(lc);
+			ListCell   *l2;
+			bool		dup = false;
+
+			if (!IsA(var, Var) || var->varno != (int) priv.scanrelid ||
+				var->varattno <= 0)
+				elog(ERROR, "LionCount: a test of each key reads more than its column");
 			foreach(l2, ctlist)
 			{
 				Node	   *e = (Node *) ((TargetEntry *) lfirst(l2))->expr;

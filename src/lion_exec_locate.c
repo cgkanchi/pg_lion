@@ -2004,6 +2004,120 @@ lion_ingroup_item(LionCountScanState *st)
 }
 
 /*
+ * THE TESTS OF EACH KEY (DESIGN.md §10, "A test of each key"): for each such
+ * clause, the keys of its column in the relation about to be counted that
+ * pass it, as the clause's IN list, an array in val, which the locate below
+ * then takes like any other list: past lion_array_batch_size() keys a batch
+ * at a time, or collected (lion_array_batch_prepare(), lion_locate_list(),
+ * lion_group_list_prepare()).  The array is held whole, as a parameter's of
+ * any length is; the planner takes the test only on a column of few keys
+ * (lion_keytest_leaf()).  Made again for each relation, since a partition's
+ * index has keys of its own, and each run, since the clause may read a
+ * parameter; in keycxt, which the next one resets.
+ *
+ * The column's entries are walked in its index (lion_entry_scan_begin_range()
+ * with no range: every entry, the NULL one aside, which the clause selects
+ * no row of - lion_keytest_leaf()).  An entry is tested only when a row the
+ * snapshot sees holds it: the existence test of a count(DISTINCT) walk
+ * (§26), against the entry's set alone, under its pin - so a key only
+ * deleted rows hold is never handed to the clause, which might fail on it
+ * where a sequential scan would never evaluate it.  The set is released
+ * before the clause runs, which may take any time.  The key goes into the
+ * one column of keyslot the clause reads, and the clause is evaluated as a
+ * qual, in keyecxt, whose per-tuple memory holds the key and is reset for
+ * the next.
+ */
+static void
+lion_keytest_values(LionCountScanState *st)
+{
+	ExprContext *econtext = st->keyecxt;
+	int			k;
+
+	/*
+	 * The relation's own items: a partition whose bounds imply the clause
+	 * leaves it out (§16), and has no index of it open.
+	 */
+	for (k = 0; k < st->nitem; k++)
+	{
+		LionClauseState *cl = &st->clause[st->item[k].clauseno];
+		TupleTableSlot *slot = cl->keyslot;
+		ArrayBuildState *astate;
+		LionEntryScan es;
+		MemoryContext oldcxt;
+
+		if (!cl->keytest || st->item[k].orno >= 0)
+			continue;
+		if (cl->idx == NULL)
+			elog(ERROR, "LionCount: a test of each key with no index");
+
+		/* the last relation's or run's list */
+		Assert(cl->valstore == NULL);
+		MemoryContextReset(cl->keycxt);
+		cl->val = (Datum) 0;
+		cl->valisnull = false;
+
+		oldcxt = MemoryContextSwitchTo(cl->keycxt);
+		astate = initArrayResult(cl->keytype, cl->keycxt, true);
+		lion_entry_scan_begin_range(&es, cl->idx, cl->idxcol, NULL);
+
+		for (;;)
+		{
+			LionPostingSet ps;
+			LionCountSource src;
+			Datum		key;
+			bool		exists;
+			int			j;
+
+			CHECK_FOR_INTERRUPTS();
+			ResetExprContext(econtext);
+			MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+			if (!lion_entry_scan_next(&es, &key, &ps))
+				break;
+			if (ps.keyisnull)
+			{
+				lion_posting_set_release(&ps);
+				continue;
+			}
+
+			memset(&src, 0, sizeof(src));
+			src.nsets = 1;
+			src.sets = &ps;
+			exists = lion_node_count(st, 1, &src, true) > 0;
+			lion_posting_set_release(&ps);
+			if (!exists)
+				continue;
+
+			cl->keystested++;
+			ExecClearTuple(slot);
+			for (j = 0; j < slot->tts_tupleDescriptor->natts; j++)
+			{
+				slot->tts_values[j] = (Datum) 0;
+				slot->tts_isnull[j] = true;
+			}
+			slot->tts_values[cl->keypos - 1] = key;
+			slot->tts_isnull[cl->keypos - 1] = false;
+			ExecStoreVirtualTuple(slot);
+			econtext->ecxt_scantuple = slot;
+			if (!ExecQual(cl->keyqual, econtext))
+				continue;
+			cl->keyspassed++;
+
+			/* copied into the array's context, a by-reference key too */
+			astate = accumArrayResult(astate, key, false, cl->keytype,
+									  cl->keycxt);
+		}
+		lion_entry_scan_end(&es);
+		ResetExprContext(econtext);
+		econtext->ecxt_scantuple = NULL;
+		ExecClearTuple(slot);
+
+		MemoryContextSwitchTo(cl->keycxt);
+		cl->val = makeArrayResult(astate, cl->keycxt);
+		MemoryContextSwitchTo(oldcxt);
+	}
+}
+
+/*
  * Locate the posting sets of every WHERE clause of the relation the node is
  * counting.  They stay located until lion_release_where() - with partitions
  * for one partition's turn, with a plain table until the node is done - and
@@ -2020,6 +2134,10 @@ lion_locate_where(LionCountScanState *st)
 	MemoryContext oldcxt;
 	int			ingroup = lion_ingroup_item(st);
 	int			k;
+
+	/* the lists of the tests of each key, this relation's (§10) */
+	if (st->keyecxt != NULL)
+		lion_keytest_values(st);
 
 	/* what this locates may be pinned until the next pause unpins it */
 	st->wherepinned = true;

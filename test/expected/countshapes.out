@@ -308,8 +308,9 @@ SELECT q, cs_q(q) FROM (VALUES
  SELECT d.r, count(*) FROM cs JOIN csd d ON d.pk = cs.a WHERE cs.n NOT IN (1, 2) GROUP BY d.r | count, 3 rows
 (8 rows)
 
--- a NULL in the list makes it unknown for every row, and an empty one true
--- for every row: both are the ordinary plan's
+-- a NULL in the list makes it unknown for every row, which a test of each
+-- key finds of every key (DESIGN.md §10, "A test of each key"), and an empty
+-- one true for every row, the ordinary plan's
 SELECT q, cs_q(q) FROM (VALUES
 	('SELECT count(*) FROM cs WHERE a NOT IN (3, NULL)'),
 	('SELECT count(*) FROM cs WHERE n <> ALL (''{}''::int[])'),
@@ -317,7 +318,7 @@ SELECT q, cs_q(q) FROM (VALUES
 ) v(q);
                           q                           |       cs_q       
 ------------------------------------------------------+------------------
- SELECT count(*) FROM cs WHERE a NOT IN (3, NULL)     | no count, 1 rows
+ SELECT count(*) FROM cs WHERE a NOT IN (3, NULL)     | count, 1 rows
  SELECT count(*) FROM cs WHERE n <> ALL ('{}'::int[]) | no count, 1 rows
  SELECT count(*) FROM cs WHERE u NOT IN (1, 2)        | no count, 1 rows
 (3 rows)
