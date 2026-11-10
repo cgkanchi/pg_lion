@@ -2588,6 +2588,12 @@ lion_slice_insert(Relation index, Relation heaprel, LionState *state,
 }
 
 /*
+ * The first block of the statement's insert context (lioninsert()): what a
+ * row allocates, with room to spare, so that no row needs a second block.
+ */
+#define LION_INSERT_CONTEXT_SIZE	(64 * 1024)
+
+/*
  * aminsert
  *
  * checkUnique is irrelevant (amcanunique is false) and indexUnchanged is
@@ -2625,9 +2631,31 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 
 	ix = lion_get_index_state(index);
 
-	insertcxt = AllocSetContextCreate(CurrentMemoryContext,
+	/*
+	 * The row is inserted in a context of its own, reset when it is done.
+	 * The context is the statement's: it is kept in the IndexInfo the
+	 * executor holds for the index (ii_AmCache, under ii_Context), so a
+	 * statement of many rows makes it once.  Its first block takes what one
+	 * row allocates - a few work buffers of LION_CONTAINER_MAX_SIZE, which
+	 * the allocator rounds up to 8 kB each - and is kept by every reset, so
+	 * a row allocates nothing from malloc.  A caller without an IndexInfo
+	 * gets a context for the row alone.
+	 */
+	if (indexInfo != NULL && indexInfo->ii_Context != NULL)
+	{
+		if (indexInfo->ii_AmCache == NULL)
+			indexInfo->ii_AmCache =
+				AllocSetContextCreate(indexInfo->ii_Context,
 									  "lion index insert",
-									  ALLOCSET_DEFAULT_SIZES);
+									  LION_INSERT_CONTEXT_SIZE,
+									  LION_INSERT_CONTEXT_SIZE,
+									  ALLOCSET_DEFAULT_MAXSIZE);
+		insertcxt = (MemoryContext) indexInfo->ii_AmCache;
+	}
+	else
+		insertcxt = AllocSetContextCreate(CurrentMemoryContext,
+										  "lion index insert",
+										  ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(insertcxt);
 
 	code = lion_tid_to_code(ht_ctid);
@@ -2716,7 +2744,10 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 	}
 
 	MemoryContextSwitchTo(oldcxt);
-	MemoryContextDelete(insertcxt);
+	if (indexInfo != NULL && insertcxt == (MemoryContext) indexInfo->ii_AmCache)
+		MemoryContextReset(insertcxt);
+	else
+		MemoryContextDelete(insertcxt);
 
 	/* No uniqueness check was performed. */
 	return false;
