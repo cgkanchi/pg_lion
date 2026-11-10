@@ -214,7 +214,7 @@ lion_cells_tree_copy(const LionKeyNode *n, int offset)
 	int			i;
 
 	if (n->kind != LION_KN_KEY && n->kind != LION_KN_AND &&
-		n->kind != LION_KN_OR)
+		n->kind != LION_KN_OR && n->kind != LION_KN_ANDNOT)
 		elog(ERROR, "LionCount: a key tree of kind %d in a count by cells",
 			 (int) n->kind);
 	c->kind = n->kind;

@@ -314,7 +314,7 @@ SELECT lion_pd('SELECT a, b, c, count(*) FROM lion_pdt GROUP BY a, b, c');
 -- two indexed columns are the nested loop of DESIGN.md section 20 or the
 -- decoded walk, whichever the model finds cheaper, below
 SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
--- GROUP BY an expression
+-- GROUP BY an expression: a's groups, merged (DESIGN.md §36)
 SELECT lion_pd('SELECT a + 1, count(*) FROM lion_pdt GROUP BY a + 1');
 -- a join
 SELECT lion_pd('SELECT count(*) FROM lion_pdt x, lion_pdt y WHERE x.a = 3 AND y.b = 2');

@@ -164,7 +164,8 @@ SELECT i, (i * 7919) % 200, (i * 7919) % 200, i, i % 10,
 			WHEN i % 13 = 0 THEN '{}'::int[]
 			ELSE ARRAY[i % 10, 10 + i % 17, 40 + i % 23] END,
 	   CASE WHEN i % 11 = 0 THEN NULL
-			ELSE to_tsvector('simple', 'w' || (i % 10) || ' x' || (i % 7)) END,
+			ELSE setweight(to_tsvector('simple', 'w' || (i % 10) || ' x' || (i % 7)),
+						   CASE WHEN i % 700 = 23 THEN 'A' ELSE 'D' END::"char") END,
 	   i % 97 = 0, i % 89 = 0,
 	   repeat('p', 20)
   FROM generate_series(1, 30000) i;
@@ -237,11 +238,16 @@ SELECT lion_iq('SELECT id FROM lis WHERE tags @> ''{}''');
 SELECT lion_iq('SELECT id FROM lis WHERE tags IS NULL');
 SELECT lion_iq('SELECT id FROM lis WHERE tags IS NOT NULL');
 SELECT lion_ir('SELECT id FROM lis WHERE tags <@ ''{1, 11, 41, 2, 12, 42}''');
--- tsvector: a tree of lexemes, and a NOT beside one, answered from the lexeme's rows and rechecked
+-- tsvector: a tree of lexemes; a NOT beside one, the other lexeme's rows taken
+-- away, exact; a NOT of a weight beside one, answered from the lexeme's rows
+-- and rechecked - which rejects the rows of w3 and x2 at weight A, every
+-- 700th from 23
 SELECT lion_iq('SELECT id FROM lis WHERE tsv @@ ''w3 & x2''::tsquery');
 SELECT lion_iq('SELECT id FROM lis WHERE tsv @@ ''w3 | x5''::tsquery');
 SELECT lion_iq('SELECT id FROM lis WHERE tsv @@ ''w3 & !x2''::tsquery');
 SELECT lion_ir('SELECT id FROM lis WHERE tsv @@ ''w3 & !x2''::tsquery');
+SELECT lion_iq('SELECT id FROM lis WHERE tsv @@ ''w3 & !x2:A''::tsquery');
+SELECT lion_ir('SELECT id FROM lis WHERE tsv @@ ''w3 & !x2:A''::tsquery');
 -- partial indexes answered with no key at all: a scalar column and a multi-key one
 SELECT lion_iq('SELECT id FROM lis WHERE flag');
 SELECT lion_iq('SELECT id FROM lis WHERE flag2');
