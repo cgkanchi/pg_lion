@@ -23516,6 +23516,86 @@ The plan carries k, the candidates and the tie rule in a new member of custom_pr
 they must all come out); ANALYZE adds `Top K Entries Walked`, `Top K Groups Counted` and, when it
 happened, `Top K Walked Whole`. `pg_lion.enable_topk` turns it off.
 
+### The fallback (2026-11-10)
+
+`GROUP BY user_id ORDER BY count(*) DESC LIMIT 10` under `WHERE status = 'paid'`, on a synthetic
+table of 2M rows and 200,000 users of about ten rows each, took 505 ms as a top k against 215-299
+ms for core's bitmap heap scan and hash aggregate - and was picked, priced at 1,697 against
+75,622. The candidates' counts were a fifth of their bounds, and the bounds of the entries after
+them nearly as large: the walk ran out of candidates and counted all 199,993 groups, which the
+price left out.
+
+**When it falls back.** The k-th count only grows and the next bound only falls as the walk goes,
+so it runs out exactly when, of all its candidates, fewer than k have a count that reaches the
+bound of the first entry left out (more than it, strictly). Under a WHERE that keeps a share s of
+the rows independently of the group, a candidate of bound b reaches that bound T with the
+binomial chance P(Bin(b, s) >= T), taken as normal with a continuity correction; the number that
+do is a sum of those chances, taken as normal too, and P(fewer than k) is how often the top k
+falls back (`lion_topk_whole_share()`). With nothing in the WHERE but g's own clauses every count
+is taken to be its bound, and only the strict rule to fall back. That is an estimate: an entry
+still holding TIDs of dead or invisible rows counts fewer visible rows than its bound, and a
+non-strict top k can then fall back with no WHERE at all, which the price does not foresee - as
+before this change, it pays for the walk it makes.
+
+**The bounds.** The column's most common values give theirs, largest first, but for those a
+clause on g alone rejects (`lion_topk_freqs()`). Past that list the r-th largest key's rows are
+read where the share (r - 1/2) / n of the keys lie above (`lion_topk_tail_bound()`), never above
+the list's smallest; the candidates there are taken in 32 strata of equal numbers, each at its
+middle one's bound. How many keys there are past the list, their rows and the spread of those are
+what a lion index on the column counted (§33, "The rows of a probed key"): its keys less the
+list's, the rows the list leaves, and the spread sqrt(Σn² / keys - mean²), Σn² counted over
+those keys (`lion_key_tail_counted()`), whatever `pg_lion.enable_skew_estimate` says. Where no index counted
+them, ANALYZE's distinct values less the list's, the rows it leaves them, and the spread of rows
+put in keys at random: the square root of the mean. A clause on g alone keeps the share of the
+keys past the list that its selectivity keeps of their rows.
+
+The shape of that spread decides the answer, since the candidates' bounds and the first one left
+out lie a few standard deviations above the mean. Rows put in keys at random spread as a count
+does, and a normal curve cuts a count's upper tail short: ten rows a key on average, the 75th of
+200,000 keys holds 22, which a normal curve puts at 19.6 - too far below the candidates', so a
+WHERE that keeps 90% was priced to fall back strictly three times in four, where it never did.
+That part of the spread, up to the mean, is read as a gamma variable by Wilson and Hilferty's
+cube-root form, m (1 - 1/9a + z / 3 sqrt(a))^3 with a = m^2 / v, which keeps the count's tail; the
+spread beyond it is the column's skew, with a longer tail still and no negative values, and is
+read as log-normal; a key's bound is the larger of the two. A skewed column with a short list -
+ANALYZE at a statistics target of 10, its tail's spread several times its mean - read as normal
+put the bounds after the k-th far below the real ones, priced its top k to fall back, and planned
+a walk more than ten times slower than the top k it replaced; read as log-normal it keeps the top k.
+
+So a column whose largest entries are about as large as the ones after them falls back under a
+WHERE that takes away more than they differ by, a skewed one only where the WHERE takes away more
+than the bounds fall from the k-th to the first left out - which the candidates, 2k/s of them,
+are sized to cover - and keys of exactly the same rows always fall back under the strict rule.
+On the table above (PostgreSQL 18, warm cache, best of several runs), `WHERE kind < n` keeping
+the share shown, against the plans before this change (with the GROUP BY walk reading each leaf
+once, §28 "One read per leaf"):
+
+| WHERE keeps | falls back, priced | before | now | strictly, priced | before | now |
+| --- | --- | --- | --- | --- | --- | --- |
+| 100% | 0 | top k, 10 counted, 7 ms | the same | 0 | top k, 12 counted, 8 ms | the same |
+| 95% | 2e-25 | top k, 23 counted, 19 ms | the same | 8e-9 | top k, 50 counted, 18 ms | the same |
+| 90% | 5e-7 | top k, 40 counted, 18 ms | the same | 0.04 | top k, 50 counted, 17 ms | the same |
+| 85% | 0.06 | walked whole, 592 ms | the same | 0.86 | walked whole, 599 ms | hash aggregate, 531 ms |
+| 80% | 0.88 | walked whole, 602 ms | hash aggregate, 531 ms | 1 | walked whole, 706 ms | hash aggregate, 523 ms |
+| 70% | 1 | walked whole, 626 ms | hash aggregate, 499 ms | 1 | walked whole, 639 ms | hash aggregate, 531 ms |
+| 50% | 1 | walked whole, 614 ms | hash aggregate, 424 ms | 1 | walked whole, 585 ms | hash aggregate, 445 ms |
+
+The query that lost, under a WHERE keeping a fifth, went from 468 ms to 210 ms. At 85% the top k
+counts 21 for the 10th group against a first bound left out of 22: a near
+thing, priced as unlikely, and planned as before. On a Zipf-like column of 160,714 keys in 2M
+rows, under WHERE clauses keeping 5% or 20% of the rows and under none, and the same with a
+statistics target of 10, every plan is as before.
+
+**The price.** The walk the top k falls back on is the plain GROUP BY's, so it is made a path of
+its own beside the top k (`lion_try_count_path_once()`), priced as any GROUP BY walk is, and the
+top k's price adds that path's, as it went to `add_path()`, times how often the fallback is
+expected - before the first row, like the rest of the top k's. `add_path()` keeps the cheaper of
+the two, and core's plans weigh against both: the query above now plans core's hash aggregate.
+The plain path is made only where the fallback is expected at all, and the spread asked of the
+index only where a candidate or the first entry left out lies past the list. DEBUG2 prints the
+chance (`lion: a top 10 from 101 candidates, under a WHERE that keeps 0.2 of the rows, counts
+every group in 1 of runs`).
+
 ### Expressions of the grouping column
 
 `GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3` was declined: a grouping clause that
@@ -23600,7 +23680,10 @@ group counted, and not without a tie-breaker); `g <> c` and `g IS NOT NULL` taki
 the declines - ascending, ordered by the group, HAVING, DISTINCT, a window function, count(g)
 beside the NULL group, few groups, a generic plan's LIMIT, the setting off; deleted rows still in
 the entries' counts, before and after VACUUM; a rescan under each outer row's WHERE; expressions of
-the grouping column, and the volatile one, the one of another column and the one alone it declines.
+the grouping column, and the volatile one, the one of another column and the one alone it declines;
+the fallback - a column of about equal keys with no WHERE, with ties broken, under a WHERE that
+keeps 95% (the top k) and one that keeps a fifth (the plain walk), keys of exactly the same rows
+under the strict rule (the plain walk), and heavy groups under a WHERE (the top k).
 
 ## 37. Aggregates over the entries of lion columns, weighted by their rows (implemented 2026-09-30)
 
