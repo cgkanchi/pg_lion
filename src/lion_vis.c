@@ -505,11 +505,21 @@ lion_vis_fill_page(LionCountCtx *cx, Buffer buf, BlockNumber blkno,
 		maxoff = (OffsetNumber) MaxHeapTuplesPerPage;	/* cannot happen */
 
 	memset(e->vis, 0, sizeof(e->vis));
+
+	/*
+	 * Every line pointer's tuple header is read, so each is asked for
+	 * LION_RECHECK_PREFETCH ahead of its turn (lion_prefetch_heap_tuple()).
+	 */
+	for (off = FirstOffsetNumber;
+		 off <= maxoff && off < FirstOffsetNumber + LION_RECHECK_PREFETCH;
+		 off = OffsetNumberNext(off))
+		lion_prefetch_heap_tuple(page, maxoff, off);
 	for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
 	{
 		ItemPointerData tid;
 		HeapTupleData heapTuple;
 
+		lion_prefetch_heap_tuple(page, maxoff, off + LION_RECHECK_PREFETCH);
 		ItemPointerSet(&tid, blkno, off);
 
 		/*

@@ -145,6 +145,49 @@ StaticAssertDecl(LION_RECHECK_BLOCK_TIDS <= LION_RECHECK_MIN_BATCH,
 				 "pg_lion: a recheck batch must hold a whole heap block");
 
 /*
+ * How far ahead of the TID it resolves the heap recheck asks for a tuple
+ * header (lion_prefetch_heap_tuple(), DESIGN.md §9, "The recheck's reads").
+ */
+#define LION_RECHECK_PREFETCH	8
+
+/*
+ * Ask for the header of the tuple at which the HOT chain of the root line
+ * pointer off begins, on a heap page the caller holds pinned and share
+ * locked: the line heap_hot_search_buffer() reads first, a cache miss per
+ * row on a page that is not in the CPU's cache.  Asked for a few rows ahead,
+ * the misses of a block's rows overlap instead of running one after another.
+ *
+ * It reads the line pointer, and a redirect's target, from the page's line
+ * pointer array, and asks for the header's bytes, which may straddle a cache
+ * line; a prefetch reads nothing, waits for nothing and never faults, so a
+ * line pointer that names nothing usable costs the instruction at most.  A
+ * macro, as lion_prefetch_range() is: GCC deletes a function that only
+ * prefetches.
+ */
+#define lion_prefetch_heap_tuple(page, maxoff, off) \
+	do { \
+		Page		lion_pht_page = (page); \
+		OffsetNumber lion_pht_max = (maxoff); \
+		OffsetNumber lion_pht_off = (off); \
+		ItemId		lion_pht_lp; \
+		\
+		if (lion_pht_off < FirstOffsetNumber || lion_pht_off > lion_pht_max) \
+			break; \
+		lion_pht_lp = PageGetItemId(lion_pht_page, lion_pht_off); \
+		if (ItemIdIsRedirected(lion_pht_lp)) \
+		{ \
+			lion_pht_off = ItemIdGetRedirect(lion_pht_lp); \
+			if (lion_pht_off < FirstOffsetNumber || lion_pht_off > lion_pht_max) \
+				break; \
+			lion_pht_lp = PageGetItemId(lion_pht_page, lion_pht_off); \
+		} \
+		if (ItemIdIsNormal(lion_pht_lp)) \
+			lion_prefetch_range((const char *) lion_pht_page + \
+								ItemIdGetOffset(lion_pht_lp), \
+								SizeofHeapTupleHeader); \
+	} while (0)
+
+/*
  * LION_OR_BITSET_MIN (lion_count.h, because the cost model needs the same
  * number): above this many containers at one container key, an OR node stops
  * folding them pairwise and accumulates them in a bitset image instead (see

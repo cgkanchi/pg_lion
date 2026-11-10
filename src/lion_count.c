@@ -40,7 +40,8 @@ typedef struct LionRecheckCollector
 {
 	LionCountCtx *cx;
 	uint32		ckey;
-	const bool *needrecheck;	/* LION_BLOCKS_PER_CONTAINER entries */
+	uint64		dirty;			/* the blocks to recheck, a bit a block */
+	uint32		queued;			/* members put on the list */
 } LionRecheckCollector;
 
 /*
@@ -77,8 +78,36 @@ lion_recheck_budget_for(Size entry)
 	return (int) budget;
 }
 
+/*
+ * Append tid to the list, which has room for it.  The list is built in ckey
+ * order, and inside a container in ascending lo order, so it comes out
+ * sorted by (block, offset) - which is what lets lion_recheck_heap() process
+ * it one heap block at a time.  Verify rather than assume: one comparison
+ * per TID buys the right to skip the sort.
+ */
+static inline void
+lion_recheck_append(LionCountCtx *cx, const ItemPointerData *tid)
+{
+	int			n = cx->ntids;
+
+	Assert(n < cx->maxtids);
+	cx->tids[n] = *tid;
+	if (n > 0)
+	{
+		const ItemPointerData *prev = &cx->tids[n - 1];
+		BlockNumber pb = ItemPointerGetBlockNumberNoCheck(prev);
+		BlockNumber tb = ItemPointerGetBlockNumberNoCheck(tid);
+
+		if (pb > tb || (pb == tb &&
+						ItemPointerGetOffsetNumberNoCheck(prev) >=
+						ItemPointerGetOffsetNumberNoCheck(tid)))
+			cx->tids_sorted = false;
+	}
+	cx->ntids = n + 1;
+}
+
 static void
-lion_recheck_add(LionCountCtx *cx, uint64 code)
+lion_recheck_add_slow(LionCountCtx *cx, uint64 code)
 {
 	ItemPointerData tid;
 
@@ -170,19 +199,29 @@ lion_recheck_add(LionCountCtx *cx, uint64 code)
 		MemoryContextSwitchTo(oldcxt);
 	}
 
-	cx->tids[cx->ntids] = tid;
+	lion_recheck_append(cx, &tid);
+}
 
-	/*
-	 * The list is built in ckey order, and inside a container in ascending lo
-	 * order, so it comes out sorted by (block, offset) - which is what lets
-	 * lion_recheck_heap() process it one heap block at a time.  Verify rather
-	 * than assume: one comparison per TID buys the right to skip the sort.
-	 */
-	if (cx->ntids > 0 &&
-		ItemPointerCompare(&cx->tids[cx->ntids - 1], &cx->tids[cx->ntids]) >= 0)
-		cx->tids_sorted = false;
+/*
+ * Put a TID of a heap block that was not all-visible on the recheck list.
+ * The common case - room on the list, no flush due, nothing spilled - is
+ * the append alone, inline; everything else is lion_recheck_add_slow()'s.
+ * That no flush is due follows from the room: every flush condition there
+ * wants the list within LION_RECHECK_BLOCK_TIDS of its budget.
+ */
+static inline void
+lion_recheck_add(LionCountCtx *cx, uint64 code)
+{
+	if (likely(cx->spill == NULL && cx->ntids < cx->maxtids &&
+			   cx->ntids + LION_RECHECK_BLOCK_TIDS <= cx->batchmax))
+	{
+		ItemPointerData tid;
 
-	cx->ntids++;
+		lion_code_to_tid(code, &tid);
+		lion_recheck_append(cx, &tid);
+	}
+	else
+		lion_recheck_add_slow(cx, code);
 }
 
 static bool
@@ -194,8 +233,11 @@ lion_recheck_cb(uint16 lo, void *arg)
 
 	lion_lo_split(lo, &blkinc, &off);
 	Assert(blkinc < LION_BLOCKS_PER_CONTAINER);
-	if (rc->needrecheck[blkinc])
+	if ((rc->dirty >> blkinc) & 1)
+	{
 		lion_recheck_add(rc->cx, lion_make_code(rc->ckey, lo));
+		rc->queued++;
+	}
 
 	return true;
 }
@@ -425,22 +467,20 @@ lion_count_container_masks(LionCountCtx *cx, const LionContainer *c,
 	}
 	else
 	{
-		bool		needrecheck[LION_BLOCKS_PER_CONTAINER];
-		uint32		dirty_members = 0;
-		uint64		m = dirty;
+		uint32		dirty_members;
 		LionRecheckCollector rc;
 
-		memset(needrecheck, 0, sizeof(needrecheck));
-		while (m != 0)
-		{
-			int			b = pg_rightmost_one_pos64(m);
-			uint16		lo_start = (uint16) (b << LION_OFFSET_BITS);
-			uint16		lo_end = (uint16) (lo_start + LION_MAX_OFFSET);
-
-			m &= m - 1;
-			needrecheck[b] = true;
-			dirty_members += lion_container_range_cardinality(c, lo_start, lo_end);
-		}
+		/*
+		 * Queue the members of the non-all-visible blocks for a heap
+		 * recheck, and count the rest from the map: the members queued are
+		 * the ones it does not vouch for.
+		 */
+		rc.cx = cx;
+		rc.ckey = c->ckey;
+		rc.dirty = dirty;
+		rc.queued = 0;
+		lion_container_iterate(c, lion_recheck_cb, &rc);
+		dirty_members = rc.queued;
 
 		/*
 		 * Only a damaged container can hold more members in some blocks than
@@ -453,12 +493,6 @@ lion_count_container_masks(LionCountCtx *cx, const LionContainer *c,
 
 		cx->count += lion_container_cardinality(c) - dirty_members;
 		cx->stats.blocks_skipped_via_vm += pg_popcount64(members & allvis);
-
-		/* Queue the members of the non-all-visible blocks for a heap recheck. */
-		rc.cx = cx;
-		rc.ckey = c->ckey;
-		rc.needrecheck = needrecheck;
-		lion_container_iterate(c, lion_recheck_cb, &rc);
 	}
 
 	/*
@@ -789,6 +823,114 @@ lion_recheck_heap_am(LionCountCtx *cx)
 }
 
 /*
+ * The first TID of tids[] past the block of tids[i], which is sorted: the
+ * block's TIDs are tids[i] up to it.
+ */
+static inline int
+lion_tid_run_end(const ItemPointerData *tids, int ntids, int i)
+{
+	BlockNumber blk = ItemPointerGetBlockNumber(&tids[i]);
+
+	do
+		i++;
+	while (i < ntids && ItemPointerGetBlockNumber(&tids[i]) == blk);
+	return i;
+}
+
+#if PG_VERSION_NUM >= 170000
+/*
+ * The blocks a recheck reads, in the order it visits them, for the read
+ * stream that reads them ahead (lion_recheck_stream_begin()): each block
+ * once, the TIDs being sorted - but for one whose answers the count's
+ * visibility cache already holds when cx is set, which lion_recheck_heap_heap()
+ * serves without reading it.  The callback only reads the TID list and looks
+ * blocks up in the cache, which nothing changes while the stream runs: a
+ * block's entry is filled only when the recheck reads that block, and a
+ * sorted list names each block once, so the callback, which runs ahead of
+ * the recheck, decides for every block exactly as the recheck will.
+ */
+typedef struct LionTidBlocks
+{
+	ItemPointerData *tids;
+	int			ntids;
+	int			next;
+	LionCountCtx *cx;			/* skip what its cache answers, or NULL */
+} LionTidBlocks;
+
+static BlockNumber
+lion_tid_blocks_next(ReadStream *stream, void *arg, void *per_buffer_data)
+{
+	LionTidBlocks *tb = (LionTidBlocks *) arg;
+
+	while (tb->next < tb->ntids)
+	{
+		BlockNumber blk = ItemPointerGetBlockNumber(&tb->tids[tb->next]);
+		LionVisEntry *e;
+
+		tb->next = lion_tid_run_end(tb->tids, tb->ntids, tb->next);
+		if (tb->cx != NULL &&
+			(e = lion_vis_cache_lookup(tb->cx, blk)) != NULL && e->filled)
+			continue;
+		return blk;
+	}
+	return InvalidBlockNumber;
+}
+
+/*
+ * 18 lets a stream whose callback takes no lock and does no I/O hold its
+ * reads back and hand them over in batches, as core's bitmap heap scan's
+ * does.
+ */
+#if PG_VERSION_NUM >= 180000
+#define LION_RECHECK_STREAM_FLAGS	(READ_STREAM_DEFAULT | READ_STREAM_USE_BATCHING)
+#else
+#define LION_RECHECK_STREAM_FLAGS	READ_STREAM_DEFAULT
+#endif
+
+/*
+ * A read stream over the blocks of cx->tids, which a recheck reads in order
+ * with lion_recheck_read(); see lion_tid_blocks_next() for skip_cached.
+ * Beginning and ending one costs too little to keep it from a list of a
+ * block or two: twenty thousand groups' counts of a few rows each, every
+ * one with its own stream, took the time they took without.
+ */
+static ReadStream *
+lion_recheck_stream_begin(LionCountCtx *cx, LionTidBlocks *tb,
+						  bool skip_cached)
+{
+	tb->tids = cx->tids;
+	tb->ntids = cx->ntids;
+	tb->next = 0;
+	tb->cx = skip_cached ? cx : NULL;
+	return read_stream_begin_relation(LION_RECHECK_STREAM_FLAGS, NULL, cx->heap,
+									  MAIN_FORKNUM, lion_tid_blocks_next,
+									  tb, 0);
+}
+#endif
+
+/*
+ * The heap block blk, pinned: the stream's next buffer, which must be blk,
+ * or read on its own when there is no stream.
+ */
+static inline Buffer
+lion_recheck_read(LionCountCtx *cx, void *stream, BlockNumber blk)
+{
+#if PG_VERSION_NUM >= 170000
+	if (stream != NULL)
+	{
+		Buffer		buf = read_stream_next_buffer((ReadStream *) stream, NULL);
+
+		if (!BufferIsValid(buf) || BufferGetBlockNumber(buf) != blk)
+			elog(ERROR, "lion index count: the read stream lost its place in the candidates");
+		return buf;
+	}
+#else
+	Assert(stream == NULL);
+#endif
+	return ReadBuffer(cx->heap, blk);
+}
+
+/*
  * The same thing for the heap AM, one heap BLOCK at a time.
  *
  * table_fetch_tid() is heapam_fetch_tid(), which is ReadBuffer + share lock +
@@ -856,6 +998,12 @@ lion_recheck_heap_heap(LionCountCtx *cx)
 {
 	int64		visible = 0;
 	int			i = 0;
+	void	   *stream = NULL;
+#if PG_VERSION_NUM >= 170000
+	LionTidBlocks tb;
+
+	stream = lion_recheck_stream_begin(cx, &tb, true);
+#endif
 
 	while (i < cx->ntids)
 	{
@@ -886,7 +1034,7 @@ lion_recheck_heap_heap(LionCountCtx *cx)
 		/* Decide (and allocate) before the page is locked. */
 		e = lion_vis_cache_prepare(cx, blk, e);
 
-		buf = ReadBuffer(cx->heap, blk);
+		buf = lion_recheck_read(cx, stream, blk);
 		lion_heap_page_prune_opt(cx->heap, buf, &cx->vmbuf, cx->rel_read_only);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		cx->stats.blocks_rechecked++;
@@ -909,11 +1057,29 @@ lion_recheck_heap_heap(LionCountCtx *cx)
 		}
 		else
 		{
-			do
+			Page		page = BufferGetPage(buf);
+			OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+			int			end = lion_tid_run_end(cx->tids, cx->ntids, i);
+			int			pf;
+
+			/*
+			 * Ask for the first few tuple headers, then for each one
+			 * LION_RECHECK_PREFETCH ahead of the TID resolved.
+			 */
+			for (pf = i; pf < end && pf < i + LION_RECHECK_PREFETCH; pf++)
+				lion_prefetch_heap_tuple(page, maxoff,
+										 ItemPointerGetOffsetNumber(&cx->tids[pf]));
+			for (; i < end; i++)
 			{
 				ItemPointerData tid = cx->tids[i];	/* callee updates it */
 				HeapTupleData heapTuple;
 
+				if (pf < end)
+				{
+					lion_prefetch_heap_tuple(page, maxoff,
+											 ItemPointerGetOffsetNumber(&cx->tids[pf]));
+					pf++;
+				}
 				if (heap_hot_search_buffer(&tid, cx->heap, buf, cx->snapshot,
 										   &heapTuple, NULL, true))
 				{
@@ -921,9 +1087,7 @@ lion_recheck_heap_heap(LionCountCtx *cx)
 					if (cx->visout != NULL)
 						cx->visout[i] = true;
 				}
-				i++;
-			} while (i < cx->ntids &&
-					 ItemPointerGetBlockNumber(&cx->tids[i]) == blk);
+			}
 		}
 
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
@@ -933,6 +1097,10 @@ lion_recheck_heap_heap(LionCountCtx *cx)
 		CHECK_FOR_INTERRUPTS();
 	}
 
+#if PG_VERSION_NUM >= 170000
+	if (stream != NULL)
+		read_stream_end((ReadStream *) stream);
+#endif
 	return visible;
 }
 
@@ -996,35 +1164,6 @@ lion_row_filter_test(LionRowFilter *filter, HeapTuple tuple)
  * The visibility cache is neither read nor filled: it knows which offsets
  * are visible, but the filter needs their tuples.
  */
-#if PG_VERSION_NUM >= 170000
-/*
- * The blocks of a filtered recheck's candidates, in the order it visits them,
- * for the read stream that reads them ahead (lion_recheck_heap_filtered()):
- * each block once, the TIDs being sorted.
- */
-typedef struct LionTidBlocks
-{
-	ItemPointerData *tids;
-	int			ntids;
-	int			next;
-} LionTidBlocks;
-
-static BlockNumber
-lion_tid_blocks_next(ReadStream *stream, void *arg, void *per_buffer_data)
-{
-	LionTidBlocks *tb = (LionTidBlocks *) arg;
-	BlockNumber blk;
-
-	if (tb->next >= tb->ntids)
-		return InvalidBlockNumber;
-	blk = ItemPointerGetBlockNumber(&tb->tids[tb->next]);
-	while (tb->next < tb->ntids &&
-		   ItemPointerGetBlockNumber(&tb->tids[tb->next]) == blk)
-		tb->next++;
-	return blk;
-}
-#endif
-
 static int64
 lion_recheck_heap_filtered(LionCountCtx *cx)
 {
@@ -1033,21 +1172,16 @@ lion_recheck_heap_filtered(LionCountCtx *cx)
 	int			visidx[MaxHeapTuplesPerPage];	/* ... and its place in tids */
 	int64		passed = 0;
 	int			i = 0;
+	void	   *stream = NULL;
 #if PG_VERSION_NUM >= 170000
 	LionTidBlocks tb;
-	ReadStream *stream;
 
 	/*
 	 * Every candidate's page is read, whatever the visibility map says, so
 	 * they are read ahead as a bitmap heap scan reads its pages: a read
 	 * stream over the candidates' blocks in order (PostgreSQL 17 on).
 	 */
-	tb.tids = cx->tids;
-	tb.ntids = cx->ntids;
-	tb.next = 0;
-	stream = read_stream_begin_relation(READ_STREAM_DEFAULT, NULL, cx->heap,
-										MAIN_FORKNUM, lion_tid_blocks_next,
-										&tb, 0);
+	stream = lion_recheck_stream_begin(cx, &tb, false);
 #endif
 
 	while (i < cx->ntids)
@@ -1055,25 +1189,35 @@ lion_recheck_heap_filtered(LionCountCtx *cx)
 		BlockNumber blk = ItemPointerGetBlockNumber(&cx->tids[i]);
 		Buffer		buf;
 		Page		page;
+		OffsetNumber maxoff;
 		int			nvis = 0;
+		int			end = lion_tid_run_end(cx->tids, cx->ntids, i);
+		int			pf;
 		int			j;
 
-#if PG_VERSION_NUM >= 170000
-		buf = read_stream_next_buffer(stream, NULL);
-		if (!BufferIsValid(buf) || BufferGetBlockNumber(buf) != blk)
-			elog(ERROR, "lion index count: the read stream lost its place in the candidates");
-#else
-		buf = ReadBuffer(cx->heap, blk);
-#endif
+		buf = lion_recheck_read(cx, stream, blk);
 		lion_heap_page_prune_opt(cx->heap, buf, &cx->vmbuf, cx->rel_read_only);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		cx->stats.blocks_rechecked++;
 
-		do
+		page = BufferGetPage(buf);
+		maxoff = PageGetMaxOffsetNumber(page);
+
+		/* the tuple headers asked for ahead, as lion_recheck_heap_heap() does */
+		for (pf = i; pf < end && pf < i + LION_RECHECK_PREFETCH; pf++)
+			lion_prefetch_heap_tuple(page, maxoff,
+									 ItemPointerGetOffsetNumber(&cx->tids[pf]));
+		for (; i < end; i++)
 		{
 			ItemPointerData tid = cx->tids[i];	/* callee updates it */
 			HeapTupleData heapTuple;
 
+			if (pf < end)
+			{
+				lion_prefetch_heap_tuple(page, maxoff,
+										 ItemPointerGetOffsetNumber(&cx->tids[pf]));
+				pf++;
+			}
 			if (heap_hot_search_buffer(&tid, cx->heap, buf, cx->snapshot,
 									   &heapTuple, NULL, true))
 			{
@@ -1083,13 +1227,10 @@ lion_recheck_heap_filtered(LionCountCtx *cx)
 				visidx[nvis] = i;
 				vis[nvis++] = ItemPointerGetOffsetNumber(&tid);
 			}
-			i++;
-		} while (i < cx->ntids &&
-				 ItemPointerGetBlockNumber(&cx->tids[i]) == blk);
+		}
 
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
-		page = BufferGetPage(buf);
 		for (j = 0; j < nvis; j++)
 		{
 			ItemId		lp = PageGetItemId(page, vis[j]);
@@ -1114,7 +1255,8 @@ lion_recheck_heap_filtered(LionCountCtx *cx)
 		CHECK_FOR_INTERRUPTS();
 	}
 #if PG_VERSION_NUM >= 170000
-	read_stream_end(stream);
+	if (stream != NULL)
+		read_stream_end((ReadStream *) stream);
 #endif
 
 	return passed;
