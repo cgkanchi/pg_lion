@@ -1305,9 +1305,10 @@ lion_index_row_column(const LionIndexState *ix)
  *	LION_QMODE_LOSSY	at least the rows the query selects, and perhaps
  *					more: the key tree selects a SUPERSET, which the caller
  *					rechecks (lion_extract_query_superset() only: a phrase
- *					as the AND of its lexemes, `a & !b` as `a`)
+ *					as the AND of its lexemes, `a & !b:A` as `a`)
  *	LION_QMODE_ALL	every indexed row, with recheck (`tags @> '{}'`, `<@`,
- *					a tsquery with NOT/phrase/prefix/weights, a NULL key)
+ *					a tsquery with a bare NOT, a phrase, a prefix or a
+ *					weight, a NULL key)
  */
 typedef enum LionQueryMode
 {
@@ -1334,7 +1335,8 @@ typedef enum LionKeyNodeKind
 	LION_KN_ANDNOT				/* its first child's members less every other
 								 * child's: `col IS NOT NULL` beside other
 								 * quals, the column's NULL entry subtracted
-								 * (DESIGN.md §14, §29.2); the scans' only */
+								 * (DESIGN.md §14, §29.2), and a tsquery's
+								 * `a & !b` (§17) */
 } LionKeyNodeKind;
 
 /*

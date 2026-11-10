@@ -320,9 +320,12 @@ bytes is not expanded, and every row is rechecked. A `text`, `varchar` or `bytea
 a query is rechecked. An element of another type longer than 2047 bytes is stored compressed, and is
 an error only if that does not fit, as a GIN index tuple that does not fit is.
 
-Without positions, everything a plain AND/OR of key sets cannot express is rechecked in the heap. A
-NULL element and a tsquery phrase, weight or `a & !b` are answered from the rows of their keys (the
-other elements, the phrase's lexemes, `a`), then rechecked, in counts and scans alike. `<@`, `@> '{}'` and a bare `!a` fall back to scanning
+A NOT beside the rest of an AND (`a & !b`, `(a | c) & !(b | d)`) is a set difference: the rows of
+`b` are taken away from the rows of `a`, so it is exact with positions or without, and costs about
+what `a & b` does. Without positions, everything else a plain AND/OR of key sets cannot express is
+rechecked in the heap. A NULL element and a tsquery phrase, weight or `a & !b:A` are answered from
+the rows of their keys (the other elements, the phrase's lexemes, `a`), then rechecked, in counts and
+scans alike. `<@`, `@> '{}'`, a bare `!a` and `a | !b` fall back to scanning
 every indexed row and rechecking it if the Lion index is used; the planner may choose a sequential
 scan instead.
 
@@ -338,7 +341,7 @@ prepared statement's generic plan (`tags @> $1`, `tsv @@ to_tsquery($1)`) or a s
 (`tsv @@ to_tsquery(current_setting('app.q'))`) - is pushed down whatever it turns out to be
 (DESIGN.md §17): exactly when the key sets answer it; from a superset of its rows, each rechecked in
 the heap, when they do not (`@>` with a NULL element counts the other elements' rows, a phrase the
-rows with all of its lexemes, `a & !b` the rows with `a`); and when no key narrows it at all (`@>
+rows with all of its lexemes, `a & !b:A` the rows with `a`); and when no key narrows it at all (`@>
 '{}'`, `!a`, `foo:*`), by rechecking the rows the other clauses select, or every row by a
 sequential scan when there is no other clause. `EXPLAIN ANALYZE` reports the rows the recheck
 turned away as `Rows Removed by Recheck`. A value the planner cannot estimate is priced as the case

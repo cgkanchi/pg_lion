@@ -936,39 +936,45 @@ BEGIN
 	END LOOP;
 END $$;
 CREATE TEMP TABLE pos_def_q (q tsquery);
-INSERT INTO pos_def_q VALUES ('w1 <-> x1'), ('x1 <-> w1'), ('w1:A'), ('w1 & !x1');
+INSERT INTO pos_def_q VALUES ('w1 <-> x1'), ('x1 <-> w1'), ('w1:A'), ('w1 & !x1'),
+	('w1 <-> !x1');
 DROP INDEX pos_def_off;
 SELECT q, pos_def_explain(q) FROM pos_def_q;
-       q       |                        pos_def_explain                        
----------------+---------------------------------------------------------------
- 'w1' <-> 'x1' | Bitmap Heap Scan on pos_def
- 'w1' <-> 'x1' |   ->  Bitmap Index Scan on pos_def_d
- 'w1' <-> 'x1' | Custom Scan (LionCount)
- 'w1' <-> 'x1' |   Lion Indexes: pos_def_d (d @@ '''w1'' <-> ''x1'''::tsquery)
- 'w1' <-> 'x1' |   Heap TIDs Rechecked: 0
- 'w1' <-> 'x1' |   Position Checks: 91
- 'w1' <-> 'x1' |   Rows Removed by Positions: 0
- 'x1' <-> 'w1' | Index Scan using pos_def_d on pos_def
- 'x1' <-> 'w1' | Custom Scan (LionCount)
- 'x1' <-> 'w1' |   Lion Indexes: pos_def_d (d @@ '''x1'' <-> ''w1'''::tsquery)
- 'x1' <-> 'w1' |   Heap TIDs Rechecked: 0
- 'x1' <-> 'w1' |   Position Checks: 91
- 'x1' <-> 'w1' |   Rows Removed by Positions: 91
- 'w1':A        | Bitmap Heap Scan on pos_def
- 'w1':A        |   ->  Bitmap Index Scan on pos_def_d
- 'w1':A        | Custom Scan (LionCount)
- 'w1':A        |   Lion Indexes: pos_def_d (d @@ '''w1'':A'::tsquery)
- 'w1':A        |   Heap TIDs Rechecked: 0
- 'w1':A        |   Position Checks: 1000
- 'w1':A        |   Rows Removed by Positions: 800
- 'w1' & !'x1'  | Bitmap Heap Scan on pos_def
- 'w1' & !'x1'  |   ->  Bitmap Index Scan on pos_def_d
- 'w1' & !'x1'  | Custom Scan (LionCount)
- 'w1' & !'x1'  |   Lion Indexes: pos_def_d (d @@ '''w1'' & !''x1'''::tsquery)
- 'w1' & !'x1'  |   Heap TIDs Rechecked: 0
- 'w1' & !'x1'  |   Position Checks: 1000
- 'w1' & !'x1'  |   Rows Removed by Positions: 91
-(27 rows)
+       q        |                        pos_def_explain                         
+----------------+----------------------------------------------------------------
+ 'w1' <-> 'x1'  | Bitmap Heap Scan on pos_def
+ 'w1' <-> 'x1'  |   ->  Bitmap Index Scan on pos_def_d
+ 'w1' <-> 'x1'  | Custom Scan (LionCount)
+ 'w1' <-> 'x1'  |   Lion Indexes: pos_def_d (d @@ '''w1'' <-> ''x1'''::tsquery)
+ 'w1' <-> 'x1'  |   Heap TIDs Rechecked: 0
+ 'w1' <-> 'x1'  |   Position Checks: 91
+ 'w1' <-> 'x1'  |   Rows Removed by Positions: 0
+ 'x1' <-> 'w1'  | Index Scan using pos_def_d on pos_def
+ 'x1' <-> 'w1'  | Custom Scan (LionCount)
+ 'x1' <-> 'w1'  |   Lion Indexes: pos_def_d (d @@ '''x1'' <-> ''w1'''::tsquery)
+ 'x1' <-> 'w1'  |   Heap TIDs Rechecked: 0
+ 'x1' <-> 'w1'  |   Position Checks: 91
+ 'x1' <-> 'w1'  |   Rows Removed by Positions: 91
+ 'w1':A         | Bitmap Heap Scan on pos_def
+ 'w1':A         |   ->  Bitmap Index Scan on pos_def_d
+ 'w1':A         | Custom Scan (LionCount)
+ 'w1':A         |   Lion Indexes: pos_def_d (d @@ '''w1'':A'::tsquery)
+ 'w1':A         |   Heap TIDs Rechecked: 0
+ 'w1':A         |   Position Checks: 1000
+ 'w1':A         |   Rows Removed by Positions: 800
+ 'w1' & !'x1'   | Bitmap Heap Scan on pos_def
+ 'w1' & !'x1'   |   ->  Bitmap Index Scan on pos_def_d
+ 'w1' & !'x1'   | Custom Scan (LionCount)
+ 'w1' & !'x1'   |   Lion Indexes: pos_def_d (d @@ '''w1'' & !''x1'''::tsquery)
+ 'w1' & !'x1'   |   Heap TIDs Rechecked: 0
+ 'w1' <-> !'x1' | Bitmap Heap Scan on pos_def
+ 'w1' <-> !'x1' |   ->  Bitmap Index Scan on pos_def_d
+ 'w1' <-> !'x1' | Custom Scan (LionCount)
+ 'w1' <-> !'x1' |   Lion Indexes: pos_def_d (d @@ '''w1'' <-> !''x1'''::tsquery)
+ 'w1' <-> !'x1' |   Heap TIDs Rechecked: 0
+ 'w1' <-> !'x1' |   Position Checks: 1000
+ 'w1' <-> !'x1' |   Rows Removed by Positions: 91
+(32 rows)
 
 SET enable_seqscan = off;
 CREATE TEMP TABLE pos_def_n AS
@@ -976,47 +982,53 @@ SELECT q::text, (SELECT count(*) FROM pos_def WHERE d @@ q) AS by_positions FROM
 DROP INDEX pos_def_d;
 CREATE INDEX pos_def_off ON pos_def USING lion (d) WITH (store_positions = off);
 SELECT q, pos_def_explain(q) FROM pos_def_q;
-       q       |                         pos_def_explain                         
----------------+-----------------------------------------------------------------
- 'w1' <-> 'x1' | Bitmap Heap Scan on pos_def
- 'w1' <-> 'x1' |   ->  Bitmap Index Scan on pos_def_off
- 'w1' <-> 'x1' | Custom Scan (LionCount)
- 'w1' <-> 'x1' |   Lion Indexes: pos_def_off (d @@ '''w1'' <-> ''x1'''::tsquery)
- 'w1' <-> 'x1' |   Heap TIDs Rechecked: 91
- 'x1' <-> 'w1' | Index Scan using pos_def_off on pos_def
- 'x1' <-> 'w1' |   Rows Removed by Index Recheck: 91
- 'x1' <-> 'w1' | Custom Scan (LionCount)
- 'x1' <-> 'w1' |   Lion Indexes: pos_def_off (d @@ '''x1'' <-> ''w1'''::tsquery)
- 'x1' <-> 'w1' |   Heap TIDs Rechecked: 91
- 'x1' <-> 'w1' |   Rows Removed by Recheck: 91
- 'w1':A        | Bitmap Heap Scan on pos_def
- 'w1':A        |   Rows Removed by Index Recheck: 800
- 'w1':A        |   ->  Bitmap Index Scan on pos_def_off
- 'w1':A        | Custom Scan (LionCount)
- 'w1':A        |   Lion Indexes: pos_def_off (d @@ '''w1'':A'::tsquery)
- 'w1':A        |   Heap TIDs Rechecked: 1000
- 'w1':A        |   Rows Removed by Recheck: 800
- 'w1' & !'x1'  | Bitmap Heap Scan on pos_def
- 'w1' & !'x1'  |   Rows Removed by Index Recheck: 91
- 'w1' & !'x1'  |   ->  Bitmap Index Scan on pos_def_off
- 'w1' & !'x1'  | Custom Scan (LionCount)
- 'w1' & !'x1'  |   Lion Indexes: pos_def_off (d @@ '''w1'' & !''x1'''::tsquery)
- 'w1' & !'x1'  |   Heap TIDs Rechecked: 1000
- 'w1' & !'x1'  |   Rows Removed by Recheck: 91
-(25 rows)
+       q        |                         pos_def_explain                          
+----------------+------------------------------------------------------------------
+ 'w1' <-> 'x1'  | Bitmap Heap Scan on pos_def
+ 'w1' <-> 'x1'  |   ->  Bitmap Index Scan on pos_def_off
+ 'w1' <-> 'x1'  | Custom Scan (LionCount)
+ 'w1' <-> 'x1'  |   Lion Indexes: pos_def_off (d @@ '''w1'' <-> ''x1'''::tsquery)
+ 'w1' <-> 'x1'  |   Heap TIDs Rechecked: 91
+ 'x1' <-> 'w1'  | Index Scan using pos_def_off on pos_def
+ 'x1' <-> 'w1'  |   Rows Removed by Index Recheck: 91
+ 'x1' <-> 'w1'  | Custom Scan (LionCount)
+ 'x1' <-> 'w1'  |   Lion Indexes: pos_def_off (d @@ '''x1'' <-> ''w1'''::tsquery)
+ 'x1' <-> 'w1'  |   Heap TIDs Rechecked: 91
+ 'x1' <-> 'w1'  |   Rows Removed by Recheck: 91
+ 'w1':A         | Bitmap Heap Scan on pos_def
+ 'w1':A         |   Rows Removed by Index Recheck: 800
+ 'w1':A         |   ->  Bitmap Index Scan on pos_def_off
+ 'w1':A         | Custom Scan (LionCount)
+ 'w1':A         |   Lion Indexes: pos_def_off (d @@ '''w1'':A'::tsquery)
+ 'w1':A         |   Heap TIDs Rechecked: 1000
+ 'w1':A         |   Rows Removed by Recheck: 800
+ 'w1' & !'x1'   | Bitmap Heap Scan on pos_def
+ 'w1' & !'x1'   |   ->  Bitmap Index Scan on pos_def_off
+ 'w1' & !'x1'   | Custom Scan (LionCount)
+ 'w1' & !'x1'   |   Lion Indexes: pos_def_off (d @@ '''w1'' & !''x1'''::tsquery)
+ 'w1' & !'x1'   |   Heap TIDs Rechecked: 0
+ 'w1' <-> !'x1' | Bitmap Heap Scan on pos_def
+ 'w1' <-> !'x1' |   Rows Removed by Index Recheck: 91
+ 'w1' <-> !'x1' |   ->  Bitmap Index Scan on pos_def_off
+ 'w1' <-> !'x1' | Custom Scan (LionCount)
+ 'w1' <-> !'x1' |   Lion Indexes: pos_def_off (d @@ '''w1'' <-> !''x1'''::tsquery)
+ 'w1' <-> !'x1' |   Heap TIDs Rechecked: 1000
+ 'w1' <-> !'x1' |   Rows Removed by Recheck: 91
+(30 rows)
 
 -- the same rows either way, and a sequential scan's
 SELECT q, n.by_positions,
 	   (SELECT count(*) FROM pos_def WHERE d @@ q::tsquery) AS by_recheck,
 	   (SELECT count(*) FROM pos_def WHERE (d::text || '')::tsvector @@ q::tsquery) AS heap
   FROM pos_def_n n ORDER BY 1;
-       q       | by_positions | by_recheck | heap 
----------------+--------------+------------+------
- 'w1' & !'x1'  |          909 |        909 |  909
- 'w1' <-> 'x1' |           91 |         91 |   91
- 'w1':A        |          200 |        200 |  200
- 'x1' <-> 'w1' |            0 |          0 |    0
-(4 rows)
+       q        | by_positions | by_recheck | heap 
+----------------+--------------+------------+------
+ 'w1' & !'x1'   |          909 |        909 |  909
+ 'w1' <-> !'x1' |          909 |        909 |  909
+ 'w1' <-> 'x1'  |           91 |         91 |   91
+ 'w1':A         |          200 |        200 |  200
+ 'x1' <-> 'w1'  |            0 |          0 |    0
+(5 rows)
 
 RESET enable_seqscan;
 DROP FUNCTION pos_def_explain(tsquery);

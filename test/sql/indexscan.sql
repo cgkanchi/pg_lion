@@ -237,11 +237,15 @@ SELECT lion_iq('SELECT id FROM lis WHERE tags @> ''{}''');
 SELECT lion_iq('SELECT id FROM lis WHERE tags IS NULL');
 SELECT lion_iq('SELECT id FROM lis WHERE tags IS NOT NULL');
 SELECT lion_ir('SELECT id FROM lis WHERE tags <@ ''{1, 11, 41, 2, 12, 42}''');
--- tsvector: a tree of lexemes, and a NOT beside one, answered from the lexeme's rows and rechecked
+-- tsvector: a tree of lexemes; a NOT beside one, the other lexeme's rows taken
+-- away, exact; a NOT of a weight beside one, answered from the lexeme's rows
+-- and rechecked
 SELECT lion_iq('SELECT id FROM lis WHERE tsv @@ ''w3 & x2''::tsquery');
 SELECT lion_iq('SELECT id FROM lis WHERE tsv @@ ''w3 | x5''::tsquery');
 SELECT lion_iq('SELECT id FROM lis WHERE tsv @@ ''w3 & !x2''::tsquery');
 SELECT lion_ir('SELECT id FROM lis WHERE tsv @@ ''w3 & !x2''::tsquery');
+SELECT lion_iq('SELECT id FROM lis WHERE tsv @@ ''w3 & !x2:A''::tsquery');
+SELECT lion_ir('SELECT id FROM lis WHERE tsv @@ ''w3 & !x2:A''::tsquery');
 -- partial indexes answered with no key at all: a scalar column and a multi-key one
 SELECT lion_iq('SELECT id FROM lis WHERE flag');
 SELECT lion_iq('SELECT id FROM lis WHERE flag2');

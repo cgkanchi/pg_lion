@@ -436,8 +436,9 @@ lion_join_switch_reset(LionCountScanState *st)
 /*
  * The rows a node of a source's tree holds, and the container keys it has,
  * from what the located sets carry (`ntids`, `ncontainers`): a set's own, a
- * union's sets added up - at most the heap's keys - and the least of an
- * intersection's children.  Upper bounds, as lion_node_members() takes them.
+ * union's sets added up - at most the heap's keys - the least of an
+ * intersection's children, and an ANDNOT's first child's.  Upper bounds, as
+ * lion_node_members() takes them.
  */
 static void
 lion_join_node_size(const LionKeyNode *node, const LionPostingSet *sets,
@@ -468,6 +469,12 @@ lion_join_node_size(const LionKeyNode *node, const LionPostingSet *sets,
 			*members = (double) sets[node->keyno].ntids;
 			*keys = Min((double) sets[node->keyno].ncontainers, ckeys);
 		}
+		return;
+	}
+	if (node->kind == LION_KN_ANDNOT)
+	{
+		/* no more than what it takes the others away from */
+		lion_join_node_size(node->args[0], sets, nsets, ckeys, members, keys);
 		return;
 	}
 	for (i = 0; i < node->nargs; i++)

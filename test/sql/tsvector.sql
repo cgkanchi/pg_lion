@@ -117,8 +117,9 @@ SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 					WHERE tsv @@ to_tsquery('english', 'w1 & w2')$$);
 SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 					WHERE tsv @@ to_tsquery('english', 'w1 | w2')$$);
--- NOT beside a lexeme, phrase and weights are counted from the superset of
--- their lexemes' rows and rechecked; a prefix is never pushed down
+-- NOT beside a lexeme is the lexeme's rows less the other's, counted exactly;
+-- phrase and weights are counted from the superset of their lexemes' rows and
+-- rechecked; a prefix is never pushed down
 SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 					WHERE tsv @@ to_tsquery('english', 'alpha & !w1')$$);
 SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
@@ -163,11 +164,37 @@ SELECT lion_tscmp($$SELECT id FROM lion_ts
 SELECT lion_tscmp($$SELECT id FROM lion_ts
 				  WHERE tsv @@ ANY (ARRAY['w1 & w2', '!w3']::tsquery[])$$);
 
--- ---- the fallbacks -----------------------------------------------------
+-- ---- NOT beside a lexeme: a set taken away -----------------------------
 SELECT lion_tscmp($$SELECT id FROM lion_ts
 				  WHERE tsv @@ to_tsquery('english', 'alpha & !w1')$$);
 SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@ to_tsquery('english', '!w1 & alpha & !w2')$$);
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@ to_tsquery('english', 'alpha & !(w1 | w2)')$$);
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@ to_tsquery('english', 'alpha & !(w1 & !w2)')$$);
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@ to_tsquery('english', '(alpha & !w1) | (bravo & !w2)')$$);
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@ to_tsquery('english', 'alpha & !nosuchword')$$);
+-- ... and where it cannot be: under a weight, a prefix or a phrase, and
+-- inside one, where a NOT is about positions
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@ to_tsquery('english', 'alpha & !w1:A')$$);
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@ to_tsquery('english', 'alpha & !w1:*')$$);
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@ to_tsquery('english', 'alpha & !(bravo <-> charlie)')$$);
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@ to_tsquery('english', '(bravo & !w1) <-> charlie')$$);
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@ to_tsquery('english', '!w1 & !w2')$$);
+
+-- ---- the fallbacks -----------------------------------------------------
+SELECT lion_tscmp($$SELECT id FROM lion_ts
 				  WHERE tsv @@ to_tsquery('english', '!w1')$$);
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@ to_tsquery('english', 'alpha | !w1')$$);
 SELECT lion_tscmp($$SELECT id FROM lion_ts WHERE tsv @@ to_tsquery('english', 'w1:*')$$);
 SELECT lion_tscmp($$SELECT id FROM lion_ts
 				  WHERE tsv @@ to_tsquery('english', 'alpha & w1:*')$$);
@@ -211,6 +238,10 @@ SELECT lion_tscmp($$SELECT count(*) FROM lion_ts
 				  WHERE tsv @@ to_tsquery('english', 'alpha & (w1 | w2)')$$);
 SELECT lion_tscmp($$SELECT count(*) FROM lion_ts
 				  WHERE tsv @@ to_tsquery('english', 'alpha & !w1')$$);
+SELECT lion_tscmp($$SELECT count(*) FROM lion_ts
+				  WHERE tsv @@ to_tsquery('english', '(alpha & !w1 & !w2) | (bravo & !(w3 | w4))')$$);
+SELECT lion_tscmp($$SELECT grp, count(*) FROM lion_ts
+				  WHERE tsv @@ to_tsquery('english', 'alpha & !w1') GROUP BY grp$$);
 SELECT lion_tscmp($$SELECT count(*) FROM lion_ts
 				  WHERE tsv @@ to_tsquery('english', 'w1 & w2') AND grp = 3$$);
 
