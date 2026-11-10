@@ -16,6 +16,7 @@ A lion index stores, for every distinct value, the set of rows that have it, as 
 
 - `count(*)` with equality, `IN`, range, `<>` and `IS NULL` filters, ANDed and ORed;
 - `GROUP BY`, `SELECT DISTINCT`, `count(DISTINCT ...)`, top-k groups, and the total beside a page of rows (`count(*) OVER ()`);
+- capped counts (`count(*)` over a `LIMIT`), and `min`/`max` beside a count, each from a one-row ordered walk;
 - counts over a fact table joined to a filtered dimension;
 - the first rows in a B-tree's order (`ORDER BY ... LIMIT`) under lion filters, also across a join to a filtered dimension by its key;
 - array membership (`tags @> ...`) and full-text search (`tsv @@ ...`), with phrase search and BM25 ranking;

@@ -17,6 +17,10 @@ CREATE EXTENSION IF NOT EXISTS pg_lion;
 RESET client_min_messages;
 -- VACUUM can only set all-visible once the commit record is on disk
 SET synchronous_commit = on;
+-- a min or max here is the walk of the column's keys (DESIGN.md §37);
+-- LionCountMinMax walks an index for it instead when that is cheaper, and
+-- countminmax.sql tests that
+SET pg_lion.enable_count_minmax = off;
 SET max_parallel_workers_per_gather = 0;
 
 /*

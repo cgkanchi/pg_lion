@@ -2095,6 +2095,8 @@ extern PGDLLIMPORT set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook;
  */
 extern PGDLLIMPORT bool lion_enable_count_anti;
 extern PGDLLIMPORT bool lion_enable_window_count;
+extern PGDLLIMPORT bool lion_enable_count_rows;
+extern PGDLLIMPORT bool lion_enable_count_minmax;
 
 /*
  * Whether a GROUP BY over a join of a table to a dimension by its primary key

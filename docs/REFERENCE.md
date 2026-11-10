@@ -900,6 +900,20 @@ working around a bad choice:
   clause or an `ORDER BY` of the window function. EXPLAIN shows the count as the node's first
   child and prints the window function as `count(*)`. `pg_lion.enable_count_pushdown = off` turns
   it off too.
+- `pg_lion.enable_count_rows`: answer a `LIMIT` over rows of one table that read no column - the
+  subquery of a capped count, `SELECT count(*) FROM (SELECT 1 FROM t WHERE ... LIMIT 10001) s` -
+  with the `LionCountRows` node (DESIGN.md §10, "A count capped by a LIMIT"): the pushdown's count
+  of the table under the same `WHERE`, less the `OFFSET`, up to the `LIMIT`, that many rows of the
+  target. Not with an `ORDER BY`, `DISTINCT`, grouping, a join, `FOR UPDATE`, `WITH TIES`, a
+  set-returning function or a volatile target or `WHERE` clause. `pg_lion.enable_count_pushdown =
+  off` turns it off too.
+- `pg_lion.enable_count_minmax`: answer `min()` and `max()` beside a `count(*)` - `SELECT count(*),
+  min(ts), max(ts) FROM t WHERE ...` - with the `LionCountMinMax` node (DESIGN.md §10, "A count
+  beside min or max"): the pushdown's count of the other aggregates, and for each `min` or `max`
+  the first row of an ordered walk under the same `WHERE`, an InitPlan as PostgreSQL makes for a
+  query of only `min` and `max`. Not under a `GROUP BY`, `HAVING`, a window or a join, nor with a
+  `FILTER` or `ORDER BY` on the `min` or `max`, a volatile `WHERE` clause, one that reads an outer
+  query's row, or row-level security. `pg_lion.enable_count_pushdown = off` turns it off too.
 - `pg_lion.enable_probe_join`: group a join of a table to a dimension by the dimension's primary
   key with `LionProbeJoin` (DESIGN.md §46) - `SELECT CASE WHEN d.region IN ('north', 'east') THEN
   'ne' ELSE 'other' END, f.channel, count(*) FROM fact f JOIN dim d ON f.dim_id = d.id WHERE
