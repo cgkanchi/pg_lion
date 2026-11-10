@@ -138,7 +138,20 @@ is a `NOT` of a query whose index sets only bound its rows (an empty array, a NU
 phrase). On five million rows `count(*) WHERE n IS DISTINCT FROM 17` took 1.6 ms against 380 for
 the sequential scan.
 
-A `WHERE` clause no Lion index answers - `payload LIKE 'ab%'`, `id > 1000` on a column without
+Three other spellings of those clauses are counted as the clause they select the same rows as
+(DESIGN.md §10, "Other spellings of answered clauses"), and EXPLAIN prints that clause: `'x' = ANY
+(tags)` as `tags @> '{x}'` (on `text`, `varchar` and integer arrays, `1 = ANY (bigint_ids)`
+included, and with a prepared statement's `$1` too when it has the element's type: a `bigint` `$1`
+for `bigint_ids`, not an `int`), `col IS NOT DISTINCT FROM 'v'` as `col = 'v'`, and `col LIKE 'ab%'`
+as `col >= 'ab' AND col < 'ac'`. The `LIKE` needs a column whose collation orders strings as bytes
+(`"C"`, `"POSIX"`, `pg_c_utf8`, or the database's default where that is C); under any other
+collation it is a residual clause (below), as is a `LIKE` with a wildcard before the end (`'a_c'`,
+`'a%c'`), `ILIKE` and `NOT LIKE`. A pattern with no wildcard is an equality under any deterministic
+collation. On two million rows `count(*) WHERE 't1' = ANY (tags)` took 3.2 ms against 343 before
+(108x), `status IS NOT DISTINCT FROM 'paid'` 7.2 ms against 179 (25x), and `status LIKE 'pa%'` 8.2
+ms against 118 (14x).
+
+A `WHERE` clause no Lion index answers - `payload LIKE '%ab%'`, `id > 1000` on a column without
 one, `length(name) = 3` - does not send the count to the ordinary plan when the other clauses do
 select rows: the node counts those rows and tests the clause on each of them in the heap
 (`Residual Filter` in EXPLAIN; DESIGN.md §10, "Residual clauses"). It does the work of a bitmap
@@ -224,7 +237,7 @@ bounds rule out and, in the arm it keeps, the `kind = ...` they imply, so the pa
 counts `tags && '{x}'` alone (`Refuted by Partition Bounds` in `EXPLAIN`).
 
 A clause no partition's Lion index answers and the bounds do not decide - `ts >= '2026-10-19' AND
-ts < '2026-10-26'` over monthly partitions, `payload LIKE 'ab%'` - is tested on each partition's
+ts < '2026-10-26'` over monthly partitions, `payload LIKE '%ab%'` - is tested on each partition's
 rows as it is over one table (`Residual Filter`; DESIGN.md §16, "Residual clauses over a
 partitioned table"): the partitions whose bounds imply it test none of theirs, so the months inside
 the range are counted from their indexes alone and only the two at its ends read their heaps
