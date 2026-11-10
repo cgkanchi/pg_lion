@@ -1603,7 +1603,11 @@ phase1g() {
 	# Two keys on alternate wide rows, 65 to a heap page: 66000 rows are 16
 	# container keys, which a build at posting_fillfactor 10 makes a leaf
 	# each, so each key has 16 leaves and no internal level.  The insert below
-	# fills the last leaf with containers, and its split is the 17th.
+	# fills the last leaf with containers, and its split is the 17th.  The
+	# inserts go in row by row, the two keys' rows alternating: a batch
+	# (DESIGN.md §55) writes one key's rows before the other's, so the crash
+	# would leave the other set without the rows that bring it to its 17th
+	# leaf after the restart.
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1g: fixture failed"
 		SET synchronous_commit = on;
 		DROP TABLE IF EXISTS lion_promo;
@@ -1621,7 +1625,7 @@ phase1g() {
 
 	off=$(stat -c %s "$PRIMARY_LOG")
 	"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres -d "$DBNAME" \
-		-c "SET synchronous_commit = on;
+		-c "SET synchronous_commit = on; SET pg_lion.batch_inserts = off;
 		    INSERT INTO lion_promo SELECT 100000 + i, i % 2
 		      FROM generate_series(1, 30000) i" >>"$RUNLOG" 2>&1 &
 	parked=$!
@@ -1677,6 +1681,7 @@ phase1g() {
 	# the other key's set on the way.
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1g: inserting after the crash failed"
 		SET synchronous_commit = on;
+		SET pg_lion.batch_inserts = off;
 		INSERT INTO lion_promo SELECT 200000 + i, i % 2
 		  FROM generate_series(1, 20000) i;
 		VACUUM lion_promo;
