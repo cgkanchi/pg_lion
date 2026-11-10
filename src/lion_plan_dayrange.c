@@ -275,16 +275,18 @@ lion_dayrange_bucket(FuncExpr *fe, Interval *step, Const *c,
 	if (step == NULL)
 	{
 		DateADT		d = DatumGetDateADT(c->constvalue);
-		int			overflow = 0;
 
-		if (DATE_NOT_FINITE(d) || d >= DATEVAL_NOEND - 1)
+		/*
+		 * The day and the next one as timestamps, as date2timestamp() makes
+		 * them, both inside the timestamp range (whose test there has a
+		 * different name on each major version)
+		 */
+		if (DATE_NOT_FINITE(d) ||
+			d < DATETIME_MIN_JULIAN - POSTGRES_EPOCH_JDATE ||
+			d >= TIMESTAMP_END_JULIAN - POSTGRES_EPOCH_JDATE - 1)
 			return false;
-		*start = date2timestamp_opt_overflow(d, &overflow);
-		if (overflow != 0)
-			return false;
-		*next = date2timestamp_opt_overflow(d + 1, &overflow);
-		if (overflow != 0)
-			return false;
+		*start = (Timestamp) d * USECS_PER_DAY;
+		*next = (Timestamp) (d + 1) * USECS_PER_DAY;
 		*aligned = true;
 		return lion_dayrange_inside(*start);
 	}
