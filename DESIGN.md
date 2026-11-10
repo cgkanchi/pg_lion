@@ -23282,6 +23282,42 @@ expression is computed for the groups that come out, so an error only another gr
 raise (`ClientIP + 1` at the type's maximum) is not raised; the ordinary plan computes it for
 every row.
 
+### Expressions of columns not grouped
+
+`GROUP BY upper(status)` or `GROUP BY kind / 5` names no column, so neither has the groups of the
+walk. Each is the GROUP BY of the columns it reads, merged: where every row of a column's group
+holds the same value (the value rule of §10), an immutable expression of those columns
+(`lion_group_dependent()`) is the same for every row of the group, so each group of the
+expressions is a union of the columns' groups. `lion_count_path_derive_groups()` makes each column
+the expressions read, and the GROUP BY does not name, a grouping column under its type's own
+equality and the column's collation: a finer grouping than any the expressions make. The node
+counts those groups and emits them as partial rows; the projection computes the expressions from
+each group's key, and core's Finalize HashAggregate adds up the rows that share a value:
+
+```
+Finalize HashAggregate
+  Group Key: upper(t)
+  ->  Custom Scan (LionCount)
+        Lion Indexes: lion_ge_t (t)
+        Group Key: t
+```
+
+The expressions are computed once per group with rows, from the value each of those rows holds,
+which is the value the ordinary plan computes them from, so they raise the errors the ordinary
+plan raises and no others: a key whose rows are all deleted, or all taken out by the WHERE, is not
+emitted. Two grouping columns at most, with the expressions' columns counted in (the nested loop of
+§20); the merge needs partial aggregation and hashable expressions. Declined beside the columns'
+groups: a count(DISTINCT), whose partial counts cannot be added; a SELECT DISTINCT; filtered counts;
+the FK-side and anti joins; aggregates over the entries (§37); the top k, which needs finished
+groups. A partitioned table's leaves are merged by the same Finalize Agg. The plan's group estimate
+is the columns' groups; the Finalize Agg's is core's estimate of the expressions', capped by it.
+Numeric, float and other types whose equal values may differ (`1.0`, `1.00`) fail the value rule
+and stay with core, as do volatile and stable expressions. Where a count by cells (§10) also
+applies, as for a `CASE` over one column's values, the cost model picks; the merge measured faster
+(2.4 ms against 14.8 for a `CASE` over a 20-value column of 2M rows), and `pg_lion.enable_expr_groups`
+turns it off. `test/sql/group_expr.sql` checks every shape against a sequential scan, with deleted
+and updated rows unvacuumed.
+
 ### The keys of a multi-key column (`lion_index_facets()`, §7)
 
 The bound holds for a multi-key column's entries as for a scalar one's: a row is filed under each

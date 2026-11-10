@@ -525,7 +525,9 @@ SELECT lion_tq('SELECT g, g % 3, count(*) FROM tk GROUP BY g, g % 3');
  every group, 4021 rows
 (1 row)
 
--- ... but not a volatile one, one of another column, or one alone.
+-- ... but not a volatile one or one of another column; and one alone is
+-- counted for every group and merged (DESIGN.md §36, "Expressions of columns
+-- not grouped"), never the top k.
 SELECT lion_tq('SELECT g, count(*) FROM tk GROUP BY g, g + (random() * 0)::int ORDER BY count(*) DESC LIMIT 2');
        lion_tq       
 ---------------------
@@ -541,7 +543,7 @@ SELECT lion_tq('SELECT g, h + 1, count(*) FROM tk WHERE g < 1005 GROUP BY g, h +
 SELECT lion_tq('SELECT g + 1, count(*) FROM tk GROUP BY g + 1 ORDER BY count(*) DESC LIMIT 2');
        lion_tq       
 ---------------------
- no pushdown, 2 rows
+ every group, 2 rows
 (1 row)
 
 -- ... nor one of a column whose equal values need not be the same: 'A' and

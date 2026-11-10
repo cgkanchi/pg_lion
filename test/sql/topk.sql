@@ -250,7 +250,9 @@ SELECT lion_tq('SELECT g, g + 1, (g * 2)::text, count(*) FROM tk GROUP BY g, g +
 SELECT lion_trun('SELECT g + 1, count(*) FROM tk GROUP BY g + 1, g ORDER BY count(*) DESC LIMIT 4');
 SELECT g - 1, g, count(*) FROM tk GROUP BY g - 1, g ORDER BY count(*) DESC LIMIT 4;
 SELECT lion_tq('SELECT g, g % 3, count(*) FROM tk GROUP BY g, g % 3');
--- ... but not a volatile one, one of another column, or one alone.
+-- ... but not a volatile one or one of another column; and one alone is
+-- counted for every group and merged (DESIGN.md §36, "Expressions of columns
+-- not grouped"), never the top k.
 SELECT lion_tq('SELECT g, count(*) FROM tk GROUP BY g, g + (random() * 0)::int ORDER BY count(*) DESC LIMIT 2');
 SELECT lion_tq('SELECT g, h + 1, count(*) FROM tk WHERE g < 1005 GROUP BY g, h + 1');
 SELECT lion_tq('SELECT g + 1, count(*) FROM tk GROUP BY g + 1 ORDER BY count(*) DESC LIMIT 2');

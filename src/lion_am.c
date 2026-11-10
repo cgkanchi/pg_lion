@@ -616,6 +616,20 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	/*
+	 * DESIGN.md §36, "Expressions of columns not grouped": whether a GROUP BY
+	 * of expressions of lion-indexed columns it does not name may be counted
+	 * by those columns' groups, merged by a Finalize Agg.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_expr_groups",
+							 "Lets the count pushdown count a GROUP BY of expressions of lion-indexed columns by the columns' own groups, merged.",
+							 "Off, such a GROUP BY goes to a count by cells or to the ordinary plan.",
+							 &lion_enable_expr_groups,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomIntVariable("pg_lion.count_cells_max",
 							"The most cells a count by cells may have: the product of each predicate column's outcomes.",
 							"A plan with more is left to the ordinary plan.",
