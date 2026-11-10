@@ -6877,7 +6877,10 @@ lion_tsquery_operand_free(OpExpr *lop)
  * exactly, as lion_tsquery_tree() decides it: plain lexemes - a prefix as
  * the OR of lexemes the executor expands it into - under ANDs and ORs, and
  * an AND of x and !y for two such?  The shape alone: an ambiguous long
- * lexeme, which makes the executor's answer a superset, is not known here.
+ * lexeme anywhere in the query, which makes the whole extraction a superset,
+ * is lion_tsquery_ambiguous()'s; and a prefix past the expansion cap, which
+ * the executor leaves every row, is taken as expanded, as this estimate
+ * takes every prefix, since how many lexemes it covers is not known here.
  */
 static bool
 lion_tsquery_exact_shape(QueryItem *items, int32 size, int32 i)
@@ -6911,22 +6914,44 @@ lion_tsquery_exact_shape(QueryItem *items, int32 size, int32 i)
 }
 
 /*
+ * Does the tsquery hold a lexeme lion_tsvector_extract_query() files under an
+ * ambiguous key - one of LION_LEXEME_KEY_MAX bytes or more, not a prefix
+ * (DESIGN.md §17, "Long lexemes")?  Its extraction is then not the plain
+ * one, and lion_tsquery_superset() takes no NOT away anywhere in it.
+ */
+static bool
+lion_tsquery_ambiguous(QueryItem *items, int32 size)
+{
+	int32		i;
+
+	for (i = 0; i < size; i++)
+	{
+		if (items[i].type == QI_VAL && !items[i].qoperand.prefix &&
+			items[i].qoperand.length >= LION_LEXEME_KEY_MAX)
+			return true;
+	}
+	return false;
+}
+
+/*
  * The share of the rows the tsquery rooted at items[i] matches, from its
  * operands' shares lexsel[itemlex[...]], combined as core combines them
  * (tsquery_opr_selec()): an AND and a phrase their product, an OR as
  * independent, a NOT the complement.  Or, superset, the share of the rows
  * of the boolean tree over its lexemes the posting sets answer, which
  * lion_tsquery_superset() makes of it: a phrase its operands' AND, a weight
- * the lexeme at any weight, `x & !y` outside a phrase x's tree less y's rows
- * where y is exact (lion_tsquery_exact_shape()), any other NOT every row -
- * and an AND with it the other side, an OR with it every row.  *every says
- * that the tree is every row.  The bounds of an operator's left operand are
- * the ones that function checks; what it would refuse is every row here.
+ * the lexeme at any weight, `x & !y` x's tree less y's rows where y is exact
+ * (lion_tsquery_exact_shape()) and nosub is false - it is true inside a
+ * phrase and for a query lion_tsquery_ambiguous() finds - any other NOT
+ * every row - and an AND with it the other side, an OR with it every row.
+ * *every says that the tree is every row.  The bounds of an operator's left
+ * operand are the ones that function checks; what it would refuse is every
+ * row here.
  */
 static Selectivity
 lion_tsquery_walk_sel(QueryItem *items, int32 size, int32 i,
 					  const int *itemlex, const double *lexsel, bool superset,
-					  bool inphrase, bool *every)
+					  bool nosub, bool *every)
 {
 	QueryItem  *item;
 	Selectivity s1;
@@ -6973,7 +6998,7 @@ lion_tsquery_walk_sel(QueryItem *items, int32 size, int32 i,
 				*every = true;
 				return 1.0;
 			}
-			if (superset && !inphrase && item->qoperator.oper == OP_AND)
+			if (superset && !nosub && item->qoperator.oper == OP_AND)
 			{
 				QueryItem  *r = &items[i + 1];
 				QueryItem  *l = &items[i + (int32) left];
@@ -7001,12 +7026,12 @@ lion_tsquery_walk_sel(QueryItem *items, int32 size, int32 i,
 			}
 			s1 = lion_tsquery_walk_sel(items, size, i + 1, itemlex, lexsel,
 									   superset,
-									   inphrase ||
+									   nosub ||
 									   item->qoperator.oper == OP_PHRASE,
 									   &every1);
 			s2 = lion_tsquery_walk_sel(items, size, i + (int32) left,
 									   itemlex, lexsel, superset,
-									   inphrase ||
+									   nosub ||
 									   item->qoperator.oper == OP_PHRASE,
 									   &every2);
 			if (item->qoperator.oper == OP_OR)
@@ -7284,7 +7309,8 @@ lion_tsquery_pos_shape_of(PlannerInfo *root, RelOptInfo *rel,
 	full = lion_tsquery_walk_sel(items, tsq->size, 0, itemlex, shares, false,
 								 false, &every);
 	super = lion_tsquery_walk_sel(items, tsq->size, 0, itemlex, shares, true,
-								  false, &every);
+								  lion_tsquery_ambiguous(items, tsq->size),
+								  &every);
 	if (every)
 		super = 1.0;
 

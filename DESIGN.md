@@ -6960,12 +6960,14 @@ counts need stored positions, which is a separate design.
 match y", so the rows the operator selects are x's less y's, and the shared evaluator already has the
 node for it, `LION_KN_ANDNOT` (§14, `IS NOT NULL`), whose first child's containers are taken the
 others' members away at the keys the first child stands at.  `lion_tsquery_tree()` builds one for an
-AND exactly one of whose operands is a NOT - either way round, the NOT's operand an exact tree
-itself - and folds a run of them into one node (`a & !b & !c` is ANDNOT(a, b, c)); a NOT under an OR,
-alone, or on both sides of an AND still needs every row and stays ALL.  The query is then KEYS:
-exact for the scans (no recheck), the count (no row filter, no position filter) and every count
-shape that takes an exact multi-key leaf - GROUP BY, count(DISTINCT), the FK-side join, counts by
-cells, whose mask test reads an ANDNOT as its first child's keys and none of the others'
+AND exactly one of whose operands is a NOT - either way round, the other operand and the NOT's
+operand both exact trees themselves (`(a <-> c) & !b` is not one, and is the superset's below) -
+and folds a run of them into one node (`a & !b & !c` is ANDNOT(a, b, c)); a NOT that is itself an
+OR's operand (`a | !b`), one alone, or one on both sides of an AND still needs every row and stays
+ALL, while an ANDNOT under an OR (`(a & !b) | c`) is an ordinary operand of it.  The query is then
+KEYS: exact for the scans (no recheck), the count (no row filter, no position filter) and every
+count shape that takes an exact multi-key leaf - GROUP BY, count(DISTINCT), the FK-side join,
+counts by cells, whose mask test reads an ANDNOT as its first child's keys and none of the others'
 (`lion_cells_tree()`), and LionOrdered's lazy set.
 
 The superset (`lion_tsquery_superset()`) does the same wherever it would have dropped the NOT, so
@@ -6974,7 +6976,9 @@ phrase, where a NOT is about positions (`(a & !b) <-> c` matches a row that has 
 else), not where y is not exact (`a & !b:A`, `a & !(b <-> c)`, which stay `a`), not where the other
 side's superset is every row, and never for an extraction that is not the plain one: an ambiguous
 long lexeme's set ("Long lexemes") may hold rows without its lexeme, and taking those away would
-lose rows.  The cost model's superset share (`lion_tsquery_walk_sel()`) follows the same rule.
+lose rows.  The cost model's superset share (`lion_tsquery_walk_sel()`) follows the same rule,
+an ambiguous long lexeme anywhere in the query included (`lion_tsquery_ambiguous()`); a prefix past
+the expansion cap, which the planner cannot see, it takes as expanded, as it takes every prefix.
 
 On 500,000 synthetic documents (PostgreSQL 18.7, warm, serial), `count(*) WHERE tsv @@ 'w2 & !w5'`
 of a lexeme in nearly every row and one in 93% of them took 55 ms, every candidate of `w2` decided
