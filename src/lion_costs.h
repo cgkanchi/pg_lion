@@ -54,6 +54,7 @@ extern PGDLLIMPORT double lion_probe_rescan_cost;
 
 /* The count's walks: GROUP BY, count(DISTINCT), ranges (§20, §26, §28, §32) */
 extern PGDLLIMPORT double lion_entry_count_cost;
+extern PGDLLIMPORT double lion_inline_entry_count_cost;
 extern PGDLLIMPORT double lion_list_group_cost;
 extern PGDLLIMPORT double lion_distinct_test_cost;
 extern PGDLLIMPORT double lion_range_entry_cost;

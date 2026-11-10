@@ -1981,6 +1981,26 @@ lion_entry_scan_batch_left(const LionEntryScan *es)
 }
 
 /*
+ * How many entries of that leaf lion_entry_scan_next() must still hand out
+ * before a pause (lion_entry_scan_pause()) has nothing to let go of: up to
+ * and including the batch's last INLINE copy, whose pin the scan keeps until
+ * then.  0 when no INLINE copy is still to come, and the pause then keeps
+ * the batch.  A caller that hands out that many first, and releases their
+ * sets, reads the leaf once however many rows it returns from it (DESIGN.md
+ * §28, "A walk that returns rows").  Not for a walk whose sets share the
+ * scan's pin (lion_entry_scan_share_pin()), which keeps it to the next leaf.
+ */
+static inline int
+lion_entry_scan_pinned_left(const LionEntryScan *es)
+{
+	Assert(!es->sharepin);
+	if (es->batchbuf == InvalidBuffer)
+		return 0;
+	Assert(es->lastinline >= es->nextbatch && es->lastinline < es->nbatch);
+	return es->lastinline - es->nextbatch + 1;
+}
+
+/*
  * The caller is about to hand a row to the executor and may not come back
  * for as long as a cursor stays open.  A walk must not keep a directory leaf
  * pinned across that (VACUUM would wait for it), so the INLINE copies still
@@ -2041,6 +2061,13 @@ extern PGDLLIMPORT bool lion_enable_decoded_walk;
  */
 extern PGDLLIMPORT bool lion_enable_count_cells;
 extern PGDLLIMPORT int lion_count_cells_max;
+
+/*
+ * Whether a GROUP BY of expressions of lion-indexed columns it does not name
+ * may be counted by those columns' groups and merged (DESIGN.md §36,
+ * "Expressions of columns not grouped").  A planner switch.
+ */
+extern PGDLLIMPORT bool lion_enable_expr_groups;
 
 /*
  * Whether the count pushdown may test WHERE clauses no posting set answers

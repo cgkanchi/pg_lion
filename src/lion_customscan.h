@@ -827,6 +827,24 @@ typedef struct LionVColScope
 #define LION_LIST_GROUP_COST	(lion_list_group_cost * cpu_tuple_cost)
 
 /*
+ * ... and of each count of the walk one entry at a time
+ * (lion_group_walk_fill(): no copy of the WHERE counted against) of an entry
+ * small enough to be INLINE: its payload is on the leaf, read once with the
+ * leaf's other entries (DESIGN.md §28, "A walk that returns rows"), so the
+ * count has no posting page to read, nor a cursor over one to set up.
+ * Measured on the release build of PostgreSQL 18 over 2M- and 5M-row tables,
+ * whole-table GROUP BYs of 489k to 5M groups of 1 to 5 rows: 0.27 to 0.5 us
+ * a group over and above the merge, 14 to 25 cpu_tuple_cost at the 500 units
+ * a millisecond of §10's reference.  Until 2026-11-10 such a walk read the
+ * leaf again for every group, and LION_ENTRY_COUNT_COST was what it cost.
+ * The sum over every entry of a column (`k IS NOT NULL` alone, §14), priced
+ * as the same walk, always read each leaf once: 0.22 us an entry all told
+ * over 2M INLINE entries of a row each, 11 cpu_tuple_cost, so it is charged
+ * this too.
+ */
+#define LION_INLINE_ENTRY_COUNT_COST	(lion_inline_entry_count_cost * cpu_tuple_cost)
+
+/*
  * ... and each set of a WHERE source that is a union (an IN list, an OR
  * across columns), which every count of a GROUP BY builds again: its cursor
  * set up and positioned over the set's copy, and its merge (DESIGN.md §15,
@@ -4331,6 +4349,7 @@ extern LionQueryMode lion_multikey_literal_mode(IndexOptInfo *idx,
 extern BoolExpr *lion_boolean_not_test(Node *clause);
 extern List *lion_or_arms(Node *clause);
 extern List *lion_all_as_and(Node *clause);
+extern List *lion_like_as_and(Node *clause);
 extern Node *lion_multikey_any_as_or(Node *clause);
 extern bool lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 							  bool allow_negated, bool allow_range,

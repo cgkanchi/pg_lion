@@ -215,6 +215,7 @@ lion_build_simple_rel(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 		lion_prev_build_simple_rel_hook(root, rel, rte);
 	lion_drop_other_format(rel);
 	lion_leave_out_slice_pages(rel);
+	lion_rewrite_day_filters(root, rel);
 }
 #else
 static void
@@ -226,6 +227,7 @@ lion_get_relation_info(PlannerInfo *root, Oid relationObjectId,
 										 rel);
 	lion_drop_other_format(rel);
 	lion_leave_out_slice_pages(rel);
+	lion_rewrite_day_filters(root, rel);
 }
 #endif
 
@@ -616,6 +618,20 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	/*
+	 * DESIGN.md §36, "Expressions of columns not grouped": whether a GROUP BY
+	 * of expressions of lion-indexed columns it does not name may be counted
+	 * by those columns' groups, merged by a Finalize Agg.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_expr_groups",
+							 "Lets the count pushdown count a GROUP BY of expressions of lion-indexed columns by the columns' own groups, merged.",
+							 "Off, such a GROUP BY goes to a count by cells or to the ordinary plan.",
+							 &lion_enable_expr_groups,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomIntVariable("pg_lion.count_cells_max",
 							"The most cells a count by cells may have: the product of each predicate column's outcomes.",
 							"A plan with more is left to the ordinary plan.",
@@ -691,6 +707,20 @@ _PG_init(void)
 	 * may count only the groups that can be among the first rows, found by
 	 * the entries' own counts.  Off, every group is counted.
 	 */
+	/*
+	 * DESIGN.md §54: whether a comparison of ts::date or date_trunc(unit, ts)
+	 * of a timestamp column with a lion index is planned as the range of ts
+	 * it is.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_date_ranges",
+							 "Plans a comparison of ts::date or date_trunc(unit, ts) of a lion-indexed timestamp column with a constant as the range of ts it is.",
+							 "Off, the comparison is left as written, which no index answers.",
+							 &lion_enable_date_ranges,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("pg_lion.enable_topk",
 							 "Lets the count pushdown count only the groups that can be among the first rows of a GROUP BY ordered by its count under a LIMIT.",
 							 "Off, every group is counted and the Sort and Limit above choose among them.",

@@ -163,80 +163,25 @@ sparse_lower_bound(const uint64 *codes, uint32 n, uint64 target)
 }
 
 /*
- * Where a pair goes in the stream, for insert() and insert_size(): the pair
- * at the insertion point and the code before it.
+ * The varint at the insertion point and the new pair's replace it, so the
+ * stream with the pair inserted takes the old stream's bytes less that
+ * varint's, plus the new pair's delta from the code before it (its lo, from
+ * the base, when it opens the stream) and, when there is a pair at the point,
+ * that pair's delta from the new one.
  */
-typedef struct SparseSpot
+static inline uint32
+sparse_probe_newbytes(const LionSparseProbe *pr)
 {
-	uint32		npairs;			/* pairs the stream decodes to */
-	uint32		end;			/* bytes they take */
-	uint32		off;			/* offset of the varint at the insertion point */
-	uint32		len;			/* its length; 0 when the point is the end */
-	uint64		prev;			/* code before the point; unused at index 0 */
-	uint64		next;			/* code at the point, when len > 0 */
-	bool		front;			/* the point is the first pair (or s is empty) */
-	bool		found;			/* the code at the point is the target */
-	uint32		newbytes;		/* stream bytes with the pair inserted */
-} SparseSpot;
+	uint32		n = pr->end - pr->len;
 
-static void
-sparse_locate(const LionContainer *s, uint64 code, SparseSpot *sp)
-{
-	LionSparseIter it;
-	const uint8 *start = LION_SPARSE_STREAM_CONST(s);
-	const uint8 *before;
-
-	sp->npairs = 0;
-	sp->len = 0;
-	sp->found = false;
-	sp->front = true;
-	sp->prev = 0;
-	sp->next = 0;
-
-	lion_sparse_iter_init(&it, s);
-	for (;;)
-	{
-		before = it.p;
-		if (!lion_sparse_iter_next(&it))
-			break;
-		if (it.code >= code)
-		{
-			/* the insertion point: this pair's varint is rewritten */
-			sp->off = (uint32) (before - start);
-			sp->len = (uint32) (it.p - before);
-			sp->next = it.code;
-			sp->found = (it.code == code);
-			/* the rest of the stream is only measured */
-			sp->npairs++;
-			while (lion_sparse_iter_next(&it))
-				sp->npairs++;
-			break;
-		}
-		sp->prev = it.code;
-		sp->front = false;
-		sp->npairs++;
-	}
-	sp->end = (uint32) (it.p - start);
-	if (sp->len == 0)
-		sp->off = sp->end;
-
-	/* The stream with the pair inserted at the point. */
-	if (sp->front)
-	{
-		/* the new pair opens the stream: its lo, then the old first pair */
-		sp->newbytes = sp->end - sp->len +
-			lion_sparse_varint_size(code - sparse_base(code));
-		if (sp->len > 0)
-			sp->newbytes += lion_sparse_varint_size(sp->next - code);
-	}
+	if (pr->front)
+		n += lion_sparse_varint_size(pr->code - sparse_base(pr->code));
 	else
-	{
-		sp->newbytes = sp->end - sp->len + lion_sparse_varint_size(code - sp->prev);
-		if (sp->len > 0)
-			sp->newbytes += lion_sparse_varint_size(sp->next - code);
-	}
+		n += lion_sparse_varint_size(pr->code - pr->prev);
+	if (pr->len > 0)
+		n += lion_sparse_varint_size(pr->next - pr->code);
+	return n;
 }
-
 
 /* ----------------------------------------------------------------
  *								API
@@ -250,6 +195,60 @@ lion_sparse_init(LionContainer *s, uint32 ckey)
 	s->cardinality = 0;
 	s->type = LION_CT_SPARSE;
 	s->flags = 0;
+}
+
+void
+lion_sparse_probe(const LionContainer *s, uint32 ckey, uint16 lo,
+				  LionSparseProbe *pr)
+{
+	LionSparseIter it;
+	const uint8 *start = LION_SPARSE_STREAM_CONST(s);
+	const uint8 *before;
+	uint64		code = lion_make_code(ckey, lo);
+
+	Assert(s->type == LION_CT_SPARSE);
+	Assert((uint32) lo < LION_CONTAINER_RANGE);
+
+	/* every byte, padding included: lion_sparse_insert_probed() compares */
+	memset(pr, 0, sizeof(LionSparseProbe));
+	pr->code = code;
+	pr->front = true;
+
+	lion_sparse_iter_init(&it, s);
+	for (;;)
+	{
+		before = it.p;
+		if (!lion_sparse_iter_next(&it))
+			break;
+		pr->npairs++;
+		if (lion_code_ckey(it.code) == ckey)
+			pr->ckey_pairs++;
+		if (it.code >= code)
+		{
+			/* the insertion point: this pair's varint is rewritten */
+			pr->off = (uint32) (before - start);
+			pr->len = (uint32) (it.p - before);
+			pr->next = it.code;
+			pr->found = (it.code == code);
+			/* the rest of the stream is only measured, and its ckey counted */
+			while (lion_sparse_iter_next(&it))
+			{
+				pr->npairs++;
+				if (lion_code_ckey(it.code) == ckey)
+					pr->ckey_pairs++;
+			}
+			break;
+		}
+		pr->prev = it.code;
+		pr->front = false;
+	}
+	pr->end = (uint32) (it.p - start);
+	if (pr->len == 0)
+		pr->off = pr->end;
+
+	/* as lion_sparse_last_ckey(): the iterator stops on the last pair */
+	pr->last_ckey = (pr->npairs > 0) ? lion_code_ckey(it.code) : s->ckey;
+	pr->newbytes = sparse_probe_newbytes(pr);
 }
 
 uint32
@@ -322,45 +321,52 @@ lion_sparse_contains(const LionContainer *s, uint32 ckey, uint16 lo)
 Size
 lion_sparse_insert_size(const LionContainer *s, uint32 ckey, uint16 lo)
 {
-	SparseSpot	sp;
+	LionSparseProbe pr;
 
-	Assert(s->type == LION_CT_SPARSE);
-	Assert((uint32) lo < LION_CONTAINER_RANGE);
-
-	sparse_locate(s, lion_make_code(ckey, lo), &sp);
-	if (sp.found)
-		return lion_sparse_size(s);
-	if (sp.newbytes > LION_SPARSE_MAX_BYTES ||
-		sp.npairs + 1 > LION_SPARSE_MAX_PAIRS)
-		return 0;
-	return lion_sparse_size_for(sp.newbytes);
+	lion_sparse_probe(s, ckey, lo, &pr);
+	return lion_sparse_probe_insert_size(s, &pr);
 }
 
 bool
 lion_sparse_insert(LionContainer *s, uint32 ckey, uint16 lo, bool *dup)
 {
-	uint64		code = lion_make_code(ckey, lo);
-	SparseSpot	sp;
+	LionSparseProbe pr;
+
+	lion_sparse_probe(s, ckey, lo, &pr);
+	return lion_sparse_insert_probed(s, &pr, dup);
+}
+
+bool
+lion_sparse_insert_probed(LionContainer *s, const LionSparseProbe *pr,
+						  bool *dup)
+{
 	uint8	   *stream = LION_SPARSE_STREAM(s);
 	uint8	   *p;
 	uint32		taillen;
 	uint32		head;
 
 	Assert(s->type == LION_CT_SPARSE);
-	Assert((uint32) lo < LION_CONTAINER_RANGE);
+#ifdef USE_ASSERT_CHECKING
+	{
+		/* the probe is of these very bytes */
+		LionSparseProbe again;
+
+		lion_sparse_probe(s, lion_code_ckey(pr->code), lion_code_lo(pr->code),
+						  &again);
+		Assert(memcmp(&again, pr, sizeof(again)) == 0);
+	}
+#endif
 
 	if (dup != NULL)
 		*dup = false;
 
-	sparse_locate(s, code, &sp);
-	if (sp.found)
+	if (pr->found)
 	{
 		if (dup != NULL)
 			*dup = true;
 		return true;			/* already there: nothing to do */
 	}
-	if (sp.newbytes > LION_SPARSE_MAX_BYTES ||
-		sp.npairs + 1 > LION_SPARSE_MAX_PAIRS)
+	if (!lion_sparse_probe_fits(pr))
 		return false;
 
 	/*
@@ -370,26 +376,26 @@ lion_sparse_insert(LionContainer *s, uint32 ckey, uint16 lo, bool *dup)
 	 * the bytes in front of it stay where they are.  Nothing is written past
 	 * lion_sparse_insert_size().
 	 */
-	taillen = sp.end - sp.off - sp.len;
-	head = sp.newbytes - taillen;
-	memmove(stream + head, stream + sp.off + sp.len, taillen);
+	taillen = pr->end - pr->off - pr->len;
+	head = pr->newbytes - taillen;
+	memmove(stream + head, stream + pr->off + pr->len, taillen);
 
-	p = stream + sp.off;
-	if (sp.front)
+	p = stream + pr->off;
+	if (pr->front)
 	{
-		Assert(sp.off == 0);
-		p = sparse_put_varint(p, code - sparse_base(code));
-		s->ckey = ckey;
+		Assert(pr->off == 0);
+		p = sparse_put_varint(p, pr->code - sparse_base(pr->code));
+		s->ckey = lion_code_ckey(pr->code);
 	}
 	else
-		p = sparse_put_varint(p, code - sp.prev);
-	if (sp.len > 0)
-		p = sparse_put_varint(p, sp.next - code);
+		p = sparse_put_varint(p, pr->code - pr->prev);
+	if (pr->len > 0)
+		p = sparse_put_varint(p, pr->next - pr->code);
 	Assert(p == stream + head);
 	(void) p;
 
-	s->cardinality = (uint16) (sp.npairs + 1);
-	s->flags = (uint8) sp.newbytes;
+	s->cardinality = (uint16) (pr->npairs + 1);
+	s->flags = (uint8) pr->newbytes;
 
 	Assert(lion_sparse_size(s) <= LION_SPARSE_MAX_SIZE);
 	return true;

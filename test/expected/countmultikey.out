@@ -24,6 +24,9 @@ SET synchronous_commit = on;
 -- own Agg, and no enable_*join setting disables it: it is off here, and tested
 -- - the upper node over it included - in fkjoin_semipath.sql.
 SET pg_lion.enable_semijoin = off;
+-- The GROUP BYs of predicates below are the counts by cells', which the
+-- columns' own groups merged (DESIGN.md §36) would otherwise count.
+SET pg_lion.enable_expr_groups = off;
 SET max_parallel_workers_per_gather = 0;
 /*
  * lion_mk() runs a query with every other scan and join method disabled, so
@@ -241,9 +244,10 @@ SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE nums @> $1', '''{}''');
  LionCount, 1 rows, 12000 rechecked, 0 removed
 (1 row)
 
--- @@: AND and OR of lexemes are exact; a phrase is the AND of its lexemes and
--- a weight the lexeme at any weight, both rechecked; `a & !b` is `a`,
--- rechecked; a prefix and `!a` are every row; an empty query nothing
+-- @@: AND and OR of lexemes are exact, and so is `a & !b`, a's rows less
+-- b's; a phrase is the AND of its lexemes and a weight the lexeme at any
+-- weight, both rechecked; `a & !b:A` is `a`, rechecked; a prefix, `!a` and
+-- `a | !b` are every row; an empty query nothing
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1''');
                   lion_mk                  
 -------------------------------------------
@@ -287,9 +291,27 @@ SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1:A & x1'''
 (1 row)
 
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1 & !x1''');
-                    lion_mk                     
-------------------------------------------------
- LionCount, 1 rows, 4561 rechecked, 912 removed
+                  lion_mk                  
+-------------------------------------------
+ LionCount, 1 rows, 0 rechecked, 0 removed
+(1 row)
+
+SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''!x1 & w1 & !x2''');
+                  lion_mk                  
+-------------------------------------------
+ LionCount, 1 rows, 0 rechecked, 0 removed
+(1 row)
+
+SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1 & !x1:A''');
+                    lion_mk                    
+-----------------------------------------------
+ LionCount, 1 rows, 4561 rechecked, 82 removed
+(1 row)
+
+SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''(w1 <-> x2) & !x1''');
+                    lion_mk                    
+-----------------------------------------------
+ LionCount, 1 rows, 913 rechecked, 730 removed
 (1 row)
 
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1 | !x1''');
@@ -339,9 +361,9 @@ SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ websearch_to_tsquery
 (1 row)
 
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ websearch_to_tsquery(''simple'', $1)', '''w3 -x3''');
-                    lion_mk                    
------------------------------------------------
- LionCount, 1 rows, 912 rechecked, 182 removed
+                  lion_mk                  
+-------------------------------------------
+ LionCount, 1 rows, 0 rechecked, 0 removed
 (1 row)
 
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> ARRAY[$1, $2]', '''t1'', ''t8''');
@@ -488,9 +510,15 @@ SELECT lion_mk('SELECT count(DISTINCT k) FROM lion_mk_t WHERE tags && $1', '''{t
 (1 row)
 
 SELECT lion_mk('SELECT g, count(DISTINCT k) FROM lion_mk_t WHERE tsv @@ $1 GROUP BY g', '''w4 & !x4''');
-                    lion_mk                    
------------------------------------------------
- LionCount, 4 rows, 603 rechecked, 231 removed
+                  lion_mk                  
+-------------------------------------------
+ LionCount, 4 rows, 0 rechecked, 0 removed
+(1 row)
+
+SELECT lion_mk('SELECT g, count(DISTINCT k) FROM lion_mk_t WHERE tsv @@ $1 GROUP BY g', '''w4 & !x4:B''');
+                   lion_mk                   
+---------------------------------------------
+ LionCount, 4 rows, 468 rechecked, 0 removed
 (1 row)
 
 -- under an OR the query has to be a literal: not pushed
