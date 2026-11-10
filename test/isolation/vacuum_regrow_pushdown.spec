@@ -221,11 +221,15 @@ step s5_vacuum	{ VACUUM (INDEX_CLEANUP ON) rgp; }
 # ... and an insert into k = 2's set, parked in a split with that leaf held:
 # its new NARROWs, of 1,032 bytes on alternate rows with k = 4, fill k = 2's
 # last leaf and split it (consecutive rows would make RUNs of a few hundred
-# bytes, which the leaf would take all of).
+# bytes, which the leaf would take all of).  Row by row: a batch of inserts
+# (DESIGN.md §55) splits the leaves at other points, and is not made in the
+# transaction that loads the library, which this one is unless it is
+# preloaded - the page counts after it would depend on that.
 session s6
 setup
 {
 	SET synchronous_commit = on;
+	SET pg_lion.batch_inserts = off;
 	SELECT injection_points_set_local();
 	SELECT injection_points_attach('lion-posting-split-incomplete', 'wait');
 }
