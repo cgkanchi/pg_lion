@@ -225,10 +225,11 @@ lion_defer_write_oid(LionDefer *d)
 		return;
 
 	/*
-	 * The rows' (sub)transaction took RowExclusiveLock on both and still has
-	 * it, so these are lookups in the local lock table.  An index dropped in
-	 * this transaction - which a utility command's write, below, makes all
-	 * but impossible - takes its rows with it.
+	 * The rows' transaction holds RowExclusiveLock on the table until it
+	 * ends, and on the index while their statement runs; the index's lock
+	 * taken here goes with the write (lion_defer_flush_index()).  An index
+	 * dropped in this transaction - which a utility command's write, below,
+	 * makes all but impossible - takes its rows with it.
 	 */
 	index = try_index_open(d->indexoid, RowExclusiveLock);
 	if (index == NULL)
@@ -239,7 +240,7 @@ lion_defer_write_oid(LionDefer *d)
 	heap = table_open(d->heapoid, RowExclusiveLock);
 	lion_defer_write(d, index, heap);
 	table_close(heap, NoLock);
-	index_close(index, NoLock);
+	index_close(index, RowExclusiveLock);
 }
 
 /*
@@ -365,15 +366,20 @@ lion_defer_flush_index(Relation index)
 		return;
 
 	/*
-	 * A reader's lock on the index may be all this backend holds of it now,
-	 * when the rows' statement has ended; a writer of the index holds
-	 * RowExclusiveLock, which is what lion_index_verify() waits for
-	 * (lion_verify_wait_for_writers()).
+	 * A writer of the index holds RowExclusiveLock on it, which is what
+	 * lion_index_verify() waits for (lion_verify_wait_for_writers()) - and a
+	 * reader's lock may be all this backend holds of it now, when the rows'
+	 * statement has ended.  The lock goes with the write, as the executor's
+	 * goes at the end of the statement (ExecCloseIndices()): held to the end
+	 * of the transaction, it would have verify() wait for a transaction that
+	 * writes nothing more, which is what lets it settle a statement's splits
+	 * once that statement is over.
 	 */
 	LockRelation(index, RowExclusiveLock);
 	heap = table_open(d->heapoid, RowExclusiveLock);
 	lion_defer_write(d, index, heap);
 	table_close(heap, NoLock);
+	UnlockRelation(index, RowExclusiveLock);
 }
 
 /* Write the rows buffered for every index of the table heapoid. */

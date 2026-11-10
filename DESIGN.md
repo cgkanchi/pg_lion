@@ -34726,7 +34726,10 @@ covered is this backend reading the index before they are written, and the commi
   in its range table. An AFTER trigger's query, which runs from `ExecutorFinish()` before the
   indexes are closed, is one of these;
 - a scan of the index (`lionbeginscan()`) and the direct readers no range table names
-  (`lion_open_index()`, `lion_reader_open()`, the count and facet functions);
+  (`lion_open_index()`, `lion_reader_open()`, the count and facet functions). These, and the
+  writes below, take RowExclusiveLock on the index for the write and let it go after it, as the
+  executor lets its own go at the end of a statement: held to the end of the transaction, it would
+  have `lion_index_verify()` wait for a transaction that writes nothing more;
 - a utility command, which may truncate, rewrite or drop the table or the index (a
   `ProcessUtility_hook`; not COMMIT, ROLLBACK or SAVEPOINT);
 - a row from another subtransaction than the rows the buffer holds;
