@@ -1,0 +1,213 @@
+-- FK-side join pushdown whose dimension's own table is a VALUES list
+-- (DESIGN.md §27, "A VALUES list as the dimension"):
+--
+--	SELECT count(*) FROM f JOIN (VALUES ('a'), ('b')) v(k) ON v.k = f.kind
+--	WHERE <fact filters>
+--
+-- The node runs the Values Scan as its child and counts each row's key, as it
+-- does a table's: the join's count is the sum over the list's rows, a value
+-- listed twice counted twice.  A GROUP BY of the list's column, or the list
+-- folded into a fact filter beside a dimension table, asks that no two of its
+-- values be equal, which is proved from the values themselves.  Every answer
+-- is checked against the same query run serially through the pushdown, and
+-- with the pushdown off and sequential scans only.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET pg_lion.enable_semijoin = off;
+SET default_statistics_target = 1000;
+
+-- parallel plans at any size; lion_gv() runs every query serially as well
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET parallel_leader_participation = off;
+
+/*
+ * lion_gv() runs a query through the pushdown with every join method
+ * disabled, so that the node is exercised wherever it has a path: once as
+ * planned - in parallel, when the plan says so - once with
+ * max_parallel_workers_per_gather at 0, and once with the pushdown off and
+ * sequential scans only.  It compares both of the first two with the third
+ * and says whether the first was pushed down.
+ */
+CREATE FUNCTION lion_gv(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+	nrows bigint;
+	ndiff bigint;
+	sdiff bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			how := 'pushed down';
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_gv_par AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+	EXECUTE format('CREATE TEMP TABLE lion_gv_ser AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_gv_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('max_parallel_workers_per_gather', '2', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_gv_par' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_gv_par EXCEPT ALL SELECT * FROM lion_gv_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_gv_off EXCEPT ALL SELECT * FROM lion_gv_par) b)'
+		INTO ndiff;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_gv_ser EXCEPT ALL SELECT * FROM lion_gv_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_gv_off EXCEPT ALL SELECT * FROM lion_gv_ser) b)'
+		INTO sdiff;
+	EXECUTE 'DROP TABLE lion_gv_par, lion_gv_ser, lion_gv_off';
+
+	IF ndiff <> 0 OR sdiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ in parallel, %s serially', ndiff, sdiff);
+	END IF;
+	RETURN format('%s, %s rows', how, nrows);
+END $$;
+
+/* The answer itself, joins disabled: to pin a value, not only an agreement. */
+CREATE FUNCTION lion_gv_val(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	RETURN QUERY EXECUTE format('SELECT s::text FROM (%s) s', q);
+END $$;
+
+/* The plan, joins disabled. */
+CREATE FUNCTION lion_gv_explain(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		CONTINUE WHEN ln ~ '^\s*Disabled: true$';
+		RETURN NEXT ln;
+	END LOOP;
+END $$;
+
+CREATE FUNCTION lion_gv_h(i int8, seed int8) RETURNS int8
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+AS 'SELECT hashint8extended(i, seed) & 9223372036854775807';
+
+/*
+ * The fact: 20000 rows, a text kind of five values with a NULL on every 17th
+ * row, a numeric amount of seven, a small int filter, and a key into the
+ * dimension table below.
+ */
+CREATE TABLE lion_gv_f (
+	id		int8,
+	kind	text,
+	amt		numeric,
+	x		int,
+	fk		int8
+) WITH (parallel_workers = 2);
+INSERT INTO lion_gv_f
+SELECT i,
+	   CASE WHEN i % 17 = 0 THEN NULL
+			ELSE (ARRAY['new', 'open', 'paid', 'void', 'done'])[1 + (lion_gv_h(i, 1) % 5)::int] END,
+	   (lion_gv_h(i, 2) % 7)::numeric,
+	   (lion_gv_h(i, 3) % 4)::int,
+	   1 + lion_gv_h(i, 4) % 300
+  FROM generate_series(1, 20000) i;
+CREATE INDEX lion_gv_f_kind ON lion_gv_f USING lion (kind);
+CREATE INDEX lion_gv_f_amt ON lion_gv_f USING lion (amt);
+CREATE INDEX lion_gv_f_x ON lion_gv_f USING lion (x);
+CREATE INDEX lion_gv_f_fk ON lion_gv_f USING lion (fk);
+VACUUM ANALYZE lion_gv_f;
+
+CREATE TABLE lion_gv_d (pk int8 PRIMARY KEY, region text NOT NULL);
+INSERT INTO lion_gv_d
+SELECT i, (ARRAY['eu', 'us', 'ap'])[1 + (lion_gv_h(i, 5) % 3)::int]
+  FROM generate_series(1, 300) i;
+VACUUM ANALYZE lion_gv_d;
+
+-- ---- the count of a join to a list: each listed key's count ----
+SELECT lion_gv_explain('SELECT count(*) FROM lion_gv_f f JOIN (VALUES (''paid''), (''void'')) v(k) ON v.k = f.kind WHERE f.x = 1');
+SELECT lion_gv('SELECT count(*) FROM lion_gv_f f JOIN (VALUES (''paid''), (''void'')) v(k) ON v.k = f.kind WHERE f.x = 1');
+SELECT lion_gv_val('SELECT count(*) FROM lion_gv_f f JOIN (VALUES (''paid''), (''void'')) v(k) ON v.k = f.kind WHERE f.x = 1')
+	= lion_gv_val('SELECT count(*) FROM lion_gv_f f WHERE f.kind IN (''paid'', ''void'') AND f.x = 1') AS same_as_in_list;
+-- the list on the other side of the equality, and written in the WHERE
+SELECT lion_gv('SELECT count(*) FROM (VALUES (''paid''), (''void'')) v(k), lion_gv_f f WHERE f.kind = v.k AND f.x = 1');
+-- with no fact filter at all
+SELECT lion_gv('SELECT count(*) FROM lion_gv_f f JOIN (VALUES (''new''), (''done''), (''open'')) v(k) ON v.k = f.kind');
+-- a value listed twice is counted twice, as the join pairs it with each row
+SELECT lion_gv('SELECT count(*) FROM lion_gv_f f JOIN (VALUES (''paid''), (''void''), (''paid'')) v(k) ON v.k = f.kind WHERE f.x = 1');
+-- a NULL in the list matches nothing; a value with no rows counts none
+SELECT lion_gv('SELECT count(*) FROM lion_gv_f f JOIN (VALUES (''paid''), (NULL), (''nope'')) v(k) ON v.k = f.kind WHERE f.x < 2');
+-- one row
+SELECT lion_gv('SELECT count(*) FROM lion_gv_f f JOIN (VALUES (''void'')) v(k) ON v.k = f.kind WHERE f.x = 3');
+-- other aggregates over the fact's rows, and a column of the list
+SELECT lion_gv('SELECT count(*), count(f.kind), count(v.k) FROM lion_gv_f f JOIN (VALUES (''paid''), (''void'')) v(k) ON v.k = f.kind WHERE f.x = 1');
+-- numbers: 1.0 and 1.00 are one value to numeric's "=", each listed row its own
+SELECT lion_gv('SELECT count(*) FROM lion_gv_f f JOIN (VALUES (1.0), (1.00), (2)) v(n) ON v.n = f.amt WHERE f.x = 2');
+-- an integer list against the numeric column: the list's side of the
+-- equality is a cast, not a column, and the join is left to the ordinary plan
+SELECT lion_gv('SELECT count(*) FROM lion_gv_f f JOIN (VALUES (3), (4)) v(n) ON v.n = f.amt WHERE f.x = 2');
+
+-- ---- GROUP BY the list's column ----
+-- distinct values: each group one listed key
+SELECT lion_gv_explain('SELECT v.k, count(*) FROM lion_gv_f f JOIN (VALUES (''paid''), (''void'')) v(k) ON v.k = f.kind WHERE f.x = 1 GROUP BY v.k');
+SELECT lion_gv('SELECT v.k, count(*) FROM lion_gv_f f JOIN (VALUES (''paid''), (''void'')) v(k) ON v.k = f.kind WHERE f.x = 1 GROUP BY v.k');
+-- a value listed twice: its group counts both rows
+SELECT lion_gv('SELECT v.k, count(*) FROM lion_gv_f f JOIN (VALUES (''paid''), (''void''), (''paid'')) v(k) ON v.k = f.kind WHERE f.x = 1 GROUP BY v.k');
+-- two values numeric's "=" calls equal are one group of both rows' counts
+-- (which of the two spellings a plan prints for the group is not fixed, so the
+-- key is left out), and a GROUP BY of the text is a group of each
+SELECT lion_gv('SELECT count(*) FROM lion_gv_f f JOIN (VALUES (1.0), (1.00), (2)) v(n) ON v.n = f.amt WHERE f.x = 2 GROUP BY v.n');
+SELECT lion_gv('SELECT v.n::text, count(*) FROM lion_gv_f f JOIN (VALUES (1.0), (1.00), (2)) v(n) ON v.n = f.amt WHERE f.x = 2 GROUP BY 1');
+-- a second column of the list, grouped by
+SELECT lion_gv('SELECT v.label, count(*) FROM lion_gv_f f JOIN (VALUES (''paid'', ''money''), (''void'', ''none''), (''done'', ''money'')) v(k, label) ON v.k = f.kind WHERE f.x = 1 GROUP BY v.label');
+
+-- ---- beside a dimension table: the list only filters the fact ----
+SELECT lion_gv('SELECT d.region, count(*) FROM lion_gv_f f JOIN lion_gv_d d ON d.pk = f.fk JOIN (VALUES (''paid''), (''void'')) v(k) ON v.k = f.kind WHERE f.x = 1 GROUP BY d.region');
+-- ... which a value listed twice does not: it repeats fact rows, and the
+-- dimension would then be two tables each joined to the fact
+SELECT lion_gv('SELECT d.region, count(*) FROM lion_gv_f f JOIN lion_gv_d d ON d.pk = f.fk JOIN (VALUES (''paid''), (''void''), (''paid'')) v(k) ON v.k = f.kind WHERE f.x = 1 GROUP BY d.region');
+
+-- ---- the list LEFT JOIN the fact: each listed row's count, or its one
+-- null-extended row ("The dimension LEFT JOIN the fact") ----
+SELECT lion_gv('SELECT count(*) FROM (VALUES (''paid''), (''nope'')) v(k) LEFT JOIN lion_gv_f f ON f.kind = v.k AND f.x = 1');
+SELECT lion_gv('SELECT v.k, count(*) FROM (VALUES (''paid''), (''nope''), (NULL)) v(k) LEFT JOIN lion_gv_f f ON f.kind = v.k AND f.x = 1 GROUP BY v.k');
+
+-- ---- IN and EXISTS over a list: a semi join before PostgreSQL 18 ----
+SELECT lion_gv('SELECT count(*) FROM lion_gv_f f WHERE f.kind IN (VALUES (''paid''), (''void''), (''paid'')) AND f.x = 1');
+SELECT lion_gv('SELECT count(*) FROM lion_gv_f f WHERE EXISTS (SELECT 1 FROM (VALUES (''paid''), (''void'')) v(k) WHERE v.k = f.kind) AND f.x = 1');
+
+-- ---- not taken ----
+-- a list that names the fact's own column is LATERAL
+SELECT lion_gv('SELECT count(*) FROM lion_gv_f f, LATERAL (VALUES (f.kind), (''paid'')) v(k) WHERE v.k = f.kind AND f.x = 1');
+
+DROP TABLE lion_gv_f, lion_gv_d;
+DROP FUNCTION lion_gv(text);
+DROP FUNCTION lion_gv_val(text);
+DROP FUNCTION lion_gv_explain(text);
+DROP FUNCTION lion_gv_h(int8, int8);

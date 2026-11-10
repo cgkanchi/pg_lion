@@ -86,8 +86,10 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "parser/parse_coerce.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
+#include "utils/sortsupport.h"
 
 #include "lion_count.h"
 #include "lion_fkjoin.h"
@@ -173,6 +175,164 @@ lion_fkjoin_rel_ok(PlannerInfo *root, RelOptInfo *rel)
 	if (IS_DUMMY_REL(rel))
 		return false;
 	return true;
+}
+
+/*
+ * Is rel a VALUES list the dimension's own table may be (DESIGN.md §27, "A
+ * VALUES list as the dimension"): `JOIN (VALUES ('a'), ('b')) v(k) ON v.k =
+ * f.fk`?  The node runs the dimension as a child plan and counts each of its
+ * rows' keys, whatever plan that is, so a Values Scan does as well as a scan
+ * of a table: the join's count is still the sum over its rows.  Never the
+ * fact, which has no index.  With no LATERAL reference - a VALUES list that
+ * names a column of another table is one - and not proved empty.  Its key's
+ * uniqueness, where a shape asks for it, is proved from its values
+ * (lion_values_column_unique()), not from an index.
+ */
+static bool
+lion_fkjoin_values_ok(PlannerInfo *root, RelOptInfo *rel)
+{
+	RangeTblEntry *rte;
+
+	if (rel == NULL || rel->reloptkind != RELOPT_BASEREL ||
+		rel->rtekind != RTE_VALUES)
+		return false;
+	if (rel->relid == 0 || rel->relid >= (Index) root->simple_rel_array_size)
+		return false;
+	rte = root->simple_rte_array[rel->relid];
+	if (rte == NULL || rte->rtekind != RTE_VALUES || rte->lateral)
+		return false;
+	if (!bms_is_empty(rel->lateral_relids) || rel->lateral_vars != NIL)
+		return false;
+	if (IS_DUMMY_REL(rel))
+		return false;
+	return true;
+}
+
+/* The dimension's own table: a table, or a VALUES list. */
+static bool
+lion_fkjoin_dim_ok(PlannerInfo *root, RelOptInfo *rel)
+{
+	return lion_fkjoin_rel_ok(root, rel) || lion_fkjoin_values_ok(root, rel);
+}
+
+/* qsort_arg() comparator of lion_values_column_unique()'s datums */
+static int
+lion_values_cmp(const void *a, const void *b, void *arg)
+{
+	return ApplySortComparator(*(const Datum *) a, false,
+							   *(const Datum *) b, false,
+							   (SortSupport) arg);
+}
+
+/*
+ * Is column attno of a VALUES list provably unique under the equality opno
+ * compares with, under that collation - no two of its rows hold values that
+ * operator calls equal?  Proved from the values themselves, which have to be
+ * constants by now (the planner has folded each row's expressions,
+ * preprocess_expression()): sorted by the ordering of a btree family that has
+ * opno as its equality, under the collation, no two neighbours compare equal.
+ * The btree contract makes "compares equal" the family's equality, the one
+ * the join tests.  A NULL never matches a strict operator, so NULLs do not
+ * count against it, as they do not for a unique index (lion_column_is_unique()).
+ * A list longer than lion_array_batch_size() is not looked at: the node would
+ * not take it as one key list anyway.
+ */
+bool
+lion_values_column_unique(PlannerInfo *root, RelOptInfo *rel,
+						  AttrNumber attno, Oid opno, Oid collation)
+{
+	RangeTblEntry *rte;
+	Oid			lefttype;
+	Oid			righttype;
+	Oid			coltype;
+	Oid			ltop = InvalidOid;
+	List	   *families;
+	SortSupportData ssup;
+	Datum	   *vals;
+	int			n = 0;
+	int			i;
+	ListCell   *lc;
+
+	if (rel == NULL || rel->rtekind != RTE_VALUES || attno <= 0 ||
+		rel->relid == 0 || rel->relid >= (Index) root->simple_rel_array_size)
+		return false;
+	rte = root->simple_rte_array[rel->relid];
+	if (rte == NULL || rte->rtekind != RTE_VALUES ||
+		attno > list_length(rte->coltypes))
+		return false;
+	if (list_length(rte->values_lists) > lion_array_batch_size())
+		return false;
+	coltype = list_nth_oid(rte->coltypes, attno - 1);
+
+	/* the "<" of the column's type in a btree family whose "=" is opno */
+	op_input_types(opno, &lefttype, &righttype);
+	families = get_mergejoin_opfamilies(opno);
+	foreach(lc, families)
+	{
+		Oid			fam = lfirst_oid(lc);
+
+		ltop = get_opfamily_member(fam, coltype, coltype,
+								   BTLessStrategyNumber);
+		if (!OidIsValid(ltop) && IsBinaryCoercible(coltype, righttype))
+			ltop = get_opfamily_member(fam, righttype, righttype,
+									   BTLessStrategyNumber);
+		if (!OidIsValid(ltop) && IsBinaryCoercible(coltype, lefttype))
+			ltop = get_opfamily_member(fam, lefttype, lefttype,
+									   BTLessStrategyNumber);
+		if (OidIsValid(ltop))
+			break;
+	}
+	if (!OidIsValid(ltop))
+		return false;
+
+	vals = (Datum *) palloc(sizeof(Datum) *
+							Max(list_length(rte->values_lists), 1));
+	foreach(lc, rte->values_lists)
+	{
+		List	   *row = (List *) lfirst(lc);
+		Node	   *e;
+
+		if (attno > list_length(row))
+			return false;
+		e = (Node *) list_nth(row, attno - 1);
+		while (e != NULL && IsA(e, RelabelType))
+			e = (Node *) ((RelabelType *) e)->arg;
+		if (e == NULL || !IsA(e, Const))
+			return false;
+		if (((Const *) e)->constisnull)
+			continue;
+		vals[n++] = ((Const *) e)->constvalue;
+	}
+
+	memset(&ssup, 0, sizeof(ssup));
+	ssup.ssup_cxt = CurrentMemoryContext;
+	ssup.ssup_collation = collation;
+	ssup.ssup_nulls_first = false;
+	PrepareSortSupportFromOrderingOp(ltop, &ssup);
+
+	if (n > 1)
+		qsort_arg(vals, n, sizeof(Datum), lion_values_cmp, &ssup);
+	for (i = 1; i < n; i++)
+	{
+		if (ApplySortComparator(vals[i - 1], false, vals[i], false,
+								&ssup) == 0)
+			return false;
+	}
+	pfree(vals);
+	return true;
+}
+
+/*
+ * The dimension-key proof of the join for any table it takes: a unique index
+ * of a table (lion_column_is_unique()), or a VALUES list's own values.
+ */
+bool
+lion_fkjoin_key_unique(PlannerInfo *root, RelOptInfo *rel, AttrNumber attno,
+					   Oid opno, Oid collation)
+{
+	if (rel != NULL && rel->rtekind == RTE_VALUES)
+		return lion_values_column_unique(root, rel, attno, opno, collation);
+	return lion_column_is_unique(rel, attno, opno, collation);
 }
 
 /*
@@ -385,7 +545,7 @@ lion_fkjoin_filter_of(PlannerInfo *root, RelOptInfo *joinrel,
 	int			i;
 	ListCell   *lc;
 
-	if (!lion_fkjoin_rel_ok(root, x) || lion_fkjoin_is_parent(root, x))
+	if (!lion_fkjoin_dim_ok(root, x) || lion_fkjoin_is_parent(root, x))
 		return false;
 	foreach(lc, root->join_info_list)
 	{
@@ -451,8 +611,8 @@ lion_fkjoin_filter_of(PlannerInfo *root, RelOptInfo *joinrel,
 		return false;
 
 	/* ---- its key unique, its path one the node may run ---- */
-	if (!lion_column_is_unique(x, argvar[di]->varattno, op->opno,
-							   op->inputcollid))
+	if (!lion_fkjoin_key_unique(root, x, argvar[di]->varattno, op->opno,
+								op->inputcollid))
 		return false;
 	if (!OidIsValid(get_array_type(exprType(argexpr[di]))))
 		return false;
@@ -503,7 +663,7 @@ lion_fkjoin_pick_dim(PlannerInfo *root, RelOptInfo *fact, Relids visible,
 		bool		factside = false;
 		ListCell   *lc;
 
-		if (!lion_fkjoin_rel_ok(root, cand))
+		if (!lion_fkjoin_dim_ok(root, cand))
 			continue;
 		if (key != NULL &&
 			!bms_is_member(i, forward ? key->min_righthand :
@@ -536,8 +696,8 @@ lion_fkjoin_pick_dim(PlannerInfo *root, RelOptInfo *fact, Relids visible,
 		}
 		if (lc != NULL || !factside || dv == NULL)
 			continue;
-		if (lion_column_is_unique(cand, dv->varattno, op->opno,
-								  op->inputcollid))
+		if (lion_fkjoin_key_unique(root, cand, dv->varattno, op->opno,
+								   op->inputcollid))
 			return i;
 		if (first == 0)
 			first = i;
@@ -836,8 +996,8 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 	 * most once (above), so a key unique in the table is unique in them.
 	 */
 	keyunique = bms_membership(visible) == BMS_SINGLETON &&
-		lion_column_is_unique(dim, argvar[di]->varattno, op->opno,
-							  op->inputcollid);
+		lion_fkjoin_key_unique(root, dim, argvar[di]->varattno, op->opno,
+							   op->inputcollid);
 	if (key == NULL || key->jointype == JOIN_LEFT)
 	{
 		/*
