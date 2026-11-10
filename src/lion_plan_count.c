@@ -422,6 +422,8 @@ typedef struct LionCountPathBuild
 	Oid			distcoll;
 	bool		distcounts;		/* its walk must count, not test (§26) */
 	double		distest;
+	bool		groupsexist;	/* nothing reads the groups' counts: each
+								 * is a test for a visible row (§10) */
 	Const	   *groupcoal;		/* GROUP BY coalesce(col, c): c (§10) */
 	Node	   *groupexpr;		/* ... and the whole expression */
 	bool		plainpositive;	/* a positive clause outside ORs that
@@ -582,6 +584,7 @@ lion_count_path_init(LionCountPathBuild *cx, PlannerInfo *root,
 	cx->distcoll = InvalidOid;
 	cx->distcounts = false;
 	cx->distest = 0;
+	cx->groupsexist = false;
 	cx->groupcoal = NULL;
 	cx->groupexpr = NULL;
 	cx->plainpositive = false;
@@ -3017,6 +3020,13 @@ lion_count_path_outputs(LionCountPathBuild *cx)
 	if (!haveagg &&
 		(cx->parse->hasAggs || (cx->ngroup == 0 && !cx->singlegroup)))
 		return false;
+
+	/*
+	 * ... and its groups are tests for a visible row, not counts (DESIGN.md
+	 * §10, "Groups nothing counts"): nothing in the target list or the
+	 * HAVING reads a count.
+	 */
+	cx->groupsexist = !haveagg;
 	return true;
 }
 
@@ -4452,6 +4462,21 @@ lion_count_path_topk(LionCountPathBuild *cx)
 }
 
 /*
+ * Are the build's groups tests for a visible row, not counts (DESIGN.md §10,
+ * "Groups nothing counts")?  A GROUP BY or a DISTINCT whose counts nothing
+ * reads, walked a group or a pair at a time - not the decoded walk, which
+ * counts every combination in one pass, nor the top k, which ranks by the
+ * counts.
+ */
+static bool
+lion_count_path_tests(const LionCountPathBuild *cx)
+{
+	return cx->groupsexist && !cx->decode && cx->topkn == 0 &&
+		cx->distvar == NULL && cx->sattnos == NIL && cx->wattnos == NIL &&
+		cx->nfilter == 0;
+}
+
+/*
  * What the path's custom_private carries (lion_plan_private.h), begun again
  * for each path made: the relation and its clauses, a partitioned table's
  * partitions, and what the query asks of them.
@@ -4487,7 +4512,8 @@ lion_count_path_fill(LionCountPathBuild *cx)
 		(cx->rangevar != NULL ? LION_FLAG_RANGE : 0) |
 		(cx->decode ? LION_FLAG_DECODE : 0) |
 		(cx->slicedecode ? LION_FLAG_SLICEDECODE : 0) |
-		(cx->residual != NIL ? LION_FLAG_RESID : 0);
+		(cx->residual != NIL ? LION_FLAG_RESID : 0) |
+		(lion_count_path_tests(cx) ? LION_FLAG_EXISTS : 0);
 	p->resid = cx->residual;
 
 	/*
@@ -5156,7 +5182,10 @@ lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
 								 (cx->distvar != NULL && cx->ngroup == 1) ?
 								 cx->distest : 0,
 								 cx->outrows,
-								 (cx->distvar == NULL) ? LION_DISTINCT_NONE :
+								 (cx->distvar == NULL) ?
+								 ((lion_count_path_tests(cx) &&
+								   cx->ngroup > 0) ?
+								  LION_DISTINCT_EXISTS : LION_DISTINCT_NONE) :
 								 cx->distcounts ? LION_DISTINCT_COUNT :
 								 LION_DISTINCT_EXISTS,
 								 (cx->rangevar == NULL) ?
@@ -5842,11 +5871,14 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	 * source that is positive whatever its value, and no range taken as one -
 	 * and partial counts core can add up.  A GROUP BY coalesce(col, c) is
 	 * one too: its two entries go up as partial rows of c, which the Agg
-	 * adds together.  Before the serial path is added, which may free it.
+	 * adds together.  Groups tested for a visible row are offered it by
+	 * their counted twin (lion_try_count_path_once()).  Before the serial
+	 * path is added, which may free it.
 	 */
 	if (cx->ngroup == 1 && !cx->sumall && !cx->singlegroup &&
 		cx->nfilter == 0 && cx->anti == NULL && cx->sattnos == NIL &&
 		cx->distvar == NULL && cx->rangevar == NULL && !cx->hasrangesrc &&
+		!lion_count_path_tests(cx) &&
 		cx->plainpositive && rangeprice.batched && cx->topkn == 0 &&
 		cx->groupdeps == NIL && cx->ncompl == 0 && cx->residual == NIL &&
 		first->driveidx[0] != NULL &&
@@ -6734,6 +6766,22 @@ lion_try_count_path_once(LionCountPathBuild *cx)
 		return false;
 	cpath = lion_count_path_make(cx);
 	lion_count_path_add(cx, cpath);
+
+	/*
+	 * Groups nothing counts are tested for a visible row (DESIGN.md §10,
+	 * "Groups nothing counts") - and counted too, which may collect the WHERE
+	 * and count the groups of a walk together, or divide them among the
+	 * participants of a Gather: both are priced, and add_path() keeps the
+	 * cheaper.
+	 */
+	if (lion_count_path_tests(cx))
+	{
+		cx->groupsexist = false;
+		lion_count_path_fill(cx);
+		cpath = lion_count_path_make(cx);
+		lion_count_path_add(cx, cpath);
+		cx->groupsexist = true;
+	}
 
 	/*
 	 * The aggregates of sliced columns of a GROUP BY of one column are counted

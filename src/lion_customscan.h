@@ -1269,6 +1269,11 @@ typedef struct LionVColScope
 										 * decoded a batch of groups at a
 										 * time (DESIGN.md §52, "The decode
 										 * route") */
+#define LION_FLAG_EXISTS		0x100	/* nothing reads the groups'
+										 * counts: each group, pair or
+										 * folded group is a test for one
+										 * visible row (DESIGN.md §10,
+										 * "Groups nothing counts") */
 
 /*
  * What the planner decided, in a form the executor can be handed through
@@ -3399,6 +3404,13 @@ typedef struct LionCountScanState
 	int64		groupsbatched;
 
 	/*
+	 * The tests for a visible row made in place of the groups' counts when
+	 * nothing reads those (LION_FLAG_EXISTS; DESIGN.md §10, "Groups nothing
+	 * counts"), which EXPLAIN ANALYZE reports.
+	 */
+	int64		grouptests;
+
+	/*
 	 * The top k of a GROUP BY ordered by its count (DESIGN.md §36), or NULL
 	 * when the plan has no k (lion_st_topk()).
 	 */
@@ -4791,6 +4803,13 @@ extern void lion_try_distinct_agg_path(PlannerInfo *root,
 									   RelOptInfo *input_rel,
 									   RelOptInfo *output_rel,
 									   GroupPathExtraData *extra);
+
+/* lion_window.c */
+extern void lion_try_window_count_path(PlannerInfo *root,
+									   RelOptInfo *input_rel,
+									   RelOptInfo *window_rel);
+extern const CustomPathMethods lion_window_count_path_methods;
+extern const CustomScanMethods lion_window_count_scan_methods;
 
 /* lion_plan_hooks.c */
 extern Plan *lion_plan_join_agg_path(PlannerInfo *root, RelOptInfo *rel,
