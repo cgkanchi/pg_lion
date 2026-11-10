@@ -6,9 +6,10 @@
 -- price is written in, so that the model can be calibrated on a workload as
 -- core's is with random_page_cost.  The defaults are the values the prices
 -- had as constants, so every other test plans exactly as before.  This one
--- lists them, shows that four of them - an index scan's, a count's, the
--- FK-side join's and a collected range's - are read by the planner, and that
--- a SET LOCAL of one ends with its transaction.
+-- lists them, shows that five of them - an index scan's, a count's of a
+-- CHAIN entry and of an INLINE one, the FK-side join's and a collected
+-- range's - are read by the planner, and that a SET LOCAL of one ends with
+-- its transaction.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -120,15 +121,28 @@ SELECT lcg_plan('SELECT sum(id) FROM lcg WHERE g = 5', 'pg_lion.plain_fetch_row_
 RESET pg_lion.enable_count_pushdown;
 
 -- A count's (DESIGN.md §10, "The units"): each count a GROUP BY makes, one
--- per entry of its column.  At its default the count pushdown answers the
--- hundred groups; at a hundred times that, the hash aggregate does.
+-- per entry of its column - a's ten entries of 5,000 rows each, CHAIN.  At
+-- its default the count pushdown answers the ten groups; at ten thousand
+-- times that, the hash aggregate does.
+SELECT lcg_cost(q, s, '0', sw) < lcg_cost(q, s, NULL, sw) AS lowered_cheaper,
+	   lcg_cost(q, s, '100', sw) > lcg_cost(q, s, NULL, sw) AS raised_dearer
+  FROM (VALUES ('SELECT a, count(*) FROM lcg GROUP BY a',
+				'pg_lion.entry_count_cost',
+				'{enable_seqscan, off, enable_bitmapscan, off, pg_lion.enable_plain_scan, off}'::text[])) v(q, s, sw);
+SELECT lcg_plan('SELECT a, count(*) FROM lcg GROUP BY a', 'pg_lion.entry_count_cost', NULL);
+SELECT lcg_plan('SELECT a, count(*) FROM lcg GROUP BY a', 'pg_lion.entry_count_cost', '500000');
+
+-- ... and of an entry small enough to be INLINE, which the walk counts one
+-- entry at a time (DESIGN.md §28, "A walk that returns rows"): g's hundred
+-- entries of 500 rows.  At its default the count pushdown answers them; at
+-- 250 times that, the hash aggregate does.
 SELECT lcg_cost(q, s, '0', sw) < lcg_cost(q, s, NULL, sw) AS lowered_cheaper,
 	   lcg_cost(q, s, '100', sw) > lcg_cost(q, s, NULL, sw) AS raised_dearer
   FROM (VALUES ('SELECT g, count(*) FROM lcg GROUP BY g',
-				'pg_lion.entry_count_cost',
+				'pg_lion.inline_entry_count_cost',
 				'{enable_seqscan, off, enable_bitmapscan, off, pg_lion.enable_plain_scan, off}'::text[])) v(q, s, sw);
-SELECT lcg_plan('SELECT g, count(*) FROM lcg GROUP BY g', 'pg_lion.entry_count_cost', NULL);
-SELECT lcg_plan('SELECT g, count(*) FROM lcg GROUP BY g', 'pg_lion.entry_count_cost', '5000');
+SELECT lcg_plan('SELECT g, count(*) FROM lcg GROUP BY g', 'pg_lion.inline_entry_count_cost', NULL);
+SELECT lcg_plan('SELECT g, count(*) FROM lcg GROUP BY g', 'pg_lion.inline_entry_count_cost', '5000');
 
 -- The FK-side join's (DESIGN.md §27): each count, one per dimension row.  At
 -- its default the node counts the region's hundred rows' keys; at a hundred
@@ -153,12 +167,12 @@ SELECT lcg_cost(q, s, '0', sw) < lcg_cost(q, s, NULL, sw) AS lowered_cheaper,
 -- ---------- 3. a SET LOCAL ends with its transaction ----------
 SELECT lcg_cost('SELECT g, count(*) FROM lcg GROUP BY g') AS before \gset
 BEGIN;
-SET LOCAL pg_lion.entry_count_cost = 5000;
-SHOW pg_lion.entry_count_cost;
+SET LOCAL pg_lion.inline_entry_count_cost = 5000;
+SHOW pg_lion.inline_entry_count_cost;
 EXPLAIN (COSTS OFF) SELECT g, count(*) FROM lcg GROUP BY g;
 SELECT lcg_cost('SELECT g, count(*) FROM lcg GROUP BY g') > :before AS dearer;
 ROLLBACK;
-SHOW pg_lion.entry_count_cost;
+SHOW pg_lion.inline_entry_count_cost;
 EXPLAIN (COSTS OFF) SELECT g, count(*) FROM lcg GROUP BY g;
 SELECT lcg_cost('SELECT g, count(*) FROM lcg GROUP BY g') = :before AS same_cost;
 

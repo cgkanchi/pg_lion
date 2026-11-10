@@ -278,6 +278,16 @@ extern int	lion_fkjoin_recognize_probe(PlannerInfo *root, RelOptInfo *joinrel,
 extern bool lion_column_is_unique(RelOptInfo *rel, AttrNumber attno, Oid opno,
 								  Oid collation);
 
+/*
+ * ... of a VALUES list, from its values; and either proof, for whichever the
+ * join's dimension table is (DESIGN.md §27, "A VALUES list as the dimension")
+ */
+extern bool lion_values_column_unique(PlannerInfo *root, RelOptInfo *rel,
+									  AttrNumber attno, Oid opno,
+									  Oid collation);
+extern bool lion_fkjoin_key_unique(PlannerInfo *root, RelOptInfo *rel,
+								   AttrNumber attno, Oid opno, Oid collation);
+
 /* ... and the unique btree that proves it, or NULL */
 extern IndexOptInfo *lion_column_unique_index(RelOptInfo *rel,
 											  AttrNumber attno, Oid opno,

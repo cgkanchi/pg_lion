@@ -93,10 +93,14 @@ SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'y3'::tsquery AND doc
 -- `IS NOT NULL` beside a query: the column's NULL entry taken away
 SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv IS NOT NULL AND tags @> ARRAY['u5'] ORDER BY id LIMIT 20$$);
 
--- 2. Built: a phrase, a weight, a NOT - none of them a tree of whole sets
+-- `a & !b`: a's rows less b's, a tree of whole sets too
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 & !y3'::tsquery ORDER BY id LIMIT 20$$);
+
+-- 2. Built: a phrase, a weight, a NOT of a weight - none of them a tree of
+--    whole sets
 SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 <-> y3'::tsquery ORDER BY id LIMIT 20$$);
 SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'w3:A & x5'::tsquery ORDER BY id LIMIT 20$$);
-SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 & !y3'::tsquery ORDER BY id LIMIT 20$$);
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 & !y3:B'::tsquery ORDER BY id LIMIT 20$$);
 
 -- 3. A query known only at run time: a generic plan's parameter, lazy or
 --    built by its value

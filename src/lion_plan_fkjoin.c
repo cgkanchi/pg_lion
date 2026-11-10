@@ -391,8 +391,9 @@ lion_fkjoin_groups_per_row(PlannerInfo *root, const LionFkJoin *fj,
 		{
 			if (fj->jointype != JOIN_INNER &&
 				!(fj->jointype == JOIN_SEMI &&
-				  lion_column_is_unique(fj->dimrel, fj->pkvar->varattno,
-										fj->opno, fj->collation)))
+				  lion_fkjoin_key_unique(root, fj->dimrel,
+										 fj->pkvar->varattno,
+										 fj->opno, fj->collation)))
 				continue;
 			if (fj->jointype == JOIN_INNER && !fj->keyunique)
 				continue;
