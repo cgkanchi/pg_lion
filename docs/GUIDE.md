@@ -79,7 +79,8 @@ under a `Finalize HashAggregate`; DESIGN.md §34). On 5M rows it took 77 ms for 
 and 179 ms for 100,000, where a HashAggregate over the table took 900 ms and 1.9 s. A range in the
 `WHERE` (`... WHERE amount < 500 GROUP BY a, b, c`) is collected with the rest of the filter, into
 a temporary file when it is larger than the memory: a quarter of 5M rows grouped by three columns
-took 153 ms against 361.
+took 153 ms against 361. A partitioned table is decoded a partition at a time, each from its own
+indexes, when every partition has a Lion index on every grouping column.
 
 `GROUP BY g ORDER BY count(*) DESC LIMIT k` counts only the groups that can be among the first `k`
 (`Top K` in EXPLAIN; DESIGN.md §36): each key's entry records how many rows it holds, which bounds
@@ -124,7 +125,9 @@ node's counts"):
   country, device`: the node counts the `GROUP BY` with `event_type` added, and PostgreSQL's
   aggregate counts each group's distinct values over those combinations (DESIGN.md §10,
   "DISTINCT aggregates over a finer grouping"). On 5M rows, two grouping columns of 20 and 2
-  values and a distinct column of 200 took 92 ms where the ordinary plan took 3.3 s.
+  values and a distinct column of 200 took 92 ms where the ordinary plan took 3.3 s. Without a
+  `GROUP BY` the same is done where the single `count(DISTINCT col)` above does not apply: two
+  `DISTINCT` aggregates, or a partitioned table.
 
 Clauses that exclude rows are counted by subtracting what they reject: `col <> v`, `col IS NOT
 NULL`, `col IS DISTINCT FROM v` (which, unlike `<>`, keeps the rows where `col` is NULL), and `NOT

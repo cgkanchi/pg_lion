@@ -768,8 +768,11 @@ SELECT * FROM lion_explain_norm('SELECT g, count(DISTINCT k) FROM lion_dtm WHERE
 
 RESET enable_seqscan;
 DROP TABLE lion_dtm;
--- ---- 7. declined ---------------------------------------------------------
--- a column with no lion index, and a column that is not the only DISTINCT
+-- ---- 7. declined by the walk ---------------------------------------------
+-- a column with no lion index; a column that is not the only DISTINCT, which
+-- is counted as GROUP BY k, t instead (DESIGN.md §10, "DISTINCT aggregates
+-- over a finer grouping"), as are the expressions, FILTER and sum(DISTINCT)
+-- below, over GROUP BY k or k, a
 SELECT lion_dc('SELECT count(DISTINCT u) FROM lion_dt WHERE a = 3');
          lion_dc         
 -------------------------
@@ -777,14 +780,13 @@ SELECT lion_dc('SELECT count(DISTINCT u) FROM lion_dt WHERE a = 3');
 (1 row)
 
 SELECT lion_dc('SELECT count(DISTINCT k), count(DISTINCT t) FROM lion_dt');
-         lion_dc         
--------------------------
- not pushed down, 1 rows
+       lion_dc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- DISTINCT on the grouping column, and two grouping columns, which are
--- counted as GROUP BY g, a, k instead (DESIGN.md §10, "DISTINCT aggregates
--- over a finer grouping")
+-- counted as GROUP BY g, a, k instead
 SELECT lion_dc('SELECT k, count(DISTINCT k) FROM lion_dt GROUP BY k');
          lion_dc          
 --------------------------
@@ -799,27 +801,27 @@ SELECT lion_dc('SELECT g, a, count(DISTINCT k) FROM lion_dt GROUP BY g, a');
 
 -- not a plain column, a FILTER, another aggregate, a count(col) we cannot answer
 SELECT lion_dc('SELECT count(DISTINCT k + 1) FROM lion_dt');
-         lion_dc         
--------------------------
- not pushed down, 1 rows
+       lion_dc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_dc('SELECT count(DISTINCT (k, a)) FROM lion_dt');
-         lion_dc         
--------------------------
- not pushed down, 1 rows
+       lion_dc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_dc('SELECT count(DISTINCT k) FILTER (WHERE a = 1) FROM lion_dt');
-         lion_dc         
--------------------------
- not pushed down, 1 rows
+       lion_dc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_dc('SELECT sum(DISTINCT k) FROM lion_dt');
-         lion_dc         
--------------------------
- not pushed down, 1 rows
+       lion_dc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_dc('SELECT count(DISTINCT k), count(g) FROM lion_dt');
@@ -842,11 +844,12 @@ SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a % 2 = 1');
  not pushed down, 1 rows
 (1 row)
 
--- a collation other than the index's: DISTINCT would compare differently
+-- a collation other than the index's: DISTINCT would compare differently,
+-- and the finer grouping groups by t under its own, the index's
 SELECT lion_dc('SELECT count(DISTINCT t COLLATE "C") FROM lion_dt WHERE a = 3');
-         lion_dc         
--------------------------
- not pushed down, 1 rows
+       lion_dc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 CREATE INDEX lion_dt_tc ON lion_dt USING lion (t COLLATE "C");
@@ -926,7 +929,7 @@ SELECT lion_dc('SELECT count(DISTINCT b) FROM lion_dta WHERE tags @> ''{3}''');
 
 DROP TABLE lion_dta;
 -- a partitioned table: distinct counts do not add up across partitions, but
--- with a GROUP BY the counts of GROUP BY a, k do, and are counted so
+-- the counts of GROUP BY k and GROUP BY a, k do, and are counted so
 CREATE TABLE lion_dtp (id int, k int, a int) PARTITION BY RANGE (id);
 CREATE TABLE lion_dtp1 PARTITION OF lion_dtp FOR VALUES FROM (0) TO (1000);
 CREATE TABLE lion_dtp2 PARTITION OF lion_dtp FOR VALUES FROM (1000) TO (2000);
@@ -935,9 +938,9 @@ CREATE INDEX lion_dtp_k ON lion_dtp USING lion (k);
 CREATE INDEX lion_dtp_a ON lion_dtp USING lion (a);
 VACUUM ANALYZE lion_dtp;
 SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dtp');
-         lion_dc         
--------------------------
- not pushed down, 1 rows
+       lion_dc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_dc('SELECT a, count(DISTINCT k) FROM lion_dtp GROUP BY a');

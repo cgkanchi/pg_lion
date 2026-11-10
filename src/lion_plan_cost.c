@@ -6147,13 +6147,11 @@ lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
  * The rows are partial counts, one per combination with rows, which the
  * Finalize Agg above adds up; all of them come out once the pass has run.
  */
-void
-lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
-					  List *whereclauses, List *wherekinds, List *ors,
-					  int ncol, const double *groupest, double numgroups,
-					  double outrows)
+static Cost
+lion_cost_decode_rel(PlannerInfo *root, LionCountTarget *t,
+					 List *whereclauses, List *wherekinds, List *ors,
+					 int ncol, const double *groupest)
 {
-	LionCountTarget *t = (LionCountTarget *) linitial(targets);
 	RelOptInfo *rel = t->rel;
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		nkeys = Max(ceil(heap_pages / LION_BLOCKS_PER_CONTAINER), 1.0);
@@ -6172,7 +6170,6 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	List	   *tors;
 	int			c;
 
-	Assert(list_length(targets) == 1 && ncol >= 2);
 	lion_target_lists(t, whereclauses, wherekinds, ors, &tidx, &tcol,
 					  &tclauses, &tkinds, &tors, NULL);
 
@@ -6232,6 +6229,40 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	else
 		run += whererows * (LION_DECODE_HASH_ROW_COST +
 							(ncol - 1) * LION_DECODE_ROW_COL_COST);
+	return run;
+}
+
+/*
+ * ... over one table, or over each partition of one in its turn (§16, "The
+ * decoded walk over partitions"): the sum of each partition's walk as one
+ * table's, every column's values the partition's own estimate of them.
+ */
+void
+lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
+					  List *whereclauses, List *wherekinds, List *ors,
+					  int ncol, const double *groupest, double numgroups,
+					  double outrows)
+{
+	Cost		run = 0;
+	ListCell   *lc;
+
+	Assert(targets != NIL && ncol >= 2);
+	foreach(lc, targets)
+	{
+		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+		double		tgroupest[LION_MAX_GROUPCOLS];
+		int			c;
+
+		for (c = 0; c < ncol; c++)
+			tgroupest[c] = (list_length(targets) > 1 &&
+							t->drivevar[c] != NULL) ?
+				estimate_num_groups(root,
+									list_make1(lion_vcol_unvar((Node *) t->drivevar[c])),
+									Max(t->rel->rows, 1.0), NULL, NULL) :
+				groupest[c];
+		run += lion_cost_decode_rel(root, t, whereclauses, wherekinds, ors,
+									ncol, tgroupest);
+	}
 
 	cpath->path.rows = outrows;
 #if PG_VERSION_NUM >= 180000

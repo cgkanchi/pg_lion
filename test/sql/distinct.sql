@@ -333,13 +333,15 @@ SELECT * FROM lion_explain_norm('SELECT g, count(DISTINCT k) FROM lion_dtm WHERE
 RESET enable_seqscan;
 DROP TABLE lion_dtm;
 
--- ---- 7. declined ---------------------------------------------------------
--- a column with no lion index, and a column that is not the only DISTINCT
+-- ---- 7. declined by the walk ---------------------------------------------
+-- a column with no lion index; a column that is not the only DISTINCT, which
+-- is counted as GROUP BY k, t instead (DESIGN.md §10, "DISTINCT aggregates
+-- over a finer grouping"), as are the expressions, FILTER and sum(DISTINCT)
+-- below, over GROUP BY k or k, a
 SELECT lion_dc('SELECT count(DISTINCT u) FROM lion_dt WHERE a = 3');
 SELECT lion_dc('SELECT count(DISTINCT k), count(DISTINCT t) FROM lion_dt');
 -- DISTINCT on the grouping column, and two grouping columns, which are
--- counted as GROUP BY g, a, k instead (DESIGN.md §10, "DISTINCT aggregates
--- over a finer grouping")
+-- counted as GROUP BY g, a, k instead
 SELECT lion_dc('SELECT k, count(DISTINCT k) FROM lion_dt GROUP BY k');
 SELECT lion_dc('SELECT g, a, count(DISTINCT k) FROM lion_dt GROUP BY g, a');
 -- not a plain column, a FILTER, another aggregate, a count(col) we cannot answer
@@ -352,7 +354,8 @@ SELECT lion_dc('SELECT count(DISTINCT k), count(g) FROM lion_dt');
 SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a > 3');
 -- a WHERE clause the posting sets cannot answer
 SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dt WHERE a % 2 = 1');
--- a collation other than the index's: DISTINCT would compare differently
+-- a collation other than the index's: DISTINCT would compare differently,
+-- and the finer grouping groups by t under its own, the index's
 SELECT lion_dc('SELECT count(DISTINCT t COLLATE "C") FROM lion_dt WHERE a = 3');
 CREATE INDEX lion_dt_tc ON lion_dt USING lion (t COLLATE "C");
 DROP INDEX lion_dt_t;
@@ -399,7 +402,7 @@ SELECT lion_dc('SELECT count(DISTINCT b) FROM lion_dta WHERE tags @> ''{3}''');
 DROP TABLE lion_dta;
 
 -- a partitioned table: distinct counts do not add up across partitions, but
--- with a GROUP BY the counts of GROUP BY a, k do, and are counted so
+-- the counts of GROUP BY k and GROUP BY a, k do, and are counted so
 CREATE TABLE lion_dtp (id int, k int, a int) PARTITION BY RANGE (id);
 CREATE TABLE lion_dtp1 PARTITION OF lion_dtp FOR VALUES FROM (0) TO (1000);
 CREATE TABLE lion_dtp2 PARTITION OF lion_dtp FOR VALUES FROM (1000) TO (2000);

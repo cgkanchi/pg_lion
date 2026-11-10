@@ -695,11 +695,15 @@ lion_gsets_distinct_walker(Node *node, List **aggs)
  * of `GROUP BY a, b, c` within each group of a, b with c not NULL, so the
  * GROUP BY with the aggregates' columns added is counted by the node, and
  * core's Agg forms the query's groups over its rows, the DISTINCT aggregates
- * standing as they are.  Its input is sorted by the query's group pathkeys,
- * which core extends with a DISTINCT aggregate's own keys when it marks the
- * aggregate presorted (adjust_group_pathkeys_for_groupagg()): the Agg then
- * relies on that order, as it would over the table.  Every failed check
- * simply returns.
+ * standing as they are.  No GROUP BY at all is the one group of every row:
+ * `count(DISTINCT c)` alone is `GROUP BY c` counted and core's plain Agg
+ * over its rows - for a partitioned table, whose distinct counts the node
+ * does not add up (lion_count_path_distinct()), the way to answer one.  Its
+ * input is sorted by the query's group pathkeys, which core extends with a
+ * DISTINCT aggregate's own keys when it marks the aggregate presorted
+ * (adjust_group_pathkeys_for_groupagg()) - with no GROUP BY, they are that
+ * aggregate's alone: the Agg then relies on that order, as it would over
+ * the table.  Every failed check simply returns.
  */
 void
 lion_try_distinct_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
@@ -719,9 +723,9 @@ lion_try_distinct_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
 	ListCell   *lc;
 
 	if (extra == NULL || parse->groupingSets != NIL ||
-		root->processed_groupClause == NIL ||
 		parse->hasTargetSRFs || parse->hasDistinctOn ||
-		parse->distinctClause != NIL || root->group_pathkeys == NIL ||
+		parse->distinctClause != NIL ||
+		(root->processed_groupClause != NIL && root->group_pathkeys == NIL) ||
 		!grouping_is_sortable(root->processed_groupClause))
 		return;
 	if (input_rel->reloptkind != RELOPT_BASEREL)
@@ -785,11 +789,15 @@ lion_try_distinct_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
 		if (!pathkeys_contained_in(root->group_pathkeys, sub->pathkeys))
 			sub = (Path *) create_sort_path(root, inner, sub,
 											root->group_pathkeys, -1.0);
-		apath = create_agg_path(root, output_rel, sub, aggtarget, AGG_SORTED,
+		apath = create_agg_path(root, output_rel, sub, aggtarget,
+								(root->processed_groupClause != NIL) ?
+								AGG_SORTED : AGG_PLAIN,
 								AGGSPLIT_SIMPLE, root->processed_groupClause,
 								having, &aggcosts,
+								(groupexprs != NIL) ?
 								estimate_num_groups(root, groupexprs,
-													sub->rows, NULL, NULL));
+													sub->rows, NULL, NULL) :
+								1.0);
 		add_path(output_rel, (Path *) lion_join_agg_wrap(root, output_rel,
 														 (Path *) apath,
 														 checkaggs));

@@ -1872,6 +1872,14 @@ typedef struct LionPartState
 	Oid		   *sliceidxoid;
 	AttrNumber *sliceidxcol;
 	Relation   *sliceidx;
+
+	/*
+	 * The decoded walk (DESIGN.md §16, "The decoded walk over partitions"):
+	 * this partition's index of each of its columns, open from Begin to End
+	 * as its other indexes are.
+	 */
+	Oid			groupnidxoid[LION_MAX_GROUPCOLS];
+	Relation	groupnidx[LION_MAX_GROUPCOLS];
 } LionPartState;
 
 /*
@@ -2698,6 +2706,12 @@ typedef struct LionCountPrivPart
 								 * sliced column here ... */
 	AttrNumber *sliceidxcol;	/* ... and its key column there; NULL
 								 * without sliced columns */
+	Oid			groupnidxoid[LION_MAX_GROUPCOLS];	/* GROUPN: the index of
+													 * each column of the
+													 * decoded walk here
+													 * (DESIGN.md §16, "The
+													 * decoded walk over
+													 * partitions") */
 } LionCountPrivPart;
 
 /* The FK-side join (DESIGN.md §27): JOIN */

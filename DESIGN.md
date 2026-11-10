@@ -3673,7 +3673,16 @@ grouping column and one distinct column keeps its plan, and a second form of the
 only compete with it. Where §26 declines - two or more grouping columns, two distinct columns, a
 DISTINCT aggregate other than `count`, a partitioned table (whose (g, k) groups the Finalize Agg
 under the node merges, so the distinct counts above it are exact) - or loses to core on price,
-the finer grouping is offered. The cost is core's sort and Agg over the node's path, its
+the finer grouping is offered.
+
+With no GROUP BY (2026-11-10) the query's one group is every row's, and the finer grouping is the
+DISTINCT aggregates' columns alone: `count(DISTINCT c) ... WHERE ...` is `GROUP BY c` counted and
+core's plain Agg over its rows (AGG_PLAIN, one group), sorted by the DISTINCT aggregate's own keys
+where core marked it presorted. §26's walk answers a single count(DISTINCT) of one table and
+keeps it; what is new is the partitioned table, whose distinct counts §26 does not add up, and two
+DISTINCT aggregates of one table, `count(DISTINCT a), count(DISTINCT b)`, which is `GROUP BY a, b`
+counted. Over 2M rows in four partitions, `count(DISTINCT country) ... WHERE status = 'paid'` took
+27 ms against core's 514. The cost is core's sort and Agg over the node's path, its
 aggregate costs computed as for grouping sets, above, and `add_path()` chooses.
 
 A column the finer grouping adds is grouped by its type's default equality, so one value of each
@@ -6295,6 +6304,46 @@ expression on the key against one off it, a volatile function, a subplan, a resi
 more than half the rows to fetch of every partition and of the one sub-partition left to test the
 clause, and the switch; a dirty heap before and after VACUUM; and a LATERAL value in the clause,
 which rescans the node partition by partition.
+
+### The decoded walk over partitions (2026-11-10)
+
+A `GROUP BY` of three or more columns, or of two with a `WHERE` whose pairs (§20) cost more than
+one pass over the rows, is §34's decoded walk over one table. Over a partitioned table it was
+refused, so `kind, country, count(*) ... WHERE status = 'paid'` got either §20's pairs, priced at
+every pair of every partition, or core's plan. The walk's rows are partial counts already, under
+a Finalize Agg, as a partitioned table's are, so nothing above the node changes: each partition is
+decoded in its turn, from its own index of each column, and its passes' rows go up as that
+partition's partial rows.
+
+- **Plan.** The GROUPN member holds the walk's columns as the parent numbers them and one index
+  per column per relation counted: the table's, or each partition's in PARTS order
+  (`lion_priv_decode_groupn()`). A partitioned plan's own are InvalidOid, as its other indexes
+  are, and each partition's first is the one it walks (`groupidxoid`) with no inner index of a
+  pair, which `lion_count_priv_check()` holds it to. Every partition has a scalar lion index on
+  every column, as `lion_collect_targets()` asks of any driving column; one without leaves the
+  query to core. A count by cells (§10), whose driver is a one-column decoded walk, still counts
+  one table: its dimensions' indexes would be per partition too.
+- **Run.** The partitions' indexes are opened with their other relations (`lion_open_parts()`) and
+  made the walk's for the partition's turn (`lion_open_relation()`), which closes only its own. A
+  turn's walk starts afresh for each run - the WHERE's, then each filtered count's (§10) - and reads
+  the run's WHERE as one table's does (`lion_decode_where()`): a clause the partition's bounds
+  imply is left out, and a partition where a clause has no entry counts nothing. The chunk sizes
+  are the first partition's (`lion_decode_caps()`), which every partition's passes then take.
+- **Price.** Each partition's walk as one table's, every column's values that partition's
+  estimate (`lion_cost_decode_path()`), and the rows each partition's combinations with rows, as
+  the pairs' partial rows are estimated.
+
+A residual clause (§16, "Residual clauses over a partitioned table") is never beside the walk,
+which tests no row, so a query that needs one keeps the pairs or core's plan.
+
+On 2M rows in four monthly partitions: `status, kind, country, count(*)` (5,000 groups) took 36
+ms against core's 515, `kind, country, count(*) ... WHERE status = 'paid'` 21 ms against 210, and
+`kind, count(DISTINCT country) ... WHERE status = 'paid' GROUP BY kind`, the finer grouping of §10
+over it, 24 ms against 444. `test/sql/group_decode.sql` runs the walk over a table partitioned by
+LIST whose last partition numbers its columns differently and has an index per column: three
+columns, a `WHERE`, two columns, a clause the bounds imply, one that prunes, one with no entry in
+some partitions, HAVING, a filtered count, count(DISTINCT) with and without a GROUP BY, and a
+rescan with a new value, each compared with a sequential scan.
 
 ### A parent pruned to one leaf (2026-10-26)
 
