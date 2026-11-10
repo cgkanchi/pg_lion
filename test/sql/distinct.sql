@@ -340,6 +340,10 @@ DROP TABLE lion_dtm;
 -- below, over GROUP BY k or k, a
 SELECT lion_dc('SELECT count(DISTINCT u) FROM lion_dt WHERE a = 3');
 SELECT lion_dc('SELECT count(DISTINCT k), count(DISTINCT t) FROM lion_dt');
+-- a GROUP BY core finds constant has no grouping columns left, but is still
+-- grouped: no rows in, no row out
+SELECT lion_dc('SELECT count(DISTINCT k), count(DISTINCT t) FROM lion_dt WHERE a = 77 GROUP BY ''x''::text');
+SELECT lion_dc('SELECT count(DISTINCT k), count(DISTINCT t) FROM lion_dt WHERE a = 3 GROUP BY ''x''::text');
 -- DISTINCT on the grouping column, and two grouping columns, which are
 -- counted as GROUP BY g, a, k instead
 SELECT lion_dc('SELECT k, count(DISTINCT k) FROM lion_dt GROUP BY k');
@@ -412,6 +416,7 @@ CREATE INDEX lion_dtp_a ON lion_dtp USING lion (a);
 VACUUM ANALYZE lion_dtp;
 SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dtp');
 SELECT lion_dc('SELECT a, count(DISTINCT k) FROM lion_dtp GROUP BY a');
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dtp WHERE a = 77 GROUP BY ''x''::text');
 -- one partition by itself is a plain table
 SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dtp1 WHERE a = 1');
 DROP TABLE lion_dtp;

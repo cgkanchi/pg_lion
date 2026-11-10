@@ -350,13 +350,20 @@ SELECT lgd_check('SELECT b, c, d, count(*) AS n FROM lgdp WHERE a = 2 GROUP BY b
 SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgdp WHERE d = 40 GROUP BY a, b, c');
 -- HAVING is the Finalize Agg's, over every partition's partial counts
 SELECT lgd_check('SELECT b, c, d, count(*) AS n FROM lgdp GROUP BY b, c, d HAVING count(*) > 30');
--- filtered counts: a run per filter in each partition's turn
-SELECT lgd_check('SELECT a, b, c, count(*) AS n, count(*) FILTER (WHERE d < 40) AS nd FROM lgdp GROUP BY a, b, c');
+-- filtered counts: a run per filter in each partition's turn, after the
+-- WHERE's
+SELECT lgd_check('SELECT a, b, c, count(*) AS n, count(*) FILTER (WHERE d IN (10, 40)) AS nd, count(*) FILTER (WHERE d = 7) AS n7 FROM lgdp GROUP BY a, b, c');
+SELECT lgd_check('SELECT a, b, c, count(*) AS n, count(*) FILTER (WHERE d = 40) AS nd FROM lgdp WHERE d < 60 GROUP BY a, b, c');
 -- count(DISTINCT) over the finer grouping, with a GROUP BY and without
 SELECT lgd_check('SELECT b, count(DISTINCT c) AS n FROM lgdp WHERE d < 60 GROUP BY b');
 SELECT lgd_check('SELECT count(DISTINCT c) AS n, count(*) AS m FROM lgdp WHERE d < 60');
 SELECT lgd_check('SELECT count(DISTINCT c) AS n, count(DISTINCT b) AS m FROM lgdp');
--- rescanned with a new value of its WHERE each time
+-- rescanned with a new value of its WHERE each time, each value with no
+-- entry in some partitions
+SELECT lgd_check('SELECT v.x, s.* FROM (VALUES (1), (40), (90)) v(x), LATERAL (SELECT a, b, c, count(*) AS n FROM lgdp WHERE d = v.x GROUP BY a, b, c) s');
+-- not decoded, as over one table: a range in a FILTER, and a range on an
+-- outer row's value
+SELECT lgd_check('SELECT a, b, c, count(*) AS n, count(*) FILTER (WHERE d < 40) AS nd FROM lgdp GROUP BY a, b, c');
 SELECT lgd_check('SELECT x, (SELECT count(*) FROM (SELECT a, b, c, count(*) FROM lgdp WHERE d > x GROUP BY a, b, c) s) AS n FROM (VALUES (10), (50), (90)) v(x)');
 -- not decoded: a grouping column with no lion index
 ALTER TABLE lgdp ADD COLUMN h int;

@@ -785,6 +785,20 @@ SELECT lion_dc('SELECT count(DISTINCT k), count(DISTINCT t) FROM lion_dt');
  pushed down, 1 rows
 (1 row)
 
+-- a GROUP BY core finds constant has no grouping columns left, but is still
+-- grouped: no rows in, no row out
+SELECT lion_dc('SELECT count(DISTINCT k), count(DISTINCT t) FROM lion_dt WHERE a = 77 GROUP BY ''x''::text');
+       lion_dc       
+---------------------
+ pushed down, 0 rows
+(1 row)
+
+SELECT lion_dc('SELECT count(DISTINCT k), count(DISTINCT t) FROM lion_dt WHERE a = 3 GROUP BY ''x''::text');
+       lion_dc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
 -- DISTINCT on the grouping column, and two grouping columns, which are
 -- counted as GROUP BY g, a, k instead
 SELECT lion_dc('SELECT k, count(DISTINCT k) FROM lion_dt GROUP BY k');
@@ -947,6 +961,12 @@ SELECT lion_dc('SELECT a, count(DISTINCT k) FROM lion_dtp GROUP BY a');
        lion_dc       
 ---------------------
  pushed down, 4 rows
+(1 row)
+
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dtp WHERE a = 77 GROUP BY ''x''::text');
+       lion_dc       
+---------------------
+ pushed down, 0 rows
 (1 row)
 
 -- one partition by itself is a plain table

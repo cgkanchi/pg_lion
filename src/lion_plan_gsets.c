@@ -781,6 +781,13 @@ lion_try_distinct_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
 	groupexprs = get_sortgrouplist_exprs(root->processed_groupClause, tlist);
 	lion_gsets_agg_costs(root, &aggcosts);
 
+	/*
+	 * A GROUP BY whose every column core found constant (`GROUP BY 'x'`, or a
+	 * column a WHERE pins) leaves processed_groupClause empty but is still a
+	 * grouped Agg - no rows in, no row out - where a plain one would emit a
+	 * row of zero counts; core makes the same choice
+	 * (add_paths_to_grouping_rel()).
+	 */
 	foreach(lc, inner->pathlist)
 	{
 		Path	   *sub = (Path *) lfirst(lc);
@@ -790,7 +797,7 @@ lion_try_distinct_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
 			sub = (Path *) create_sort_path(root, inner, sub,
 											root->group_pathkeys, -1.0);
 		apath = create_agg_path(root, output_rel, sub, aggtarget,
-								(root->processed_groupClause != NIL) ?
+								(parse->groupClause != NIL) ?
 								AGG_SORTED : AGG_PLAIN,
 								AGGSPLIT_SIMPLE, root->processed_groupClause,
 								having, &aggcosts,

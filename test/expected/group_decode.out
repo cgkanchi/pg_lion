@@ -688,11 +688,18 @@ SELECT lgd_check('SELECT b, c, d, count(*) AS n FROM lgdp GROUP BY b, c, d HAVIN
  decoded, 3 passes, 260 rows, same as the sequential scan
 (1 row)
 
--- filtered counts: a run per filter in each partition's turn
-SELECT lgd_check('SELECT a, b, c, count(*) AS n, count(*) FILTER (WHERE d < 40) AS nd FROM lgdp GROUP BY a, b, c');
-                          lgd_check                           
---------------------------------------------------------------
- not decoded, 0 passes, 319 rows, same as the sequential scan
+-- filtered counts: a run per filter in each partition's turn, after the
+-- WHERE's
+SELECT lgd_check('SELECT a, b, c, count(*) AS n, count(*) FILTER (WHERE d IN (10, 40)) AS nd, count(*) FILTER (WHERE d = 7) AS n7 FROM lgdp GROUP BY a, b, c');
+                        lgd_check                         
+----------------------------------------------------------
+ decoded, 8 passes, 319 rows, same as the sequential scan
+(1 row)
+
+SELECT lgd_check('SELECT a, b, c, count(*) AS n, count(*) FILTER (WHERE d = 40) AS nd FROM lgdp WHERE d < 60 GROUP BY a, b, c');
+                        lgd_check                         
+----------------------------------------------------------
+ decoded, 4 passes, 238 rows, same as the sequential scan
 (1 row)
 
 -- count(DISTINCT) over the finer grouping, with a GROUP BY and without
@@ -714,7 +721,22 @@ SELECT lgd_check('SELECT count(DISTINCT c) AS n, count(DISTINCT b) AS m FROM lgd
  decoded, 3 passes, 1 rows, same as the sequential scan
 (1 row)
 
--- rescanned with a new value of its WHERE each time
+-- rescanned with a new value of its WHERE each time, each value with no
+-- entry in some partitions
+SELECT lgd_check('SELECT v.x, s.* FROM (VALUES (1), (40), (90)) v(x), LATERAL (SELECT a, b, c, count(*) AS n FROM lgdp WHERE d = v.x GROUP BY a, b, c) s');
+                        lgd_check                        
+---------------------------------------------------------
+ decoded, 4 passes, 16 rows, same as the sequential scan
+(1 row)
+
+-- not decoded, as over one table: a range in a FILTER, and a range on an
+-- outer row's value
+SELECT lgd_check('SELECT a, b, c, count(*) AS n, count(*) FILTER (WHERE d < 40) AS nd FROM lgdp GROUP BY a, b, c');
+                          lgd_check                           
+--------------------------------------------------------------
+ not decoded, 0 passes, 319 rows, same as the sequential scan
+(1 row)
+
 SELECT lgd_check('SELECT x, (SELECT count(*) FROM (SELECT a, b, c, count(*) FROM lgdp WHERE d > x GROUP BY a, b, c) s) AS n FROM (VALUES (10), (50), (90)) v(x)');
                          lgd_check                          
 ------------------------------------------------------------

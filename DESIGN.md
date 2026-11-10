@@ -6307,8 +6307,8 @@ which rescans the node partition by partition.
 
 ### The decoded walk over partitions (2026-11-10)
 
-A `GROUP BY` of three or more columns, or of two with a `WHERE` whose pairs (§20) cost more than
-one pass over the rows, is §34's decoded walk over one table. Over a partitioned table it was
+A `GROUP BY` of three or more columns, or of two whose pairs (§20) cost more than one pass over
+the rows, is §34's decoded walk over one table. Over a partitioned table it was
 refused, so `kind, country, count(*) ... WHERE status = 'paid'` got either §20's pairs, priced at
 every pair of every partition, or core's plan. The walk's rows are partial counts already, under
 a Finalize Agg, as a partitioned table's are, so nothing above the node changes: each partition is
@@ -6342,8 +6342,11 @@ ms against core's 515, `kind, country, count(*) ... WHERE status = 'paid'` 21 ms
 over it, 24 ms against 444. `test/sql/group_decode.sql` runs the walk over a table partitioned by
 LIST whose last partition numbers its columns differently and has an index per column: three
 columns, a `WHERE`, two columns, a clause the bounds imply, one that prunes, one with no entry in
-some partitions, HAVING, a filtered count, count(DISTINCT) with and without a GROUP BY, and a
-rescan with a new value, each compared with a sequential scan.
+some partitions, HAVING, filtered counts with and without a `WHERE`, count(DISTINCT) with and
+without a GROUP BY, and a rescan with a new value, each compared with a sequential scan. All run
+the walk but `count(DISTINCT c), count(*)`, whose finer grouping is the one column c. A range in
+a FILTER and a range on an outer row's value are compared too; neither is decoded, as over one
+table.
 
 ### A parent pruned to one leaf (2026-10-26)
 
