@@ -2145,6 +2145,51 @@ that share one leaf and INLINE keys on leaves of their own; `serializable_moves.
 between the read and the insert by each of the three transfers above; `reader_serializable.spec`
 has every reader's absent key.
 
+### The map pages a reader keeps pinned (2026-11-10)
+
+Step 3 reads the map once per container (`lion_vm_allvisible_mask()`, lion_count_int.h) through a
+SET of map pins (`LionVmPins`, lion_vm.h) rather than one: map page m in slot m % 8, filled only as
+pages are asked for. A single pin, core's index-only scan's (`ioss_VMBuffer`), is enough for a
+reader that crosses the heap once, in order. A count per key - an FK-side join's, a semi join's -
+crosses it once per key, each key's rows scattered over it, and let go of the pin and took it again
+at every step from one map page to the next: 590,478 pins for a semi join's count over 250,000 keys
+of a 750 MB, three-map-page heap, a sixth of its 382 ms. With the set it pins three pages and takes
+319 ms. A map page covers some 255 MB of heap at 8 kB pages, so eight slots hold the map of a heap
+up to 2 GB; past that, pages that share a slot take turns in it. The set moves from count to count
+in the node's cache as the single pin did (`LionVisCache.vm`, `lion_vis_cache_take_vm()`,
+`lion_vis_cache_keep_vm()`), and LionOrdered's index-only rows (§40.4) and LionProbeJoin's map
+checks use one too (`lion_vm_all_visible()`).
+
+Nothing about the interlock changes: the bytes are read off the pinned page when the container is
+counted, after it was copied under its pins, exactly as with one pin, never remembered from an
+earlier read; a map page is no index page and nothing waits for its pin. On a pool small for its
+connections - the backend's fair share (`lion_pin_fair_share()`) under 32 buffers - the set has one
+slot, so the pin budget (§15, "The pin budget"), which leaves room for one map page, still holds. A
+set holds at most eight map pages, and every set over the same heap pins the same pages, so one
+heap's map takes no more buffers of the pool than it has pages, one per 255 MB of heap, however many
+sets and backends read it: at most eight for a heap up to 2 GB. Past that the bound is eight a set,
+and a backend can hold several: one for each node of its plan that reads the map, and one for each
+group or column context a count rechecks through.
+
+The read itself is a word at a time: a container's sixteen map bytes (at 8 kB pages; eight at 16 kB,
+four at 32 kB) as two 64-bit words, each word's 32 all-visible bits squeezed together in five
+shift-and-mask steps (`lion_vm_allvisible_bytes()`), where it was a byte at a time for the bytes
+with a wanted block. A container with members on every block - a low-cardinality column's - paid
+sixteen byte steps, some 40% of `GROUP BY c200` over 5M rows: 23.5 ms before, 17.4 ms after. A
+one-member container (a sparse segment's, §13) now reads two words for its one byte and is no
+slower. The rare container that straddles two map pages still reads bytes, each half on its own
+page. `test/unit/vm_test.c` checks the word read against a bit-at-a-time reader of the documented
+layout at every alignment and byte value; assert builds still check every mask against
+`visibilitymap_get_status()` (`LION_VM_MASK_CHECK`), though a disagreement is settled by reading the
+bytes again from the page each block belongs on, so that check vouches for the reading of the bytes
+and not for which page they were read from. `test/sql/vm_pages.sql` does that: a heap of two map
+pages, one row to a block, with rows deleted on the second page at bytes whose twins on the first
+still say all-visible, and on both halves of the straddling container. Its counts, grouped counts,
+per-key join counts and index-only rows are compared with core's, the blocks taken from the map
+and rechecked are counted exactly, and the join's count over 167 keys, each on both pages, pins
+the two pages once each (a single slot pins them 236 times). Taking a block's bits from the wrong
+page, or one half of the straddling container from the other's page, fails it.
+
 ## 10. Phase 2b: CustomScan for `count(*) [GROUP BY k] FROM t WHERE k1 = c1 AND ...` (`lion_plan_*.c`, `lion_exec_*.c`)
 
 Planner integration
@@ -5791,9 +5836,10 @@ and the paused cursor's other groups come out as its snapshot saw them after VAC
 its copy of the WHERE set still lists and an insert has taken their slots back.
 
 The counts of one node share two things (2026-09-28, §27 "The per-key path, end to end"): the
-scratch memory they work in, reset after each, and the visibility-map page the last one left
-pinned, which the node keeps between rows as core's index-only scan keeps its map page. Neither
-is an index page or part of the §9 interlock, and no VACUUM waits for a map page's pin; it goes
+scratch memory they work in, reset after each, and the visibility-map pages the last one left
+pinned (§9, "The map pages a reader keeps pinned"), which the node keeps between rows as core's
+index-only scan keeps its map page. Neither is an index page or part of the §9 interlock, and no
+VACUUM waits for a map page's pin; they go
 when the node is done, rescanned or ended, or moves to another partition
 (`lion_vis_cache_release_vm()`). `test/sql/countpause.sql`'s check - no page of a lion index
 pinned by a paused cursor - holds as before.
@@ -13513,9 +13559,12 @@ from what the code does where it does not; the fixes of 2026-09-28 are marked.
    released it at the end - a buffer lookup and two atomic operations on the header of the one
    or two map pages of the heap that every count, and every participant of a parallel plan,
    pins. *Fixed*: the page stays pinned in the node's cache from one count to the next
-   (`LionVisCache.vmbuf`), between the node's rows as well, as an index-only scan keeps its map
+   (`LionVisCache.vm`), between the node's rows as well, as an index-only scan keeps its map
    page (`ioss_VMBuffer`), and is let go when the node is done, rescanned or ended or moves to
-   another partition (`lion_vis_cache_release_vm()`). A map page is no index page and no part of
+   another partition (`lion_vis_cache_release_vm()`). Since 2026-11-10 that is every map page a
+   count needs, up to eight, not only the last (§9, "The map pages a reader keeps pinned"): a
+   key's rows scattered over a heap of several map pages moved the single pin back and forth
+   once per key. A map page is no index page and no part of
    the §9 interlock: VACUUM sets a bit under the page's content lock and never waits for its
    pins, and only a truncation of the map would, under an AccessExclusiveLock this query's own
    lock excludes. `Visibility Map Pages Pinned` counts what is left: a pin per map page a run
@@ -25137,8 +25186,9 @@ reads").
   projection and the quals on the scan slot's type before `BeginCustomScan` runs, and the expression
   machinery specialises on it, so one plan never returns slots of two types.
 - **A row.** `xs_want_itup` is set on the B-tree scan before `index_rescan()`. For a member TID
-  (`lo_fetch_indexonly()`): `VM_ALL_VISIBLE(heapRelation, blkno, &vmbuffer)`, the map's buffer kept
-  across calls and released at rescan and end, as `ioss_VMBuffer` is. All-visible, the row is
+  (`lo_fetch_indexonly()`): `VM_ALL_VISIBLE()` through the node's set of map pins
+  (`lion_vm_all_visible()`, §9 "The map pages a reader keeps pinned"), kept across calls and released
+  at rescan and end, as `ioss_VMBuffer` is. All-visible, the row is
   visible to every snapshot, this one included, and the heap is not read. Not all-visible, the
   heap tuple is fetched into a slot of the table AM's kept for this alone (`index_fetch_heap()` on
   16 to 19, `table_fetch_tid()` and `table_tuple_fetch_row_version()` on 20 - `lo_fetch_btree()`,
