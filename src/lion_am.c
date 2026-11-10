@@ -58,6 +58,7 @@
 #include "lion_bm25.h"
 #include "lion_costs.h"
 #include "lion_count.h"
+#include "lion_defer.h"
 #include "lion_vec.h"
 
 #if PG_VERSION_NUM >= 180000
@@ -771,6 +772,9 @@ _PG_init(void)
 	 */
 	lion_vec_init();
 
+	/* statement-level insert batching (DESIGN.md §55) */
+	lion_defer_init();
+
 	MarkGUCPrefixReserved("pg_lion");
 
 	/*
@@ -886,7 +890,7 @@ lion_handler(PG_FUNCTION_ARGS)
 		.ambuildempty = lionbuildempty,
 		.aminsert = lioninsert,
 #if PG_VERSION_NUM >= 170000
-		.aminsertcleanup = NULL,
+		.aminsertcleanup = lioninsertcleanup,	/* DESIGN.md §55 */
 #endif
 		.ambulkdelete = lionbulkdelete,
 		.amvacuumcleanup = lionvacuumcleanup,

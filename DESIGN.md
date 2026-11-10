@@ -668,7 +668,8 @@ Lock ordering:
   split rewrites it, both taking it as the LAST buffer of their record; nothing else writes it.
 
 INSERT (`lion_insert.c`: `lioninsert()` calls `lion_insert_one()` once per key column and, for a
-multi-key opclass, once per extracted key)
+multi-key opclass, once per extracted key; a statement's rows after its first are kept and written
+as a batch, each key's under one hold of its leaf, by the same steps - §55)
 1. Hash the key and build the search key - kind VALUE, or a reserved entry: NULL, or one of the
    key-less entries of §17 (EMPTY, EMPTYDIM, EMPTYINNER, NULLELEMS) (§14, §17). Descend the directory (`lion_dir_find()`) and take the LEAF EXCLUSIVE; a write descent that
    lands on an INCOMPLETE_SPLIT page finishes that split first (§21, the repair rule). The leaf is
@@ -762,6 +763,8 @@ multi-key opclass, once per extracted key)
    structural fix was the custom WAL resource manager of §25, which logs the bytes that changed with
    no image and no diff: the same 8-client, 2-key burst went from 765 tps generic to 1275 rmgr
    (btree 1632, release build), past the unlogged ceiling above.
+   What did move the ceiling of a few keys was taking fewer turns on the leaf: since 2026-11-10 a
+   statement's rows go in as a batch, a key's rows 256 to a hold (§55).
 
 SCAN (`lion_scan.c`, amgetbitmap; §29 says what the plain index scan does differently)
 1. Descend the directory with SHARE locks to the leaf that holds the search key's entry - the probe
@@ -10485,14 +10488,17 @@ What pg_lion installs into the server, all of it from `_PG_init()` (lion_am.c, l
 lion_ordered.c, lion_bm25_scan.c, lion_selfuncs.c, lion_wal.c): `create_upper_paths_hook` and
 `set_join_pathlist_hook`; `set_rel_pathlist_hook` three times over - `LionOrdered` (§30), `LionBm25`
 (§39) and the plain-scan repricing with the row correction (§33, §40), installed in that order, so
-the repricing runs first -; `get_relation_stats_hook` and `get_index_stats_hook` (§33, §41); and
-nothing else among the hooks - no planner, executor, ProcessUtility or object-access hook -; a
-custom WAL resource manager, only while `shared_preload_libraries` is processed; its GUCs, with the
+the repricing runs first -; `get_relation_stats_hook` and `get_index_stats_hook` (§33, §41);
+since §55, `ExecutorStart_hook`, `ExecutorEnd_hook` and `ProcessUtility_hook`, which write a
+statement's buffered inserts before a query or a utility command and note `INSERT ... ON CONFLICT`
+runs, and a transaction and a subtransaction callback (lion_defer.c); and nothing else among the
+hooks - no planner or object-access hook -; a custom WAL resource manager, only while `shared_preload_libraries` is processed; its GUCs, with the
 `pg_lion` prefix reserved by `MarkGUCPrefixReserved()`. Every hook saves the previous value and
-calls it: all but one FIRST, adding their own path after (`lion_create_upper_paths()`,
+calls it: all but one planner hook FIRST, adding their own path after (`lion_create_upper_paths()`,
 `lion_ordered_set_rel_pathlist()`), so whichever extension was loaded before pg_lion has already
 added its paths when pg_lion adds its own; the plain-scan repricing calls it LAST, so that the plain
-paths are repriced before anything compares against them. An extension loaded after pg_lion reaches
+paths are repriced before anything compares against them. The executor and utility hooks of §55
+do their writing before calling the previous hook, and their bookkeeping around it. An extension loaded after pg_lion reaches
 pg_lion through its own chaining, when it chains: Citus does not, for two of these hooks (the
 addendum "Citus and TimescaleDB" below). Nothing is ever uninstalled: core has not unloaded a library since
 PostgreSQL 15 (no `_PG_fini`), and `_PG_init()` runs once per process, so there is no reload-order
@@ -34675,3 +34681,105 @@ bucket's edge, BC buckets, infinities, NULLs, the clause under OR, NOT, `IS NOT 
 outer join's `ON`, the declines, an expression index, a table without lion, a partitioned table
 pruned by the range, and a generic plan), each against the same query with the rewrite off and
 sequential scans only.
+
+## 55. Statement-level insert batching (2026-11-10)
+
+Every writer of a key holds the directory leaf that files the key's entry EXCLUSIVE for the whole
+of its insert (§5), and a column of a few values keeps all of its entries on one leaf. So
+concurrent statements inserting into such a column took turns on that leaf row by row, and the
+handoffs of the lock rather than the inserts became the cost: four writers into a two-value column
+loaded about a third of what one writer did, with 70% of their time waiting on the leaf's content
+lock. Shortening the hold does not help (§5, step 6), and filing the keys on separate leaves gave
+2.2× where batching gave 9× (both measured on throwaway prototypes). So a statement's rows now go in
+as a batch (`lion_defer.c`): after its first row, each row's (key, TID) pairs are kept per index, in
+the backend, and written sorted, each key's rows under one hold of its leaf.
+
+**The batch.** `lioninsert()` hands the pairs of every eligible column to `lion_defer_add()`: the
+key as `lion_key_prepare()` made it, copied, with its bucket hash, or a reserved entry's flag for a
+NULL or a multi-key value with no keys (§14, §17). A buffer is one index's, holds one
+subtransaction's rows, and is written when it outgrows `work_mem`. `lion_insert_apply()` sorts the
+rows by (column, kind, hash, key bytes, TID), which puts each key's rows together in TID order,
+then sorts the keys into the directory's own order (`lion_cmp_prefix()`: an ordered column by its
+proc 4, as a descent compares it - never a sort operator, which a column whose catalog changed since
+the build may have lost, §21), so that a run of new keys fills leaves as an ascending run of inserts does rather
+than splitting them all down the middle. Then each key: one descent with the leaf EXCLUSIVE and the
+writer's SERIALIZABLE check (§9), as `lion_insert_one()` makes, and
+
+- a CHAIN entry takes up to `LION_APPLY_HOLD` (256) rows under that one hold, each through
+  `lion_insert_chain()`, which rewrites the entry in place at its size, so its offset stays good;
+- a new entry or an INLINE one takes one row per descent, since either may move the entry; an
+  INLINE entry that spills is a CHAIN one from the next descent on.
+
+A key of many rows - the case that queued - is a CHAIN entry after its first few hundred, so its
+rows go in 256 to a lock handoff; a key of one row costs what it did, plus the sort.
+
+**When the rows go in.** Nobody else can see them before the transaction commits, so what has to be
+covered is this backend reading the index before they are written, and the commit:
+
+- the end of the statement: `aminsertcleanup` (`lioninsertcleanup()`), which `ExecCloseIndices()`
+  calls for every index the executor opened for inserts, before it lets go of its
+  RowExclusiveLock on it - so `lion_index_verify()`'s wait for writers (§7) covers the write - and
+  `validate_index()` calls for CREATE INDEX CONCURRENTLY;
+- a query whose range table names the table (an `ExecutorStart_hook`): a trigger's or a volatile
+  function's query, run in the middle of the statement, sees the rows the statement wrote before it,
+  and a lion path - a scan, `LionCount`, any of the custom scans - reads only indexes of relations
+  in its range table. An AFTER trigger's query, which runs from `ExecutorFinish()` before the
+  indexes are closed, is one of these;
+- a scan of the index (`lionbeginscan()`) and the direct readers no range table names
+  (`lion_open_index()`, `lion_reader_open()`, the count and facet functions);
+- a utility command, which may truncate, rewrite or drop the table or the index (a
+  `ProcessUtility_hook`; not COMMIT, ROLLBACK or SAVEPOINT);
+- a row from another subtransaction than the rows the buffer holds;
+- PRE_COMMIT and PRE_PREPARE, for a caller of `index_insert()` that never calls
+  `index_insert_cleanup()`. After it, inserts go straight in.
+
+**When nothing is buffered** (`lion_defer_allowed()` and `lioninsert()`): PostgreSQL 16, which has
+no `aminsertcleanup`; the first row of a statement, so a one-row statement costs what it did; a
+column with stored positions, summaries or bit slices, whose inserts write more than the key's entry
+(each of those steps would have to be batched as well, and their posting sets queue less); the index
+of an exclusion constraint, whose check scans the index for the rows inserted before in the same
+statement; while an `INSERT ... ON CONFLICT` runs, anywhere in the backend (tracked from
+`ExecutorStart` to `ExecutorEnd` and dropped with the subtransaction it began in); and the rest of
+the transaction that loads the library when it is not preloaded, since its hooks can come too late
+for a statement already under way (an `ON CONFLICT DO NOTHING` with no conflict target opens its
+indexes, and so may load the library, only inside its `ExecutorStart`).
+
+**Why a buffered TID stays its row's.** A TID in a buffer must still be the row's when it is
+written, or the write files another row under this row's key. A row this transaction inserted
+becomes dead to every snapshot - and VACUUM may then remove it and hand its slot to another row -
+in two ways only. Its subtransaction aborts: the buffer is that subtransaction's, and
+SUBXACT_EVENT_ABORT_SUB drops it (a commit of the subtransaction hands it to the parent). Or it is
+an `ON CONFLICT` speculative insert that lost its race and was super-deleted
+(`heap_abort_speculative()`), which no buffer holds. A row deleted later by its own transaction is
+not dead to others until that transaction commits, by which time the buffer is written.
+
+**A write that fails** leaves every row in the buffer, and the rows are untouched but for their
+order: an insert of a TID the posting set already holds changes nothing, so the next write, or the
+pre-commit one, does them all again. An error in a write aborts the (sub)transaction it ran in,
+whose abort clears the buffer's `writing` flag; a flag still set at the next write means an error
+was swallowed without that, and the write refuses rather than guess what went in.
+
+`pg_lion.batch_inserts` (on) turns it off. `lion_debug_defer_pending(idx)` and
+`lion_debug_defer_cleanup(on)`, which tests create with `CREATE FUNCTION ... AS 'pg_lion'`, count a
+backend's buffered rows and leave them buffered past the end of a statement, as a caller that never
+calls `index_insert_cleanup()` would.
+
+**Measured** (PostgreSQL 18.7, release build, custom WAL resource manager, 4 cores; pgbench, each
+transaction one INSERT of 200 rows; thousands of rows a second, medians of three 10-second runs):
+
+(to follow)
+
+**Not done.** Columns with positions, summaries and slices are written row by row; batching them
+needs their own posting-set steps sorted and held the same way. A one-row statement gains nothing,
+and many writers inserting one row each still take turns on the leaf. Each CHAIN row is still its
+own WAL record: a batch could put a key's rows for one container into one.
+
+Tests: `test/sql/insert_batch.sql` (every kind of key in one batch and across `work_mem`, COPY;
+a volatile function's query in the INSERT's own select list, BEFORE and AFTER triggers' queries,
+by the count pushdown first; rows left past their statement written by a query of the table, a
+direct reader and the commit, dropped with an aborted savepoint or PL/pgSQL block, written before
+TRUNCATE and DROP INDEX; `batch_inserts = off`; ON CONFLICT in the statement and in a WITH query;
+an exclusion constraint violated within one statement; columns with summaries, slices and
+positions beside batched ones; a partitioned table), each against sequential scans and
+`lion_index_verify()`; `test/isolation/insert_batch_race.spec` (a batch parked between two holds
+while another writer fills the same key and VACUUM empties part of it).

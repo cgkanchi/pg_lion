@@ -1258,6 +1258,15 @@ collect them part way through (DESIGN.md §27, "Probed, then collected"), and
 mode (DESIGN.md §25).
 `pg_lion.rmgr_id` is described under `wal_mode` above.
 
+Writes: `pg_lion.batch_inserts` (on), on PostgreSQL 17 and later, keeps the rows a statement
+inserts into a Lion index after its first and writes them at the end of the statement - or before
+anything in the session reads the index - sorted by key, each key's rows under one hold of the
+directory leaf that files it (DESIGN.md §55). Concurrent statements inserting many rows into a
+column of a few values then stop taking turns on that leaf row by row. Not batched: columns with
+stored positions, summaries or slices, an exclusion constraint's index, and any insert while an
+`INSERT ... ON CONFLICT` runs in the session. A buffer is bounded by `work_mem`. Off, every row
+goes in when it is inserted, as on PostgreSQL 16.
+
 Cost settings, for calibrating Lion's cost model on your own workload the way `random_page_cost`
 calibrates core's (DESIGN.md §31, "The settings"). Each is the price of one operation as a multiple
 of a core cost setting, so Lion's prices still scale with core's; the defaults are what the model
@@ -1575,7 +1584,8 @@ query come from a covering B-tree instead, §40), no INCLUDE columns, no
 parallel index scan, so a plain lion scan, `LionBm25`, `LionOrderedJoin`, `LionOrderedSplit` and `LionOrdered`'s walk of a lion column run in one process, and a parallel bitmap heap scan builds its bitmap in one (a parallel build is supported from PostgreSQL 17, and `LionCount`, `LionSemiJoin`, `LionAntiJoin` and `LionOrdered`'s walk of a B-tree can use workers). VACUUM reclaims the pages it
 empties, as a B-tree does: directory leaves, and the leaves of a key's posting tree while the key
 still has rows; the internal pages of a posting tree go with its key. Inserts serialise on the directory
-leaf that holds the key; see the measured
+leaf that holds the key, though a statement's rows after its first go in as a batch, each key's
+under one hold of the leaf (`pg_lion.batch_inserts`, PostgreSQL 17 and later); see the measured
 [write costs](BENCHMARKS.md#size-build-and-writes-5m-rows-all-seven-indexes). Count pushdown supports constants, parameters
 and stable expressions such as `now() - interval '30 days'` or `current_date - 30` (evaluated once
 per execution; a volatile one like `random()` goes to the ordinary plan) on any indexed column, enum

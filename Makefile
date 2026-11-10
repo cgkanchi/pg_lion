@@ -38,7 +38,7 @@ READAHEAD_OBJS = src/lion_readahead.o src/lion_readahead_ring.o
 # standalone.
 OBJS = src/lion_planes.o src/lion_container.o src/lion_sparse.o src/lion_positions.o src/lion_wal.o src/lion_waldelta.o $(PAGES_OBJS) src/lion_dir.o src/lion_dir_delete.o src/lion_posting.o src/lion_posting_delete.o src/lion_postree.o src/lion_posbuild.o src/lion_posfilter.o src/lion_bm25.o src/lion_bm25_scan.o src/lion_reader.o \
        src/lion_am.o src/lion_amcost.o src/lion_build.o src/lion_spool.o src/lion_scan.o \
-       src/lion_insert.o src/lion_vacuum.o $(FUNCS_OBJS) $(COUNT_OBJS) $(CUSTOMSCAN_OBJS) \
+       src/lion_insert.o src/lion_defer.o src/lion_vacuum.o $(FUNCS_OBJS) $(COUNT_OBJS) $(CUSTOMSCAN_OBJS) \
        src/lion_multikey.o src/lion_jsonb.o src/lion_fkjoin.o src/lion_ordered.o src/lion_selfuncs.o \
        src/lion_costs.o src/lion_arena.o $(VEC_OBJS) $(READAHEAD_OBJS)
 PGFILEDESC = "pg_lion - roaring bitmap inverted index"
