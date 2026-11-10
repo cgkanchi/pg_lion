@@ -15955,9 +15955,10 @@ one - and is not proved empty. It is never the fact, which has to have an index.
 **Uniqueness** is asked of it where it is asked of a table: a GROUP BY of its column, its keys
 united, and folding it into a fact filter beside a dimension ("A second dimension that only
 filters"). A table proves it with a unique index; a list proves it from its values
-(`lion_values_column_unique()`): each one a constant by then (`preprocess_expression()` has folded
-every row), they are sorted by the `<` of a btree family whose equality is the join operator, under
-the join's collation, and no two neighbours may compare equal. The btree contract makes "compares
+(`lion_values_column_unique()`): each has to be a constant by then (`preprocess_expression()` folds
+what it can; a parameter a generic plan keeps, `VALUES ($1), ($2)`, proves nothing, whatever values
+it is given), they are sorted by the `<` of a btree family whose equality is the join operator,
+under the join's collation, and no two neighbours may compare equal. The btree contract makes "compares
 equal" that family's equality, which is the join's: `(VALUES (1.0), (1.00))` is not unique to
 numeric's `=`, and a GROUP BY of it is then left to the rows the node emits per listed row and the
 Finalize Agg above, as for any non-unique key. NULLs do not count against it, as they do not
@@ -15968,9 +15969,10 @@ against a unique index. A list longer than `lion_array_batch_size()` is not exam
 
 A list compared through a cast (`(VALUES (3), (4)) v(n) ON v.n = f.numeric_col`, whose list side
 is `v.n::numeric`) is not a column and is declined, as a table's would be. `x IN (VALUES ...)` is
-core's own `= ANY` from PostgreSQL 18 (`convert_VALUES_to_ANY()`); before it, it is a semi join
-whose inner side is the list, taken here as the forward semi join of "Forward semi joins over a
-non-unique key".
+core's own `= ANY` from PostgreSQL 18 (`convert_VALUES_to_ANY()`) where the list has two rows or
+more and every value folds to a constant; before 18, and on 18 for a list of the parameters a
+generic plan keeps, it is a semi join whose inner side is the list, taken here as the forward semi
+join of "Forward semi joins over a non-unique key".
 
 Tests: `test/sql/fkjoin_values.sql`.
 
