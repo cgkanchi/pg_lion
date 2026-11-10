@@ -6578,10 +6578,11 @@ KEYS trees:
   `gin_extract_tsquery()` numbers the keys it returns by scanning that array from 0 and counting
   QI_VAL items, so the j'th key is the j'th QI_VAL in array order; the same item -> key map is
   recomputed rather than fished out of extra_data.  QI_VAL with no prefix flag and weight mask 0
-  becomes a leaf; OP_AND and OP_OR become AND and OR nodes; **OP_NOT, OP_PHRASE, a prefix and a
-  weight mask make the whole query ALL**.  (`!a` has no complement over posting sets that is not
-  "every row minus a's", and the ALL fallback is that set anyway; a phrase needs lexeme positions
-  and a weight needs weights, neither of which the index stores.)
+  becomes a leaf; OP_AND and OP_OR become AND and OR nodes, and an OP_AND one of whose operands is
+  an OP_NOT an ANDNOT node (below, "A NOT beside an AND"); **any other OP_NOT, OP_PHRASE, a prefix
+  and a weight mask make the whole query ALL**.  (`!a` has no complement over posting sets that is
+  not "every row minus a's", and the ALL fallback is that set anyway; a phrase needs lexeme
+  positions and a weight needs weights, neither of which the index stores.)
 - `<@` is unreachable (extractQuery says INCLUDE_EMPTY first) and would be ALL.
 
 ### Bitmap scans (`lion_scan.c`)
@@ -6893,7 +6894,7 @@ literal is exact.
 
 `test/sql/countmultikey.sql` runs every shape against the pushdown off, with the node's recheck
 counters beside the answer: `@>`, `&&` over text[] and int[] and `@@` in generic plans with values
-that are exact, select nothing, are NULL, widen (a NULL element, a phrase, a weight, `a & !b`, a
+that are exact, select nothing, are NULL, widen (a NULL element, a phrase, a weight, `a & !b:A`, a
 prefix beside a lexeme) and are every row (`{}`, `!a`, `a:*`, `a | !b`), queries built by
 `to_tsquery($1)` and `websearch_to_tsquery($1)`, `ARRAY[$1, $2]`; beside other clauses, two such
 clauses and an `IS NOT NULL` read by the sequential scan, `count(col)`, GROUP BY (one column and two),
@@ -6952,6 +6953,40 @@ the price, which is now the superset's size rather than the index's: a rare phra
 median 120 words, warm).  The count's gain over GIN is the heap-skipping kind only where the
 superset is narrow; on a wide superset both do the same detoast per candidate.  Exact phrase
 counts need stored positions, which is a separate design.
+
+### A NOT beside an AND (2026-11-10)
+
+`x & !y` is a set difference: outside a phrase `TS_execute()` decides `!y` as "the row does not
+match y", so the rows the operator selects are x's less y's, and the shared evaluator already has the
+node for it, `LION_KN_ANDNOT` (§14, `IS NOT NULL`), whose first child's containers are taken the
+others' members away at the keys the first child stands at.  `lion_tsquery_tree()` builds one for an
+AND exactly one of whose operands is a NOT - either way round, the other operand and the NOT's
+operand both exact trees themselves (`(a <-> c) & !b` is not one, and is the superset's below) -
+and folds a run of them into one node (`a & !b & !c` is ANDNOT(a, b, c)); a NOT that is itself an
+OR's operand (`a | !b`), one alone, or one on both sides of an AND still needs every row and stays
+ALL, while an ANDNOT under an OR (`(a & !b) | c`) is an ordinary operand of it.  The query is then
+KEYS: exact for the scans (no recheck), the count (no row filter, no position filter) and every
+count shape that takes an exact multi-key leaf - GROUP BY, count(DISTINCT), the FK-side join,
+counts by cells, whose mask test reads an ANDNOT as its first child's keys and none of the others'
+(`lion_cells_tree()`), and LionOrdered's lazy set.
+
+The superset (`lion_tsquery_superset()`) does the same wherever it would have dropped the NOT, so
+`(a <-> c) & !b` decides positions only for the rows of `a & c` that lack `b`, but not inside a
+phrase, where a NOT is about positions (`(a & !b) <-> c` matches a row that has `b` somewhere
+else), not where y is not exact (`a & !b:A`, `a & !(b <-> c)`, which stay `a`), not where the other
+side's superset is every row, and never for an extraction that is not the plain one: an ambiguous
+long lexeme's set ("Long lexemes") may hold rows without its lexeme, and taking those away would
+lose rows.  The cost model's superset share (`lion_tsquery_walk_sel()`) follows the same rule,
+an ambiguous long lexeme anywhere in the query included (`lion_tsquery_ambiguous()`); a prefix past
+the expansion cap, which the planner cannot see, it takes as expanded, as it takes every prefix.
+
+On 500,000 synthetic documents (PostgreSQL 18.7, warm, serial), `count(*) WHERE tsv @@ 'w2 & !w5'`
+of a lexeme in nearly every row and one in 93% of them took 55 ms, every candidate of `w2` decided
+by the position filter; it now takes 1.9 ms, where `w2 & w5` takes 1.6 to 2.4.  `test/sql/tsvector.sql`
+compares the rows with a sequential scan for nested and folded NOTs, under an OR, a NOT inside and
+of a phrase, under a weight and of a prefix; `countcells.sql`, `countmultikey.sql`,
+`positions.sql`, `indexscan.sql` and `ordered_lazy_query.sql` show the shapes that became exact and
+keep one that still rechecks.
 
 ### Stored positions: position trees (in progress, 2026-10-07)
 

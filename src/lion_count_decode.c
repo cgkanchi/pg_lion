@@ -912,7 +912,11 @@ lion_count_groups_decode(Relation heap, Snapshot snapshot, int ncol,
  * Counts by cells
  * --------------------------------------------------------------------- */
 
-/* Do the keys whose bits mask holds satisfy tree n, an AND and OR of keys? */
+/*
+ * Do the keys whose bits mask holds satisfy tree n, an AND and OR of keys, or
+ * an ANDNOT - `a & !b` (lion_tsquery_tree()) - its first child's keys and
+ * none of the others'?
+ */
 static bool
 lion_cells_tree(const LionKeyNode *n, uint64 mask)
 {
@@ -920,6 +924,15 @@ lion_cells_tree(const LionKeyNode *n, uint64 mask)
 
 	switch (n->kind)
 	{
+		case LION_KN_ANDNOT:
+			if (!lion_cells_tree(n->args[0], mask))
+				return false;
+			for (i = 1; i < n->nargs; i++)
+			{
+				if (lion_cells_tree(n->args[i], mask))
+					return false;
+			}
+			return true;
 		case LION_KN_KEY:
 			Assert(n->keyno >= 0 && n->keyno < 63);
 			return (mask & (UINT64CONST(1) << n->keyno)) != 0;
