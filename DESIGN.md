@@ -1872,10 +1872,11 @@ Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *k
    are currently consuming). Advance a set's cursor page only after its containers have been fully
    consumed, and consume means: for the resulting AND container, do the VM checks (step 3) before any
    source page pin is released.
-3. For the result container: for each of the ≤ LION_BLOCKS_PER_CONTAINER heap blocks with members
-   (compute member counts per block via lion_container_range_cardinality over the block's lo range;
-   skip blocks with 0), `visibilitymap_get_status(heap, blk, &vmbuf)`; if all-visible: count +=
-   members, PredicateLockPage; else: append the block's TIDs (lion_code_to_tid) to a recheck list.
+3. For the result container: for each of the ≤ LION_BLOCKS_PER_CONTAINER heap blocks with members,
+   `visibilitymap_get_status(heap, blk, &vmbuf)`; if all-visible: PredicateLockPage; else: append
+   the block's TIDs (lion_code_to_tid) to a recheck list. One pass over the container's members
+   queues those of the blocks that are not all-visible and counts them; the count adds the rest
+   ("The recheck's reads" below).
 4. After the merge completes, recheck: sort the TID list (it is already in TID order if produced in
    ckey order), and for each TID call `table_index_fetch_tuple(fetch, &tid, snap, slot, &call_again,
    &all_dead)` in a loop over call_again (HOT chains); count each visible tuple found. Use
@@ -2053,6 +2054,75 @@ old value; then in READ COMMITTED s1 must see the new value), and an index the c
 not use at all (count_checkxmin.spec: a HOT update before CREATE INDEX makes the build set
 indcheckxmin, and the old REPEATABLE READ reader must get the eligibility error rather than a count
 that is missing the row it still sees).
+
+### The recheck's reads (2026-11-10)
+
+A count over a heap that has lost its visibility map bits spends its time in step 4. On 5M rows of
+a synthetic table (96,192 heap pages, about 52 rows a page), an UPDATE of 1% of the rows clears the
+bit on 52% of the pages, and `count(*) WHERE c2 = 1` goes from 0.6 ms to 120-130 ms with the whole
+heap in shared buffers. By perf, `heap_hot_search_buffer()` was 60% of it, nearly all of that one
+load: the header of the tuple the root line pointer names, which nothing has brought into the CPU's
+cache, so that the rows of a block waited for their misses one after another. The buffer table
+lookup of each page (core's `ReadBuffer()`) was most of the rest, then queueing the rows. Three
+changes, none of which changes what is read or what is counted:
+
+- **The tuple headers are asked for ahead** (`lion_prefetch_heap_tuple()`, lion_count_int.h). With
+  the block share-locked, the recheck reads the line pointer `LION_RECHECK_PREFETCH` (8) rows ahead
+  of the one it resolves - a redirect's target for a pruned chain - and prefetches the header it
+  names, so that a block's misses overlap; the filtered recheck and the visibility cache's page sweep
+  (`lion_vis_fill_page()`) do the same. A prefetch reads nothing and cannot fault, so a line pointer
+  that names nothing usable costs the instruction. It is a macro, as `lion_prefetch_range()` is: GCC
+  deletes a function that only prefetches. Distances of 8 to 32 measured alike, 4 slower.
+- **The blocks come through a read stream** (PostgreSQL 17 on): `lion_recheck_heap_heap()` reads
+  its blocks as `lion_recheck_heap_filtered()` already did and a bitmap heap scan does, batched on
+  18 (`READ_STREAM_USE_BATCHING`, whose callback may neither lock nor read). The callback
+  (`lion_tid_blocks_next()`) skips the blocks the visibility cache already answers. It looks each
+  one up in the cache, which nothing changes while the stream runs - an entry is filled only when
+  the recheck reads its block, and a sorted list names each block once - so the callback, running
+  ahead, decides every block as the recheck will; a buffer for another block is an ERROR. A stream
+  is begun for every recheck, however short: 20,000 groups' counts of a few rows each took the same
+  time with one per count as with none. Warm, it changes nothing; read from storage, it is most of
+  the gain below.
+- **A container's members on dirty blocks are queued and counted in one pass**
+  (`lion_count_container_masks()`): they were counted with a range cardinality per dirty block and
+  then queued by a second pass over every member. Appending to the list is inline
+  (`lion_recheck_append()`), with flushes, spills and growth left to `lion_recheck_add_slow()`.
+
+Measured on PostgreSQL 18.7 at its defaults for I/O (`io_method = worker`, 3 I/O workers,
+`effective_io_concurrency = 16`) and with `max_parallel_workers_per_gather = 0` unless the row says
+otherwise. Warm is the heap in shared buffers: medians of 9 runs (25 for the small counts). Cold is
+`debug_io_direct = data` with the heap evicted before each run: medians of 3. Each build ran twice,
+alternating, and the figures average the two medians.
+
+| Query, after the 1% UPDATE | warm before | warm after | cold before | cold after |
+|---|---|---|---|---|
+| `count(*) WHERE c2 = 1` (2.5M rows) | 128 ms | 87 ms (1.45x) | 2,700 ms | 1,050 ms (2.6x) |
+| the same with two parallel workers | 71 ms | 56 ms (1.25x) | | |
+| `count(*)` | 295 ms | 190 ms (1.55x) | 2,660 ms | 1,110 ms (2.4x) |
+| `count(*) WHERE c200 = 17` | 12.7 ms | 9.0 ms (1.4x) | 620 ms | 240 ms (2.6x) |
+| `c20, count(*) WHERE c200 = 17 GROUP BY c20` | 36.4 ms | 32.4 ms (1.1x) | | |
+| `GROUP BY c200` | 515 ms | 400 ms (1.3x) | 3,300 ms | 1,620 ms (2.0x) |
+| `GROUP BY c20` | 400 ms | 310 ms (1.3x) | 3,070 ms | 1,700 ms (1.8x) |
+
+Vacuumed, the plain counts take under a millisecond and nothing above touches them. Core's
+sequential scan answers the same four large queries in 340 to 690 ms warm (150 to 270 ms with two
+workers) and 670 to 990 ms cold (440 to 490 ms with two). So read from storage, a count that must
+recheck half of a table's pages still loses to reading all of them in order: the recheck's reads
+are single blocks, which this disk serves at about 50,000 a second whatever the concurrency (16,
+64 and 256 measured alike, and 3 or 16 I/O workers), while the sequential scan reads 128 kB at a
+time. The planner prices a heap that fits in `effective_cache_size` as cached, as core does
+(`pg_lion.cold_page_cost`, §39). Warm with two workers, core's grouped counts (250 to 270 ms) also
+beat lion's, which run serially, and the planner still picks lion for them.
+
+What is left, by perf on the warm plain count: `heap_hot_search_buffer()` 30% (the misses the
+prefetch does not hide, mostly a page's first rows, whose line pointers are the page's own first
+miss), the buffer table 22% (core's lookup; a stream makes it ahead of time, not cheaper), queueing
+14%. In a grouped count the visibility cache's hash lookups are 18-28%: each group looks up every
+block it has rows on, at scattered places of a table larger than the L2 cache. Prefetching the
+slots a few blocks ahead measured no gain - the stalls moved to the prefetches. A table indexed by
+block number would turn the lookups into a forward walk, but it takes memory per range of blocks
+rather than per entry, which a cache of scattered blocks would pay many times over in its
+`work_mem` budget; it was not done.
 
 
 ### Direct readers (2026-10-08)
