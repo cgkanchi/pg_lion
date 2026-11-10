@@ -529,6 +529,26 @@ probe_damaged(LionContainer *c)
 	if (checks)
 		CHECK(n == c->cardinality, "a chunk check accepts is read whole");
 
+	/* the counts-only walk steps over positions a word at a time */
+	{
+		uint64		cprev = 0;
+		uint32		cn = 0;
+
+		ok = true;
+		lion_poschunk_iter_init(&it, c);
+		while (lion_poschunk_iter_next_npos(&it, &m))
+		{
+			if ((cn > 0 && m.code <= cprev) || m.npos > LION_POS_MAX_NPOS)
+				ok = false;
+			cprev = m.code;
+			cn++;
+		}
+		CHECK(ok, "a damaged chunk's counts-only walk yields ascending codes");
+		CHECK(cn <= c->cardinality, "never more counts-only members than the header");
+		if (checks)
+			CHECK(cn == n, "a chunk check accepts is read whole without positions too");
+	}
+
 	(void) lion_poschunk_find(c, prev, &m);
 	(void) lion_poschunk_last_code(c, &prev);
 	(void) lion_poschunk_split(c, l, rt);
