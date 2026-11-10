@@ -185,6 +185,41 @@ rand_member(LionPosMember *m, uint64 code)
 		m->pos[i] = LION_POS_MAKE(pos, rng_below(4));
 	}
 	m->npos = (uint16) npos;
+
+	/* the row's length: unknown now and then, past 65535 now and then */
+	if (rng_below(8) == 0)
+		m->dl = 0;
+	else if (rng_below(16) == 0)
+		m->dl = (uint16) (1 + rng_below(PG_UINT16_MAX));
+	else
+		m->dl = (uint16) (Max(npos, 1) + rng_below(300));
+}
+
+/*
+ * Is every member of the reference dominated by one of the chunk's impact
+ * pairs: a tf at least its own and a length at most its row's (0 for a row
+ * whose length was not known)?
+ */
+static bool
+impacts_bound(const LionContainer *c, const Ref *r)
+{
+	LionPosImpact imp[LION_POS_NIMPACTS];
+	int			n = lion_poschunk_impacts(c, imp);
+	uint32		i;
+
+	for (i = 0; i < r->n; i++)
+	{
+		uint32		tf = Max((uint32) r->m[i].npos, 1);
+		uint32		dl = r->m[i].dl;
+		bool		dom = false;
+		int			k;
+
+		for (k = 0; k < n && !dom; k++)
+			dom = imp[k].tf >= tf && imp[k].len <= dl;
+		if (!dom)
+			return false;
+	}
+	return r->n > 0 || n == 0;
 }
 
 /* Compare the chunk to the reference, fully. */
@@ -223,8 +258,16 @@ compare(const LionContainer *c, const Ref *r, Size itemsz)
 		i++;
 	}
 	CHECK(same && i == r->n, "counts-only iteration matches the reference");
+	CHECK(impacts_bound(c, r), "the impacts bound every member");
 	if (r->n > 0)
 	{
+		uint64		hl;
+
+		CHECK(!lion_poschunk_last(c, &hl) || hl == r->m[r->n - 1].code,
+			  "a recorded last code is the reference's last");
+		CHECK(lion_poschunk_last(c, &hl) ||
+			  r->m[r->n - 1].code - lion_pos_block_base(c->ckey) >= (uint64) LION_POS_LAST_UNKNOWN,
+			  "the last code is recorded wherever it fits");
 		CHECK(c->ckey <= lion_pos_block(r->m[0].code), "header block is a lower bound");
 		CHECK(lion_poschunk_last_code(c, &last) && last == r->m[r->n - 1].code,
 			  "last_code is the reference's last");
@@ -615,12 +658,73 @@ test_damaged(uint64 seed)
 	free(c);
 }
 
+/*
+ * Length codes round down by at most a sixteenth and give their own lengths
+ * back; impact pairs stay a front of at most LION_POS_NIMPACTS that bounds
+ * every member, whatever order the members come in.
+ */
+static void
+test_impacts(uint64 seed)
+{
+	LionContainer *c = new_buf();
+	Ref			r;
+	uint32		len;
+	uint32		code;
+	int			i;
+
+	phase("impacts");
+	for (len = 0; len <= 70000; len++)
+	{
+		uint32		cd = lion_pos_len_code(len);
+		uint32		v = lion_pos_len_value(cd);
+		uint32		capped = Min(len, (uint32) PG_UINT16_MAX);
+
+		if (cd > LION_POS_LEN_CODE_MAX || v > capped || (capped - v) * 16 > capped)
+		{
+			CHECK(false, "a length code rounds down by at most a sixteenth");
+			break;
+		}
+	}
+	for (code = 0; code <= LION_POS_LEN_CODE_MAX; code++)
+		CHECK(lion_pos_len_code(lion_pos_len_value(code)) == code,
+			  "a code's length has that code");
+	CHECK(lion_pos_len_code(PG_UINT16_MAX) == LION_POS_LEN_CODE_MAX,
+		  "65535 has the largest code");
+
+	rng_seed(seed);
+	ref_init(&r);
+	lion_poschunk_init(c, 3);
+	for (i = 0; i < 300; i++)
+	{
+		LionPosMember m;
+		LionPosImpact imp[LION_POS_NIMPACTS];
+		int			n;
+		int			k;
+		bool		front = true;
+
+		rand_member(&m, lion_pos_block_base(3) + 1 + rng_below(5000));
+		if (!lion_poschunk_insert(c, LION_CONTAINER_MAX_SIZE, &m, NULL))
+			break;
+		ref_put(&r, &m);
+		n = lion_poschunk_impacts(c, imp);
+		for (k = 1; k < n; k++)
+			front &= imp[k].tf < imp[k - 1].tf && imp[k].len < imp[k - 1].len;
+		CHECK(n >= 1 && n <= LION_POS_NIMPACTS && front,
+			  "the impacts are a front of one to four pairs");
+		CHECK(impacts_bound(c, &r), "the impacts bound every member inserted");
+	}
+	ref_free(&r);
+	free(c);
+}
+
 int
 main(void)
 {
 	uint64		s;
 
 	test_encoding();
+	for (s = 1; s <= 50; s++)
+		test_impacts(s * 31337);
 	for (s = 1; s <= 200; s++)
 		test_append_random(s);
 	for (s = 1; s <= 200; s++)

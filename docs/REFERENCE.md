@@ -272,7 +272,9 @@ match the query as a whole. A prefix lexeme (`foo:*`) cannot be ranked and is an
 NOT, where it does not score either. As in a search
 engine, the statistics count deleted rows until VACUUM removes them, and a backend keeps the mean
 row length it read until the row count moves by more than 1/64. Rows that cannot reach the top `k`
-are skipped (MaxScore), so a very common lexeme next to rarer ones costs little. Like the counts,
+are skipped: a lexeme's own maximum skips the rows of a very common lexeme next to rarer ones
+(MaxScore), and each block of a lexeme's rows records the most they can score, so blocks that
+cannot reach the top are stepped over even when every lexeme is common. Like the counts,
 `lion_bm25()` and `lion_bm25_score()` need SELECT on the table and refuse a table where row-level
 security applies to the caller: the statistics count every row, so a score would reveal what the
 hidden rows hold.

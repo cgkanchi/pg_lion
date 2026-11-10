@@ -485,8 +485,17 @@ lion_extract_internal(LionState *state, Datum value, Datum **keys,
 			*lp = (uint16) Min(rowlen, (uint32) PG_UINT16_MAX);
 			outpos[nout].npos = 1;
 			outpos[nout].pos = lp;
+
+			/* every key's chunk bounds its row by this length too */
+			for (j = 0; j <= nout; j++)
+				outpos[j].dl = *lp;
 		}
 		out[nout++] = PointerGetDatum(cstring_to_text_with_len("", 0));
+	}
+	else if (outpos != NULL)
+	{
+		for (j = 0; j < nout; j++)
+			outpos[j].dl = 0;
 	}
 
 	if (nout == 0)
@@ -1502,6 +1511,7 @@ lion_tsvector_positions(PG_FUNCTION_ARGS)
 	out = (LionKeyPositions *) palloc(sizeof(LionKeyPositions) * vector->size);
 	for (i = 0; i < vector->size; i++)
 	{
+		out[i].dl = 0;
 		if (we[i].haspos)
 		{
 			out[i].npos = (uint16) POSDATALEN(vector, &we[i]);
@@ -1993,6 +2003,7 @@ lion_posmember_from_key(LionPosMember *m, uint64 code,
 		n = j;
 	}
 	m->npos = (uint16) n;
+	m->dl = kp->dl;
 }
 
 

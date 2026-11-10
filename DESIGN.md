@@ -6960,8 +6960,11 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
 - **Chunks** (`lion_positions.[ch]`, item type `LION_CT_POSITIONS`): a key's members - one per
   row, its heap TID code and its tsvector positions with weights - varint-encoded in ascending
   code order, at most 4,104 bytes a chunk.  The header's `ckey` field holds a heap **block**, a
-  lower bound on the block of every member.  `test/unit/positions_test.c` checks every operation
-  against a brute-force reference and fuzzes damaged chunks.
+  lower bound on the block of every member; the payload's header records the last member's code
+  and the chunk's impacts ("Block bounds", under "Ranking" below).  A position tree's chunks are
+  filled to 512 bytes of members (`LION_POS_TREE_BYTES`), and a chunk of one member to what it
+  needs.  `test/unit/positions_test.c` checks every operation against a brute-force reference and
+  fuzzes damaged chunks.
 - **Position trees** (`lion_postree.c`): a posting tree (§22) whose pages carry
   `LION_PAGE_POSITIONS` and are stamped with the position tree's own head, whose leaf items are
   chunks, and whose keys are heap blocks.  Like a posting set it has no internal level while it has
@@ -7084,7 +7087,12 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     candidate's, so a count whose candidates lie close together - a copy's, a count of every
     row - decodes each member of its lexemes once, and one whose candidates lie further apart than
     a chunk holds decodes part of one at each: 1,606 to 1,703 members a seek, measured over trees
-    of 400,000 to 7.5 million members of one position (`LION_POS_SEEK_MEMBERS`, 1,650).  Each
+    of 400,000 to 7.5 million members of one position (`LION_POS_SEEK_MEMBERS`, 1,650).  That was
+    with chunks of half a page; with the 512-byte chunks of "Block bounds" (2026-11-10), over 2
+    million members on a release build, a seek to every 10,000th member costs what 385 members do
+    and one to every 1,000th 180, against 1,585 and 1,200 before on the same machine (a count of
+    `r & foo <-> bar`, `r` in one row of 1,000: 50 ms to 6.4 ms).  The price is left at 1,650,
+    about four times high: it errs towards the plans it chose before, which now run faster.  Each
     member decoded is `pg_lion.position_member_cost` (2.4 `cpu_operator_cost`), and each
     candidate `pg_lion.position_check_cost` (4.3) a lexeme beyond that, `TS_execute()` and its
     callbacks: 11.4 to 12.8 ns, the leaves a cursor steps and descends to included, and 21.6 ns
@@ -7299,9 +7307,75 @@ one part in 10^9 so a sum of them rounded down cannot pass for a score.
 This pays most when a common lexeme sits beside rarer ones: on a synthetic 500k-row benchmark, top
 10 for one very common lexeme and two rarer ones went from 41 ms to 16 ms. When every lexeme is
 common, each one's maximum is close to the scores at the top, nothing becomes non-essential, and
-the walk still reads every member. Block-max bounds (a maximum per chunk, not per lexeme) would
-skip whole chunks there, but need a maximum tf and a minimum length stored per chunk, which the
-format does not have.
+MaxScore alone reads every member: the block bounds below are for that case.
+
+**Block bounds** (2026-11-10).  A chunk's header bounds what its rows can score, so the walk
+bounds each lexeme by the chunk it is in, not by its lexeme-wide maximum (block-max indexes, Ding
+and Suel, here with MaxScore's essential split rather than WAND's pivot).
+
+- **The header** (`lion_positions.h`).  A position chunk's payload opens with its member bytes,
+  the last member's code as an offset from its header block's base (`LION_POS_LAST_UNKNOWN` for a
+  chunk with no member, or one whose last member is 2^32 codes or more past it), and four impact
+  pairs of bytes, (tf - 1, length code): 22 bytes where it was 10.  Every member is dominated by
+  a pair, its tf at most the pair's and its row's length at least the length the pair's code
+  stands for.  A term's score rises with tf and falls with the length for every `k1` of at least
+  0 and `b` from 0 to 1, so the best of the pairs bounds every row of the chunk whatever the
+  query's parameters - they are only known when it runs.  The length code is logarithmic,
+  sixteen steps an octave and rounded down (`lion_pos_len_code()`): codes 0 to 207 cover 0 to
+  65,535, each at most a sixteenth below the length.  The pairs are a Pareto front, tf
+  descending and length descending; a fifth is merged with its neighbour into the pair that
+  dominates both, the two neighbours whose merge costs least in length codes.
+- **Where the lengths come from.** The extraction knows a row's length, which it files under the
+  empty key ("Ranking" above), and sets it on every key of the row (`LionKeyPositions.dl`). The
+  build's spool carries it as one more uint16 after a member's positions, so a run that spills
+  and the parallel build's workers keep it, and inserts take it from the extraction; a build
+  that moves a key's members from its first chunk to a tree keeps their lengths beside them.  A
+  member written without its row's length (`dl` 0) would add the pair that dominates every
+  member, (tf 256, length 0), and its chunk would bound nothing below the lexeme's maximum.
+  VACUUM removes members and leaves the pairs, and a split gives both halves the whole chunk's:
+  bounds that are no longer tight, never wrong.  `lion_poschunk_check()` (and so verify) checks
+  the pairs' order, that no member has more positions than the largest tf allows, and the last
+  code; that a pair's length is at most its rows' is not checked.
+- **Chunk size.** A chunk of half a page held hundreds of a common lexeme's rows, whose best
+  bound was near the lexeme's maximum.  The build fills chunks to 512 bytes of members
+  (`LION_POS_TREE_BYTES`), a few dozen rows, and an insert splits a chunk past that; a chunk of
+  fewer than two members takes what it needs, up to a container.  On a synthetic 500k-row table
+  the index grew 2%.
+- **The walk** (`lion_bm25_topk()`).  The key space is cut into windows: each lexeme's cursor is
+  asked for its chunk at or after the window's start without decoding a member
+  (`lion_poscursor_chunk()`), and the window ends at the lowest last code among those chunks, so
+  within it every lexeme's rows are in that one chunk.  A lexeme's maximum in the window is its
+  chunk's bound, or 0 when the chunk starts past the window's end; MaxScore then runs on those
+  maxima as above, essential lexemes merged and the others sought, and a window whose maxima sum
+  to no more than the heap's worst is stepped over without a member read.  A lexeme whose chunk
+  does not record its last code is bounded by its maximum and ends no window.  Past 16 lexemes
+  (`LION_BM25_WINDOW_TERMS`) the walk is one window at every lexeme's maximum, as before.  A
+  cursor's seek also steps over chunks whose last code is below its target without decoding
+  them, which every position filter gets too.
+- **Exactness.** A row's score is still added up in `lion_bm25_score_row()`'s order, highest idf
+  first, whichever lexemes were essential, so it is the same float.  A row is left out only when
+  a bound says it cannot get in: a sum of bounds is nudged up a relative 1e-9 first
+  (`lion_bm25_cannot()`), far more than rounding takes off it and far less than two different
+  scores differ by.  `test/sql/bm25_blocks.sql` checks rows and scores against scoring every row,
+  bit for bit, after a build that spills, inserts, updates, deletes, VACUUM and a parallel
+  rebuild.
+- **Measured** (PostgreSQL 18.6 release build, warm, synthetic 500k documents of uniform length,
+  top 10 unless said; median ms, before against after):
+
+  | query | before | after |
+  |---|---|---|
+  | one common word | 24.3 | 1.7 |
+  | two common words, AND | 24.2 | 3.7 |
+  | a phrase of two common words | 23.7 | 4.7 |
+  | five common words, OR | 31.8 | 21.8 |
+  | three common words, top 100 | 31.3 | 18.1 |
+  | varied lengths, one common word | 21.2 | 3.2 |
+  | varied lengths, three common words | 33.3 | 24.0 |
+  | varied lengths, common and rare words | 5.6 | 1.6 |
+
+  "Before" already has the faster varint decoding of the same change; without it the first rows
+  took 39, 36 and 48 ms.  The more common words an OR has, the closer every window's sum of bounds
+  is to the top scores, and the less it skips.
 
 **The planner path.** `lion_bm25_score(doc, query, index, k1, b, col)` is the score of one row,
 computed from its tsvector with the N, df and avgdl of the index column `col` names, read once per

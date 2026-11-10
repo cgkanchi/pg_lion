@@ -420,7 +420,7 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * summaries (DESIGN.md §32), stored positions (§17), SLICE entries (§51) -
  * the meta page's words below say, not the version.
  */
-#define LION_VERSION			1
+#define LION_VERSION			2
 
 typedef struct LionMetaPageData
 {
@@ -1399,6 +1399,13 @@ extern uint16 lion_array_empty_flag(Datum value);
 typedef struct LionKeyPositions
 {
 	uint16		npos;
+
+	/*
+	 * The row's length, the empty key's one position (DESIGN.md §17,
+	 * "Ranking"), which lion_extract_value_pos() sets on every key of the row
+	 * for the chunks' impacts (lion_positions.h): 0 where it is not known.
+	 */
+	uint16		dl;
 	const uint16 *pos;
 } LionKeyPositions;
 
@@ -3022,6 +3029,9 @@ extern LionPosCursor *lion_poscursor_open(Relation index, LionState *col,
 extern const LionPosMember *lion_poscursor_next(Relation index,
 												LionPosCursor *cur,
 												uint64 code);
+extern const LionContainer *lion_poscursor_chunk(Relation index,
+												 LionPosCursor *cur,
+												 uint64 code, uint64 *id);
 extern void lion_poscursor_close(LionPosCursor *cur);
 
 extern LionPosFilter *lion_posfilter_begin(Relation index, LionState *col,
