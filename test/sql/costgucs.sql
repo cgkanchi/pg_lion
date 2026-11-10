@@ -143,6 +143,24 @@ SELECT lcg_cost(q, s, '0', sw) < lcg_cost(q, s, NULL, sw) AS lowered_cheaper,
 				'{enable_seqscan, off, enable_bitmapscan, off, pg_lion.enable_plain_scan, off}'::text[])) v(q, s, sw);
 SELECT lcg_plan('SELECT g, count(*) FROM lcg GROUP BY g', 'pg_lion.inline_entry_count_cost', NULL);
 SELECT lcg_plan('SELECT g, count(*) FROM lcg GROUP BY g', 'pg_lion.inline_entry_count_cost', '5000');
+-- INLINE as the entries were written: under the inline_limit the index's
+-- meta page records, not the reloption, which may say another until a
+-- REINDEX.  Set to 64 bytes, lcg_g's entries are INLINE still and priced so;
+-- rebuilt under it they are CHAIN, and only entry_count_cost prices them.
+ALTER INDEX lcg_g SET (inline_limit = 64);
+SELECT lcg_cost(q, s, '100', sw) > lcg_cost(q, s, NULL, sw) AS inline_until_reindex
+  FROM (VALUES ('SELECT g, count(*) FROM lcg GROUP BY g',
+				'pg_lion.inline_entry_count_cost',
+				'{enable_seqscan, off, enable_bitmapscan, off, pg_lion.enable_plain_scan, off}'::text[])) v(q, s, sw);
+REINDEX INDEX lcg_g;
+SELECT lcg_cost(q, s, '100', sw) = lcg_cost(q, s, NULL, sw) AS chain_unpriced,
+	   lcg_cost(q, 'pg_lion.entry_count_cost', '100', sw) >
+	   lcg_cost(q, 'pg_lion.entry_count_cost', NULL, sw) AS chain_entry_priced
+  FROM (VALUES ('SELECT g, count(*) FROM lcg GROUP BY g',
+				'pg_lion.inline_entry_count_cost',
+				'{enable_seqscan, off, enable_bitmapscan, off, pg_lion.enable_plain_scan, off}'::text[])) v(q, s, sw);
+ALTER INDEX lcg_g RESET (inline_limit);
+REINDEX INDEX lcg_g;
 
 -- The FK-side join's (DESIGN.md §27): each count, one per dimension row.  At
 -- its default the node counts the region's hundred rows' keys; at a hundred

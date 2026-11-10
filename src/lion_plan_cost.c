@@ -4286,7 +4286,8 @@ lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
 	 * up over one, and its leaf is read once with the entries beside it
 	 * (lion_group_walk_fill(); the sum over every entry of §14, priced as
 	 * this walk, has always read it so): LION_INLINE_ENTRY_COUNT_COST,
-	 * judged by its set's bytes as lion_cost_notnull() judges an entry's.
+	 * judged by its set's bytes against the INLINE limit the index's
+	 * entries were written under (its meta page's).
 	 */
 	if (c->distinct == LION_DISTINCT_NONE && c->rangevar == NULL)
 	{
@@ -4296,7 +4297,7 @@ lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
 			entry = LION_LIST_GROUP_COST;
 		else if (!c->whereonce && c->topk <= 0.0 &&
 				 lion_set_pages_for(gm, keys[c->nsrc]) * BLCKSZ <=
-				 (double) LION_DEFAULT_INLINE_LIMIT)
+				 lion_index_inline_limit(c->root, c->groupidx))
 			entry = LION_INLINE_ENTRY_COUNT_COST;
 		c->merge_cpu += c->walked * entry;
 	}

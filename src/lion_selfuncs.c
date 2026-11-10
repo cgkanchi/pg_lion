@@ -5239,6 +5239,7 @@ typedef struct LionNdistinctIndex
 	Oid			indexoid;
 	bool		have;			/* the meta page carries counts at all */
 	LionMetaNdistinct nd;
+	uint32		inline_limit;	/* the meta page's (lion_index_inline_limit()) */
 } LionNdistinctIndex;
 
 /*
@@ -5314,10 +5315,26 @@ lion_nd_index(LionNdistinctCache *cache, Oid indexoid)
 	MemoryContextSwitchTo(oldcxt);
 
 	index = index_open(indexoid, NoLock);
-	ent->have = lion_read_meta_ndistinct(index, &ent->nd);
+	ent->have = lion_read_meta_counts(index, &ent->nd, &ent->inline_limit);
 	index_close(index, NoLock);
 
 	return ent;
+}
+
+/*
+ * The INLINE limit idx's entries were written under, in bytes: its meta
+ * page's, as this planner run read it - the reloption may say another until
+ * a REINDEX - or LION_DEFAULT_INLINE_LIMIT for a hypothetical index, which
+ * has no page to read.
+ */
+double
+lion_index_inline_limit(PlannerInfo *root, IndexOptInfo *idx)
+{
+	LionNdistinctCache *cache = lion_nd_cache_for(root);
+
+	if (idx == NULL || idx->relam != cache->amoid || idx->hypothetical)
+		return (double) LION_DEFAULT_INLINE_LIMIT;
+	return (double) lion_nd_index(cache, idx->indexoid)->inline_limit;
 }
 
 /*

@@ -2485,21 +2485,22 @@ Planner integration
     container the driving source reads and counts, `LION_CONTAINER_COST` and `LION_MEMBER_COST` a
     member up to a bitset's worth; each probe of another source at the driver's container keys,
     `LION_PROBE_COST` (`LION_MEMORY_PROBE_COST` into a copy in memory) and `LION_AND_MEMBER_COST` a
-    member of the running intersection; the k'th source sought only at the keys the first k - 1
-    left a row at. A source's containers are `Min(heap_pages / LION_BLOCKS_PER_CONTAINER, its
-    members)` when its column's values are scattered, and its rows' share of the container keys
-    when it is stored in value order, interpolated by the correlation's square
-    (`lion_key_containers()`). A GROUP BY runs one merge per ENTRY of its column - every entry is
-    counted, whatever the WHERE leaves of it - with the entry's own set as a source, and one per
-    pair of two columns (§20), plus each count's set-up, `LION_ENTRY_COUNT_COST`
-    (`LION_LIST_GROUP_COST` for a group of an IN list that drives them, and
-    `LION_INLINE_ENTRY_COUNT_COST` for an entry small enough to be INLINE in a walk counted one entry
-    at a time, §28 "A walk that returns rows", or in the sum over every entry of §14), and each set of a union
-    source rebuilt at every count, `LION_UNION_SET_COST`. Before, every container was two
-    cpu_operator_cost whatever it held, members and probes were free, and a group was charged the
-    containers of its share of the WHERE's rows rather than of its own set. Since 2026-10-20 a
-    bitmap container is priced by its words, an ARRAY looked up in one by a bit a member, and a
-    seek that stays on its leaf as a step ("Dense sources" below);
+    member of the running intersection; the k'th source sought only at the keys the first k - 1 left
+    a row at. A source's containers are `Min(heap_pages / LION_BLOCKS_PER_CONTAINER, its members)`
+    when its column's values are scattered, and its rows' share of the container keys when it is
+    stored in value order, interpolated by the correlation's square (`lion_key_containers()`). A
+    GROUP BY runs one merge per ENTRY of its column - every entry is counted, whatever the WHERE
+    leaves of it - with the entry's own set as a source, and one per pair of two columns (§20), plus
+    each count's set-up, `LION_ENTRY_COUNT_COST` (`LION_LIST_GROUP_COST` for a group of an IN list
+    that drives them, and `LION_INLINE_ENTRY_COUNT_COST` for an entry small enough to be INLINE -
+    under the inline_limit its index's meta page records, which the reloption may no longer say
+    until a REINDEX - in a walk counted one entry at a time, §28 "A walk that returns rows", or in
+    the sum over every entry of §14), and each set of a union source rebuilt at every count,
+    `LION_UNION_SET_COST`. Before, every container was two cpu_operator_cost whatever it held,
+    members and probes were free, and a group was charged the containers of its share of the WHERE's
+    rows rather than of its own set. Since 2026-10-20 a bitmap container is priced by its words, an
+    ARRAY looked up in one by a bit a member, and a seek that stays on its leaf as a step ("Dense
+    sources" below);
   - **the union of an IN list**, cpu_operator_cost × members × log2(nelems): a merge of k sets costs
     that per member however it is organised (§15 builds the k-way one), and a single-key clause with
     k = 1 pays nothing for a merge it does not make;
@@ -16794,29 +16795,31 @@ batch that still holds INLINE copies drops them with their pin, and the next cal
 again from the last entry handed out. A batch of CHAIN copies survives the pause. The node's located
 sets give their pins up at the same point (§15, "Paused and finished counts").
 
-So the GROUP BY's walk does not hand a row up while the batch still holds an INLINE copy (2026-11-10,
-`lion_group_walk_fill()`). It takes the next entry and counts it, as it always did, and then every
-entry after it up to the batch's last INLINE copy (`lion_entry_scan_pinned_left()`), each counted
-under its own pin as soon as it is taken and its set released; their keys and counts wait in the
-batch of rows (`gbkey`, `gbcount`) and go up one a call. When the first of them goes up the last
-INLINE copy has been handed out and its pin let go of, so the pause has nothing to drop, and the CHAIN
-copies after it stay in the batch. Until then a GROUP BY over INLINE entries - any column of more
-than a few thousand values - read a leaf per group: 993,227 directory pages for the 993k groups of an
-unfiltered `GROUP BY` over a 5M-row table whose index has 6,725 leaves, and about half its time. It
-now reads 6,728, and the walk takes 0.73 s instead of 2.0 (PostgreSQL 18.7, release build); a
-2M-row table's GROUP BY of a unique column went from 3.6 s to 0.79, one of four rows a key from
-0.94 s to 0.29. A count is made earlier than it was - before the previous group's row goes up
-rather than after - under the same snapshot, by `lion_group_count()` as before, so the answers are
-the same: the WHERE may still hold its pins then, which no count needs, and it is collected when
+So the GROUP BY's walk does not hand a row up while the batch still holds an INLINE copy
+(2026-11-10, `lion_group_walk_fill()`). It takes the next entry and counts it, as it always did, and
+then every entry after it up to the batch's last INLINE copy (`lion_entry_scan_pinned_left()`), each
+counted under its own pin as soon as it is taken and its set released; their keys and counts wait in
+the batch of rows (`gbkey`, `gbcount`) and go up one a call. When the first of them goes up the last
+INLINE copy has been handed out and its pin let go of, so the pause has nothing to drop, and the
+CHAIN copies after it stay in the batch. Until then a GROUP BY over INLINE entries - any column of
+more than a few thousand values - read a leaf per group: 993,227 directory pages for the 993k groups
+of an unfiltered `GROUP BY` over a 5M-row table whose index has 6,725 leaves, and about half its
+time. It now reads 6,728, and the walk takes 0.73 s instead of 2.0 (PostgreSQL 18.7, release build);
+a 2M-row table's GROUP BY of a unique column went from 3.6 s to 0.79, one of four rows a key from
+0.94 s to 0.29. A count is made earlier than it was - before the previous group's row goes up rather
+than after - under the same snapshot, by `lion_group_count()` as before, so the answers are the
+same: the WHERE may still hold its pins then, which no count needs, and it is collected when
 `lion_group_count()` decides. The count that collects it ends the fill: the groups after it are
 counted in batches as before, and the leaf it stood on is read once more for them, once a walk.
-GROUP BY coalesce(g, c) adds the NULL entry's and c's counts into its one group there. A CHAIN entry with no INLINE copy after it is
-taken alone, so nothing is counted ahead that a pause would have kept, and that a LIMIT above may
-never ask for. The WHERE collected and its groups counted in batches (§10, "The groups of a walk,
-counted together") never paused within a batch, and is unchanged. `directory.sql` §20 checks that
-such walks read each leaf once - with no WHERE, a HAVING, coalesce, a WHERE collected and one never
-collected, over leaves that mix INLINE and CHAIN entries - and `countpause.sql` that they pin
-nothing while paused.
+GROUP BY coalesce(g, c) adds the NULL entry's and c's counts into its one group there. A CHAIN entry
+with no INLINE copy after it is taken alone, so nothing is counted ahead that a pause would have
+kept, and that a LIMIT above may never ask for. The WHERE collected and its groups counted in
+batches (§10, "The groups of a walk, counted together") never paused within a batch, and is
+unchanged. `directory.sql` §20 checks that such walks read fewer than two directory pages a leaf -
+each leaf once, with the root, the WHERE index's pages and, once a WHERE is collected, the leaf the
+fill stopped on read again besides (a read a group, as before, is 3,600 reads over its 20 leaves) -
+with no WHERE, a HAVING, coalesce, a WHERE collected and one never collected, over leaves that mix
+INLINE and CHAIN entries; and `countpause.sql` that they pin nothing while paused.
 The sums never pause: the sum over a range, the sum-over-all of §14, the count(DISTINCT) walk of §26
 and `lion_index_count_group_stats()` each walk to the end within one call. §28's pinned-GROUP-BY
 test (`range.sql` §14, at most one leaf pinned) holds as before.
