@@ -2493,8 +2493,10 @@ Planner integration
     counted, whatever the WHERE leaves of it - with the entry's own set as a source, and one per
     pair of two columns (§20), plus each count's set-up, `LION_ENTRY_COUNT_COST`
     (`LION_LIST_GROUP_COST` for a group of an IN list that drives them, and
-    `LION_INLINE_ENTRY_COUNT_COST` for an entry small enough to be INLINE in a walk counted one entry
-    at a time, §28 "A walk that returns rows", or in the sum over every entry of §14), and each set of a union
+    `LION_INLINE_ENTRY_COUNT_COST` for an entry small enough to be INLINE - under the inline_limit
+    the index's meta page records, which an `ALTER INDEX ... SET` leaves as it was until REINDEX - in a
+    walk counted one entry at a time, §28 "A walk that returns rows", or in the sum over every entry
+    of §14), and each set of a union
     source rebuilt at every count, `LION_UNION_SET_COST`. Before, every container was two
     cpu_operator_cost whatever it held, members and probes were free, and a group was charged the
     containers of its share of the WHERE's rows rather than of its own set. Since 2026-10-20 a
@@ -16814,9 +16816,10 @@ GROUP BY coalesce(g, c) adds the NULL entry's and c's counts into its one group 
 taken alone, so nothing is counted ahead that a pause would have kept, and that a LIMIT above may
 never ask for. The WHERE collected and its groups counted in batches (§10, "The groups of a walk,
 counted together") never paused within a batch, and is unchanged. `directory.sql` §20 checks that
-such walks read each leaf once - with no WHERE, a HAVING, coalesce, a WHERE collected and one never
-collected, over leaves that mix INLINE and CHAIN entries - and `countpause.sql` that they pin
-nothing while paused.
+such walks read fewer than two directory pages a leaf - with no WHERE, a HAVING, coalesce, a WHERE
+collected and one never collected, over leaves that mix INLINE and CHAIN entries - rather than one
+a group; the bound leaves room for the descent's pages and for the leaf a collected WHERE reads
+again, above. `countpause.sql` checks that they pin nothing while paused.
 The sums never pause: the sum over a range, the sum-over-all of §14, the count(DISTINCT) walk of §26
 and `lion_index_count_group_stats()` each walk to the end within one call. §28's pinned-GROUP-BY
 test (`range.sql` §14, at most one leaf pinned) holds as before.
@@ -19470,8 +19473,8 @@ each, and the answer's members taken out at each key the entry has. Or, where th
 choice would walk the column (`lion_scan_notnull_walks()`: a scalar column, beside sets with no
 range or long list), the walk, made from the statistics as the executor makes it from the
 directory: the NULL entry from the null fraction, the walk from the column's `ndistinct` entries
-of the other rows, an entry small enough to be INLINE (`LION_DEFAULT_INLINE_LIMIT`) its bytes of
-the leaves and any other its pages, once per window. A lone `IS NOT NULL` walks its column, which
+of the other rows, an entry small enough to be INLINE (under the index's own `inline_limit`, off
+its meta page) its bytes of the leaves and any other its pages, once per window. A lone `IS NOT NULL` walks its column, which
 the full walk's price already covers. The plain scan no longer counts as rechecking for it
 (`lion_plain_scan_shape()`), and `lion_path_rechecked_quals()` names what a plain scan's source
 does leave to the recheck, for §40.3. `indexscan.sql`'s plan pins, `a IS NOT NULL AND b = 5`'s

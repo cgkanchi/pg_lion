@@ -94,6 +94,23 @@ lion_index_dir_pages(IndexOptInfo *idx, double *height)
 }
 
 /*
+ * The largest posting set, in bytes, that an entry of idx keeps INLINE: the
+ * inline_limit its meta page records, read through its cached state.  That
+ * is the limit its entries were written under; the reloption may differ from
+ * it until the next REINDEX.
+ */
+double
+lion_index_inline_limit(IndexOptInfo *idx)
+{
+	Relation	indexrel = index_open(idx->indexoid, AccessShareLock);
+	double		limit;
+
+	limit = (double) lion_get_index_state(indexrel)->meta.inline_limit;
+	index_close(indexrel, AccessShareLock);
+	return limit;
+}
+
+/*
  * A clause of rel's as lion's cost model hands it to core's selectivity
  * functions, which it asks with varRelid 0: the clause itself where it is of
  * rel alone, and a join clause - `fk = outer.pk`, taken as a parameterized
@@ -1619,8 +1636,9 @@ lion_null_entry_pages(double members, double containers, double others)
  * NULL entry's pages from the column's null fraction, in the form it takes
  * (lion_null_entry_pages()), and the walk's from its ndistinct entries of
  * the other rows: a descent to the column's first leaf, an entry small
- * enough to be INLINE (LION_DEFAULT_INLINE_LIMIT) its bytes of the leaves
- * and any other its pages, a page at least - once per window
+ * enough to be INLINE (under the index's own inline_limit,
+ * lion_index_inline_limit()) its bytes of the leaves and any other its
+ * pages, a page at least - once per window
  * (lion_walk_window()) of as many container keys as the NULL entry has, as
  * the executor counts them.  The walk is priced as those pages read in order
  * and a descent an entry.
@@ -1670,7 +1688,7 @@ lion_cost_notnull(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 													lion_containers_for(heap_pages,
 																		perentry));
 		double		walk = 1.0 + entries *
-			((entrypages * BLCKSZ <= (double) LION_DEFAULT_INLINE_LIMIT) ?
+			((entrypages * BLCKSZ <= lion_index_inline_limit(idx)) ?
 			 entrypages : Max(1.0, entrypages));
 		double		windows = Max(1.0, ceil(sc.containers /
 										  (double) lion_walk_window()));
@@ -4286,7 +4304,8 @@ lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
 	 * up over one, and its leaf is read once with the entries beside it
 	 * (lion_group_walk_fill(); the sum over every entry of §14, priced as
 	 * this walk, has always read it so): LION_INLINE_ENTRY_COUNT_COST,
-	 * judged by its set's bytes as lion_cost_notnull() judges an entry's.
+	 * judged by its set's bytes against the grouping index's own inline_limit
+	 * (lion_index_inline_limit()), as lion_cost_notnull() judges an entry's.
 	 */
 	if (c->distinct == LION_DISTINCT_NONE && c->rangevar == NULL)
 	{
@@ -4296,7 +4315,7 @@ lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
 			entry = LION_LIST_GROUP_COST;
 		else if (!c->whereonce && c->topk <= 0.0 &&
 				 lion_set_pages_for(gm, keys[c->nsrc]) * BLCKSZ <=
-				 (double) LION_DEFAULT_INLINE_LIMIT)
+				 lion_index_inline_limit(c->groupidx))
 			entry = LION_INLINE_ENTRY_COUNT_COST;
 		c->merge_cpu += c->walked * entry;
 	}
