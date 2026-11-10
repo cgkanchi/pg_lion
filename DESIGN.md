@@ -34400,3 +34400,68 @@ and VACUUM, the plans and `EXPLAIN ANALYZE`'s counters, and the declines: a leaf
 not slice the column, until pruning leaves it out, and the switch); `slices_range.sql`'s
 partitioned table now answered; and the isolation spec `slices_partitioned.spec` with a count and a
 sum under a range from slices beside the aggregates.
+
+## 54. Day filters as ranges (2026-11-10)
+
+`count(*) ... WHERE ts::date = '2026-03-05'`, `WHERE date_trunc('day', ts) = '2026-03-05'` and
+`WHERE ts::date BETWEEN '2026-03-01' AND '2026-03-07'` read every row: a function of the column is
+in no operator family, lion's or a B-tree's, and the plan was a sequential scan (192 to 254 ms on 2M
+rows against 1 to 2 ms for the same counts written as ranges of `ts`). For a `timestamp` column
+they are ranges of `ts`, and are now planned as those ranges (`lion_plan_dayrange.c`).
+
+**Why it is exact.** `ts::date` (`date(timestamp)`) and `date_trunc(unit, ts)` of a `timestamp
+without time zone` are immutable and monotone - never smaller for a larger `ts` - and constant over
+buckets `[A, N(A))`, a day for the cast and the unit's bucket for `date_trunc()`. With `[A, N)` the
+bucket of the constant `c`:
+
+| clause | is |
+|---|---|
+| `f(ts) = c` | `ts >= A AND ts < N` (when `f(A) = c`; a `c` inside a bucket equals no `f(ts)`, left alone) |
+| `f(ts) < c` | `ts < A` when `c` is its bucket's value, else `ts < N` |
+| `f(ts) <= c` | `ts < N` |
+| `f(ts) > c` | `ts >= N` |
+| `f(ts) >= c` | `ts >= A` when `c` is its bucket's value, else `ts >= N` |
+
+and the constant on the left is the same with the strategy commuted. `f` of an infinite `ts` is the
+infinite value of the result type, which compares with `c` as `ts` compares with the bounds, and both
+sides are NULL exactly when `ts` is. So the replacement has the clause's value for every row, and is
+made wherever the clause is in a qual: under OR, inside `IS NOT TRUE` or a CASE, in an outer join's
+`ON` clause.
+
+`A` and `N` are computed from the constant at plan time, and checked against the function rather
+than assumed: `A = date_trunc(unit, c)`, `N = A + one step of the unit` (a microsecond up to a
+millennium, a week seven days, a quarter three months), and the bucket is taken only if
+`date_trunc(unit, N) = N` and `date_trunc(unit, N - 1 microsecond) = A`. For the cast, `A` and `N`
+are the timestamps of `c` and `c + 1`, computed as `date2timestamp()` does once `c` is checked to
+lie inside `timestamp`'s range. A constant within two
+thousand years of either end of `timestamp`'s range, an infinite one, or a date past that range is
+left alone, so that computing a bound never raises an error the clause itself would not.
+
+**Where.** The query's quals are rewritten in place, once for each base relation, from the hook
+after `get_relation_info()` (`lion_get_relation_info()`, `build_simple_rel_hook` from 19): it runs
+from `add_base_rels_to_query()`, before `deconstruct_jointree()` makes RestrictInfos of the quals,
+so every estimate, path, EquivalenceClass and partition pruning step after it sees the ranges, and
+the plan shows them (`ts >= '...' AND ts < '...'`). The jointree's quals are implicit-AND lists by
+then (`preprocess_qual_conditions()`), and a top-level member that becomes two clauses becomes two
+members, as if written so; elsewhere it is an AND. Nothing else of the jointree changes, so the
+walk `add_base_rels_to_query()` is in the middle of is undisturbed. An appendrel child's quals are
+its parent's, translated after this, and are not looked at.
+
+**Which relations.** Only a column with a lion index key on it (a plain column, `timestamp`), and
+only a clause no index of the relation has as an expression key - an expression index on
+`(ts::date)` keeps its clause. A table without lion keeps PostgreSQL's plans as they were.
+Only constants: a generic plan's `$1`, `current_date` and other stable expressions are left as
+written, since the bound's conversion could then fail at run time where the clause does not.
+`pg_lion.enable_date_ranges` (on) turns it off.
+
+**Not done.** `timestamptz` columns: the cast and the two-argument `date_trunc()` depend on the
+session's time zone, and a day of some zones' clocks is not one range - the clocks of St. John's,
+Moncton and Goose Bay stepped back across midnight every autumn from 1987 to 2010, and Alaska's by
+a whole day in 1867 - so the exact set is a union of ranges known only at run time. IN lists of
+days, `<>`, and a comparison across types (`ts::date = timestamp '...'`) are left as written.
+
+Tests: `test/sql/dayrange.sql` (every comparison with the constant on either side, every unit on and inside a
+bucket's edge, BC buckets, infinities, NULLs, the clause under OR, NOT, `IS NOT TRUE`, CASE and an
+outer join's `ON`, the declines, an expression index, a table without lion, a partitioned table
+pruned by the range, and a generic plan), each against the same query with the rewrite off and
+sequential scans only.

@@ -1121,6 +1121,15 @@ working around a bad choice:
   key the visibility map vouches for, in one pass of the bit-plane kernel (`lion_planes_count_strided()`,
   DESIGN.md §50, §52). Off, each slice's container is ANDed with the `WHERE` and counted on its own;
   the answers are the same.
+- `pg_lion.enable_date_ranges`: plan `ts::date <op> constant` and `date_trunc(unit, ts) <op>
+  constant`, with `<op>` one of `=`, `<`, `<=`, `>`, `>=` and the constant on either side, over a
+  `timestamp` column with a lion index, as the range of `ts` they are (`ts::date = '2026-03-05'` is
+  `ts >= '2026-03-05' AND ts < '2026-03-06'`), which every index of `ts` and partition pruning
+  answer (DESIGN.md §54). EXPLAIN shows the range. Off, the clause is left as written. Also left as
+  written: `timestamptz` columns; a constant that is infinite or within 2000 years of either end of
+  `timestamp`'s range; parameters and stable expressions such as `current_date`; `<>`, IN lists and
+  comparisons across types (`ts::date = timestamp '...'`); `date_trunc()` with a unit that isn't a
+  constant; and a clause some index has as an expression key.
 - `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot
