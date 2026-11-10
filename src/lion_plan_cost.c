@@ -4279,11 +4279,27 @@ lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
 	 * ... and each count's own set-up and tear-down (a memory context,
 	 * the sources' cursors, the visibility-map state): a distinct
 	 * walk's test prices it (LION_DISTINCT_TEST_COST, below), a range's
-	 * walk its entry (LION_RANGE_ENTRY_COST).
+	 * walk its entry (LION_RANGE_ENTRY_COST).  A count of the walk one
+	 * entry at a time - no copy of the WHERE to count the groups against
+	 * together, nor the top k's candidates, each looked up - of an entry
+	 * small enough to be INLINE reads no posting page and sets no cursor
+	 * up over one, and its leaf is read once with the entries beside it
+	 * (lion_group_walk_fill(); the sum over every entry of §14, priced as
+	 * this walk, has always read it so): LION_INLINE_ENTRY_COUNT_COST,
+	 * judged by its set's bytes as lion_cost_notnull() judges an entry's.
 	 */
 	if (c->distinct == LION_DISTINCT_NONE && c->rangevar == NULL)
-		c->merge_cpu += c->walked * (c->groupdrive ? LION_LIST_GROUP_COST :
-									 LION_ENTRY_COUNT_COST);
+	{
+		Cost		entry = LION_ENTRY_COUNT_COST;
+
+		if (c->groupdrive)
+			entry = LION_LIST_GROUP_COST;
+		else if (!c->whereonce && c->topk <= 0.0 &&
+				 lion_set_pages_for(gm, keys[c->nsrc]) * BLCKSZ <=
+				 (double) LION_DEFAULT_INLINE_LIMIT)
+			entry = LION_INLINE_ENTRY_COUNT_COST;
+		c->merge_cpu += c->walked * entry;
+	}
 }
 
 /*
