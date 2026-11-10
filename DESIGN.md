@@ -34765,9 +34765,27 @@ backend's buffered rows and leave them buffered past the end of a statement, as 
 calls `index_insert_cleanup()` would.
 
 **Measured** (PostgreSQL 18.7, release build, custom WAL resource manager, 4 cores; pgbench, each
-transaction one INSERT of 200 rows; thousands of rows a second, medians of three 10-second runs):
+transaction one INSERT of 200 rows unless it says otherwise; thousands of rows a second, medians of
+three 10-second runs, and the milliseconds a statement took). An empty table with one lion index on
+a column of two values:
 
-(to follow)
+| clients | main | batched | | per statement, main | batched | B-tree, main |
+|---|---|---|---|---|---|---|
+| 1 | 353 | 467 | 1.3× | 0.57 ms | 0.43 ms | 466 |
+| 2 | 160 | 802 | 5.0× | 2.5 ms | 0.50 ms | |
+| 4 | 124 | 916 | 7.4× | 6.4 ms | 0.87 ms | 579 |
+| 8 | 152 | 895 | 5.9× | 10.5 ms | 1.8 ms | |
+
+Four writers now load 2× what one does, where they loaded a third of it, and more than a B-tree on
+the same column. A table of a million rows with eight single-column lion indexes, from two values
+to a million (the same 200-row INSERTs into all eight): 1.08× at one client (48.7 → 52.6), 1.25× at
+two (64.1 → 80.2), 1.51× at four (76.8 → 115.9); its high-cardinality indexes, whose rows each find
+their own entry, gain nothing and bound it. No change past the noise: a key of ten million values
+at one and four clients (219 and 740, run to run ±5%), one-row INSERTs (16 and 111-119), and
+`batch_inserts = off` against main. Index sizes after the same 500 seeded statements, batched
+against row by row: ten million values 619 / 617 pages, a thousand values 57 / 62, ascending keys
+449 / 449; the two-value index 8 / 10 pages and the eight indexes 5,887 / 5,916 after 500 random
+statements each.
 
 **Not done.** Columns with positions, summaries and slices are written row by row; batching them
 needs their own posting-set steps sorted and held the same way. A one-row statement gains nothing,
