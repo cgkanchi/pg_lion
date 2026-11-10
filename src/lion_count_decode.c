@@ -550,18 +550,7 @@ lion_count_groups_decode(Relation heap, Snapshot snapshot, int ncol,
 	base.cxt = cxt;
 	base.heap = heap;
 	base.snapshot = snapshot;
-	base.vmbuf = InvalidBuffer;
-	if (cache != NULL && BufferIsValid(cache->vmbuf))
-	{
-		if (cache->vmrelid == RelationGetRelid(heap))
-		{
-			base.vmbuf = cache->vmbuf;
-			cache->vmbuf = InvalidBuffer;
-			cache->vmrelid = InvalidOid;
-		}
-		else
-			lion_vis_cache_release_vm(cache);
-	}
+	lion_vis_cache_take_vm(cache, heap, &base.vm);
 	base.serializable = IsolationIsSerializable();
 	base.in_recovery = RecoveryInProgress();
 	base.rel_read_only = rel_read_only;
@@ -609,7 +598,7 @@ lion_count_groups_decode(Relation heap, Snapshot snapshot, int ncol,
 	for (c = 0; c < ncol; c++)
 	{
 		ccx[c] = base;
-		ccx[c].vmbuf = InvalidBuffer;
+		lion_vm_pins_init(&ccx[c].vm);
 		ccx[c].droppins = (c > 0);
 		for (v = 0; v < radix[c]; v++)
 		{
@@ -782,12 +771,12 @@ lion_count_groups_decode(Relation heap, Snapshot snapshot, int ncol,
 			else
 			{
 				allvis = lion_vm_allvisible_mask(heap, firstblk, wanted,
-												 &base.vmbuf,
+												 &base.vm,
 												 &base.stats.vm_pins);
 				base.stats.vm_checks++;
 #ifdef LION_VM_MASK_CHECK
 				lion_vm_mask_check(heap, firstblk, wanted, allvis,
-								   &base.vmbuf);
+								   &base.vm);
 #endif
 			}
 
@@ -887,20 +876,8 @@ lion_count_groups_decode(Relation heap, Snapshot snapshot, int ncol,
 			lion_count_stats_add(stats, &ccx[c].stats);
 	}
 	for (c = 0; c < ncol; c++)
-	{
-		if (BufferIsValid(ccx[c].vmbuf))
-			ReleaseBuffer(ccx[c].vmbuf);
-	}
-	if (BufferIsValid(base.vmbuf))
-	{
-		if (cache != NULL && !BufferIsValid(cache->vmbuf))
-		{
-			cache->vmbuf = base.vmbuf;
-			cache->vmrelid = RelationGetRelid(heap);
-		}
-		else
-			ReleaseBuffer(base.vmbuf);
-	}
+		lion_vm_pins_release(&ccx[c].vm);
+	lion_vis_cache_keep_vm(cache, heap, &base.vm);
 	dstats->spills += tally->nspills;
 	tally->nspills = 0;
 
@@ -912,7 +889,11 @@ lion_count_groups_decode(Relation heap, Snapshot snapshot, int ncol,
  * Counts by cells
  * --------------------------------------------------------------------- */
 
-/* Do the keys whose bits mask holds satisfy tree n, an AND and OR of keys? */
+/*
+ * Do the keys whose bits mask holds satisfy tree n, an AND and OR of keys, or
+ * an ANDNOT - `a & !b` (lion_tsquery_tree()) - its first child's keys and
+ * none of the others'?
+ */
 static bool
 lion_cells_tree(const LionKeyNode *n, uint64 mask)
 {
@@ -920,6 +901,15 @@ lion_cells_tree(const LionKeyNode *n, uint64 mask)
 
 	switch (n->kind)
 	{
+		case LION_KN_ANDNOT:
+			if (!lion_cells_tree(n->args[0], mask))
+				return false;
+			for (i = 1; i < n->nargs; i++)
+			{
+				if (lion_cells_tree(n->args[i], mask))
+					return false;
+			}
+			return true;
 		case LION_KN_KEY:
 			Assert(n->keyno >= 0 && n->keyno < 63);
 			return (mask & (UINT64CONST(1) << n->keyno)) != 0;
@@ -1146,18 +1136,7 @@ lion_count_cells(Relation heap, Snapshot snapshot,
 	base.cxt = cxt;
 	base.heap = heap;
 	base.snapshot = snapshot;
-	base.vmbuf = InvalidBuffer;
-	if (cache != NULL && BufferIsValid(cache->vmbuf))
-	{
-		if (cache->vmrelid == RelationGetRelid(heap))
-		{
-			base.vmbuf = cache->vmbuf;
-			cache->vmbuf = InvalidBuffer;
-			cache->vmrelid = InvalidOid;
-		}
-		else
-			lion_vis_cache_release_vm(cache);
-	}
+	lion_vis_cache_take_vm(cache, heap, &base.vm);
 	base.serializable = IsolationIsSerializable();
 	base.in_recovery = RecoveryInProgress();
 	base.rel_read_only = rel_read_only;
@@ -1207,10 +1186,10 @@ lion_count_cells(Relation heap, Snapshot snapshot,
 
 	/* the driver's cursors keep their pins; the labels' let go of each page */
 	dcx = base;
-	dcx.vmbuf = InvalidBuffer;
+	lion_vm_pins_init(&dcx.vm);
 	dcx.droppins = false;
 	lcx = base;
-	lcx.vmbuf = InvalidBuffer;
+	lion_vm_pins_init(&lcx.vm);
 	lcx.droppins = true;
 	for (v = 0; v < nd; v++)
 	{
@@ -1497,12 +1476,12 @@ lion_count_cells(Relation heap, Snapshot snapshot,
 			else
 			{
 				allvis = lion_vm_allvisible_mask(heap, firstblk, wanted,
-												 &base.vmbuf,
+												 &base.vm,
 												 &base.stats.vm_pins);
 				base.stats.vm_checks++;
 #ifdef LION_VM_MASK_CHECK
 				lion_vm_mask_check(heap, firstblk, wanted, allvis,
-								   &base.vmbuf);
+								   &base.vm);
 #endif
 			}
 
@@ -1584,20 +1563,9 @@ lion_count_cells(Relation heap, Snapshot snapshot,
 		lion_count_stats_add(stats, &dcx.stats);
 		lion_count_stats_add(stats, &lcx.stats);
 	}
-	if (BufferIsValid(dcx.vmbuf))
-		ReleaseBuffer(dcx.vmbuf);
-	if (BufferIsValid(lcx.vmbuf))
-		ReleaseBuffer(lcx.vmbuf);
-	if (BufferIsValid(base.vmbuf))
-	{
-		if (cache != NULL && !BufferIsValid(cache->vmbuf))
-		{
-			cache->vmbuf = base.vmbuf;
-			cache->vmrelid = RelationGetRelid(heap);
-		}
-		else
-			ReleaseBuffer(base.vmbuf);
-	}
+	lion_vm_pins_release(&dcx.vm);
+	lion_vm_pins_release(&lcx.vm);
+	lion_vis_cache_keep_vm(cache, heap, &base.vm);
 	dstats->spills += tally->nspills;
 	tally->nspills = 0;
 

@@ -155,7 +155,16 @@ SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv IS NOT NULL AND tags @> 
  same rows
 (2 rows)
 
--- 2. Built: a phrase, a weight, a NOT - none of them a tree of whole sets
+-- `a & !b`: a's rows less b's, a tree of whole sets too
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 & !y3'::tsquery ORDER BY id LIMIT 20$$);
+               olq_run                
+--------------------------------------
+ Lion Set: lazy, N keys probed, exact
+ same rows
+(2 rows)
+
+-- 2. Built: a phrase, a weight, a NOT of a weight - none of them a tree of
+--    whole sets
 SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 <-> y3'::tsquery ORDER BY id LIMIT 20$$);
             olq_run             
 --------------------------------
@@ -170,7 +179,7 @@ SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'w3:A & x5'::tsquery 
  same rows
 (2 rows)
 
-SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 & !y3'::tsquery ORDER BY id LIMIT 20$$);
+SELECT * FROM olq_run($$SELECT id, k FROM olq WHERE tsv @@ 'x5 & !y3:B'::tsquery ORDER BY id LIMIT 20$$);
             olq_run             
 --------------------------------
  Lion Set: 39 containers, exact

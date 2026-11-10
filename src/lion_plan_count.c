@@ -11,6 +11,8 @@
  */
 #include "postgres.h"
 
+#include "optimizer/restrictinfo.h"
+
 #include "lion_customscan.h"
 #include "lion_plan_private.h"
 
@@ -1396,13 +1398,20 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 	 * else is known.  Any number of them may name one column: they are
 	 * ANDed into one range, and they are gathered per column here.  A
 	 * strict comparison is never true of NULL, so the column is non-NULL
-	 * in every row counted.
+	 * in every row counted.  A bound made from the restriction rather than
+	 * written in it - one of `col LIKE 'p%'`'s two (lion_like_as_and()) -
+	 * is gathered as a RestrictInfo of its own, so that the column's
+	 * selectivity and its range's bounds are the range's, not the LIKE's
+	 * twice over.
 	 */
 	if (leaf.kind == LION_CLAUSE_RANGE)
 	{
 		int			pos = list_length(cx->whereattnos);
 		int			r = 0;
 		ListCell   *lr;
+
+		if (rinfo != NULL && clause != (Node *) rinfo->clause)
+			rinfo = make_simple_restrictinfo(root, (Expr *) clause);
 
 		foreach(lr, cx->rangevars)
 		{
@@ -2187,8 +2196,9 @@ lion_count_path_where(LionCountPathBuild *cx)
 
 		/*
 		 * An OR across columns (lion_count_path_where_or()), `col NOT IN
-		 * (...)` as its `<>` clauses (lion_all_as_and()), or a clause of one
-		 * column (lion_count_path_where_leaf()).
+		 * (...)` as its `<>` clauses (lion_all_as_and()), `col LIKE 'p%'` as
+		 * its range (lion_like_as_and()), or a clause of one column
+		 * (lion_count_path_where_leaf()).
 		 */
 		if (IsA(clause, BoolExpr) && ((BoolExpr *) clause)->boolop == OR_EXPR)
 			answered = lion_count_path_where_or(cx, clause);
@@ -2205,6 +2215,27 @@ lion_count_path_where(LionCountPathBuild *cx)
 									   &leaf) ||
 					leaf.kind != LION_CLAUSE_NE ||
 					!lion_count_path_where_leaf(cx, rinfo, conj))
+				{
+					answered = false;
+					break;
+				}
+			}
+		}
+		else if ((ands = lion_like_as_and(clause)) != NIL)
+		{
+			ListCell   *la;
+
+			/*
+			 * `col LIKE 'p%'` as the range it is (lion_like_as_and()), or
+			 * the equality or `IS NOT NULL` of a pattern with no wildcard or
+			 * of `%` alone: clauses of one column, which share the
+			 * restriction's position as `NOT IN`'s do.
+			 */
+			answered = true;
+			foreach(la, ands)
+			{
+				if (!lion_count_path_where_leaf(cx, rinfo,
+												(Node *) lfirst(la)))
 				{
 					answered = false;
 					break;
@@ -3253,8 +3284,9 @@ lion_count_path_filter_no(LionCountPathBuild *cx, Node *fexpr)
 /*
  * One conjunct of a filtered count's condition (DESIGN.md §10, "Filtered
  * counts"), as lion_count_path_where() takes a restriction of the WHERE:
- * the same rewrites, then an OR, the conjunction of a `NOT IN`, or a clause
- * of one column.  False when no posting set answers it.
+ * the same rewrites, then an OR, the conjunction of a `NOT IN` or of a
+ * `LIKE`'s range, or a clause of one column.  False when no posting set
+ * answers it.
  */
 static bool
 lion_count_path_filter_clause(LionCountPathBuild *cx, Node *clause)
@@ -3294,6 +3326,17 @@ lion_count_path_filter_clause(LionCountPathBuild *cx, Node *clause)
 			if (!lion_analyze_leaf(root, conj, rti, true, true, true, &leaf) ||
 				leaf.kind != LION_CLAUSE_NE ||
 				!lion_count_path_where_leaf(cx, NULL, conj))
+				return false;
+		}
+		return true;
+	}
+	if ((ands = lion_like_as_and(clause)) != NIL)
+	{
+		ListCell   *la;
+
+		foreach(la, ands)
+		{
+			if (!lion_count_path_where_leaf(cx, NULL, (Node *) lfirst(la)))
 				return false;
 		}
 		return true;

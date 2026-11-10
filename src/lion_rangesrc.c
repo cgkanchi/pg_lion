@@ -1488,7 +1488,7 @@ lion_range_probe_begin(Relation heap, Snapshot snapshot, int nsources,
 
 	/* The cursors of the walk's sets: they carry nothing, they only read. */
 	rp->cx.cxt = cxt;
-	rp->cx.vmbuf = InvalidBuffer;
+	lion_vm_pins_init(&rp->cx.vm);
 	rp->cx.droppins = true;
 	rp->setcxt = AllocSetContextCreate(cxt, "lion range probe set",
 									   ALLOCSET_DEFAULT_SIZES);

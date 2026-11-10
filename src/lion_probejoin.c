@@ -58,6 +58,7 @@
 
 #include "lion_compat.h"
 #include "lion_customscan.h"
+#include "lion_vm.h"
 
 /* GUC pg_lion.enable_probe_join (lion_am.c) */
 bool		lion_enable_probe_join = true;
@@ -184,7 +185,7 @@ typedef struct LionProbeJoinState
 	ScanKeyData probekey;
 	ScanKeyData antikey;
 	TupleTableSlot *tabslot;	/* a dimension row read for its visibility */
-	Buffer		vmbuffer;
+	LionVmPins	vm;				/* the dimension's visibility map pages */
 	LionProbeSets *sets;
 	bool		built;			/* the sets are, for this scan's Params */
 	bool		whereexact;
@@ -1575,7 +1576,7 @@ pj_begin(CustomScanState *node, EState *estate, int eflags)
 			 list_length(factplan->targetlist), st->nfact);
 	if (heap == NULL)
 		elog(ERROR, "LionProbeJoin: no dimension to probe");
-	st->vmbuffer = InvalidBuffer;
+	lion_vm_pins_init(&st->vm);
 	st->outs = (int *) palloc0(sizeof(int) * Max(st->ndim, 1));
 
 	/* the children, as core starts a join's */
@@ -1901,8 +1902,8 @@ pj_next(ScanState *ss)
 			 * snapshot sees - read too for a recheck of the WHERE.
 			 */
 			if (!st->whereexact ||
-				!VM_ALL_VISIBLE(heap, ItemPointerGetBlockNumber(&found),
-								&st->vmbuffer))
+				!lion_vm_all_visible(heap, ItemPointerGetBlockNumber(&found),
+									 &st->vm))
 			{
 				st->fetched++;
 				if (!pj_fetch(st, st->tabslot))
@@ -1992,6 +1993,10 @@ pj_rescan(CustomScanState *node)
 	}
 }
 
+/*
+ * EndCustomScan: close the B-tree scan and index, let go of the map pins and
+ * the probe's sets, and end the child plans.
+ */
 static void
 pj_end(CustomScanState *node)
 {
@@ -2000,9 +2005,7 @@ pj_end(CustomScanState *node)
 	if (st->scan != NULL)
 		index_endscan(st->scan);
 	st->scan = NULL;
-	if (BufferIsValid(st->vmbuffer))
-		ReleaseBuffer(st->vmbuffer);
-	st->vmbuffer = InvalidBuffer;
+	lion_vm_pins_release(&st->vm);
 	if (st->tabslot != NULL)
 		ExecClearTuple(st->tabslot);
 	lion_probe_sets_end(st->sets);

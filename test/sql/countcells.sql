@@ -281,6 +281,9 @@ SELECT q, lcc_check(q) FROM (VALUES
 	-- text search
 	('SELECT (w @@ ''a1 & b2''::tsquery) AS x, (w @@ ''a3 | (a4 & b1)''::tsquery) AS y, count(*)
 		FROM lcc GROUP BY 1, 2'),
+	-- ... and with a NOT beside a lexeme: the one's rows less the other's
+	('SELECT (w @@ ''a1 & !b2''::tsquery) AS x, (w @@ ''(a3 & !b1 & !a4) | b3''::tsquery) AS y,
+			 count(*) FROM lcc GROUP BY 1, 2'),
 	-- arithmetic: round, GREATEST, LEAST, COALESCE, and NULLs through them
 	('SELECT round(GREATEST(CASE WHEN k IN (1, 2) THEN 2.5 END, CASE WHEN f THEN 1.25 END) * 3) AS v,
 			 count(*) FROM lcc GROUP BY 1'),
@@ -318,7 +321,7 @@ SELECT q, lcc_check(q) FROM (VALUES
 	('SELECT (k = 1) AS v, count(s) FROM lcc GROUP BY 1'),
 	('SELECT (k = 1) AS v, sum(n) FROM lcc GROUP BY 1'),
 	-- a range in the predicates, which no entry answers alone, and a text
-	-- search with a NOT, which no set of keys answers
+	-- search with a NOT under an OR, which no set of keys answers
 	('SELECT (n < 10) AS v, count(*) FROM lcc GROUP BY 1'),
 	('SELECT (w @@ ''a3 | !b1''::tsquery) AS v, count(*) FROM lcc GROUP BY 1'),
 	-- a WHERE of no positive clause, as for the decoded walk
