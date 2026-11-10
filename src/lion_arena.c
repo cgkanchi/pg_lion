@@ -89,12 +89,23 @@ lion_arena_add_region(LionArena *a, Size need)
 	}
 	size = Max(a->nextsize, need);
 	size = ((size + LION_ARENA_GRAIN - 1) / LION_ARENA_GRAIN) * LION_ARENA_GRAIN;
-	if (!a->extend(a->arg, a->filesize, a->filesize + size))
-		return -1;
-	base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, a->fd(a->arg),
-				(off_t) a->filesize);
-	if (base == MAP_FAILED)
-		return -1;				/* the file's tail stays, zero, for a retry */
+	if (a->fd == NULL)
+	{
+		/* no file: memory of the process's own, outside malloc's heap */
+		base = mmap(NULL, size, PROT_READ | PROT_WRITE,
+					MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (base == MAP_FAILED)
+			return -1;
+	}
+	else
+	{
+		if (!a->extend(a->arg, a->filesize, a->filesize + size))
+			return -1;
+		base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+					a->fd(a->arg), (off_t) a->filesize);
+		if (base == MAP_FAILED)
+			return -1;			/* the file's tail stays, zero, for a retry */
+	}
 
 	/* in by base: the regions are bisected (lion_arena_region_of()) */
 	for (i = a->nregions; i > 0 && a->regions[i - 1].base > (char *) base; i--)
