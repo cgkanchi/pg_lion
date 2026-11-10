@@ -2180,7 +2180,15 @@ one-member container (a sparse segment's, §13) now reads two words for its one 
 slower. The rare container that straddles two map pages still reads bytes, each half on its own
 page. `test/unit/vm_test.c` checks the word read against a bit-at-a-time reader of the documented
 layout at every alignment and byte value; assert builds still check every mask against
-`visibilitymap_get_status()` (`LION_VM_MASK_CHECK`).
+`visibilitymap_get_status()` (`LION_VM_MASK_CHECK`), though a disagreement is settled by reading the
+bytes again from the page each block belongs on, so that check vouches for the reading of the bytes
+and not for which page they were read from. `test/sql/vm_pages.sql` does that: a heap of two map
+pages, one row to a block, with rows deleted on the second page at bytes whose twins on the first
+still say all-visible, and on both halves of the straddling container. Its counts, grouped counts,
+per-key join counts and index-only rows are compared with core's, the blocks taken from the map
+and rechecked are counted exactly, and the join's count over 167 keys, each on both pages, pins
+the two pages once each (a single slot pins them 236 times). Taking a block's bits from the wrong
+page, or one half of the straddling container from the other's page, fails it.
 
 ## 10. Phase 2b: CustomScan for `count(*) [GROUP BY k] FROM t WHERE k1 = c1 AND ...` (`lion_plan_*.c`, `lion_exec_*.c`)
 

@@ -1993,6 +1993,10 @@ pj_rescan(CustomScanState *node)
 	}
 }
 
+/*
+ * EndCustomScan: close the B-tree scan and index, let go of the map pins and
+ * the probe's sets, and end the child plans.
+ */
 static void
 pj_end(CustomScanState *node)
 {

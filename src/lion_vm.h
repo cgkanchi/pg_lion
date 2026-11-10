@@ -178,6 +178,7 @@ lion_vm_pins_init(LionVmPins *vm)
 		LION_VM_PINS - 1 : 0;
 }
 
+/* Whether the set holds any pin. */
 static inline bool
 lion_vm_pins_held(const LionVmPins *vm)
 {
@@ -191,6 +192,20 @@ lion_vm_pins_held(const LionVmPins *vm)
 	return false;
 }
 
+/*
+ * Empty the slots without letting go of what they held: for a set whose pins
+ * have just been moved to another (lion_vis_cache_take_vm()).  The set stays
+ * the size it was.
+ */
+static inline void
+lion_vm_pins_clear(LionVmPins *vm)
+{
+	int			i;
+
+	for (i = 0; i < LION_VM_PINS; i++)
+		vm->buf[i] = InvalidBuffer;
+}
+
 /* Let go of every pin; the set stays the size it was. */
 static inline void
 lion_vm_pins_release(LionVmPins *vm)
@@ -201,8 +216,8 @@ lion_vm_pins_release(LionVmPins *vm)
 	{
 		if (BufferIsValid(vm->buf[i]))
 			ReleaseBuffer(vm->buf[i]);
-		vm->buf[i] = InvalidBuffer;
 	}
+	lion_vm_pins_clear(vm);
 }
 
 /*

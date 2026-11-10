@@ -270,16 +270,16 @@ lion_vis_cache_release_vm(LionVisCache *cache)
 void
 lion_vis_cache_take_vm(LionVisCache *cache, Relation heap, LionVmPins *vm)
 {
-	lion_vm_pins_init(vm);
-	if (cache == NULL || !lion_vm_pins_held(&cache->vm))
-		return;
-	if (cache->vmrelid == RelationGetRelid(heap))
+	if (cache != NULL && lion_vm_pins_held(&cache->vm) &&
+		cache->vmrelid == RelationGetRelid(heap))
 	{
 		*vm = cache->vm;
-		lion_vm_pins_init(&cache->vm);
+		lion_vm_pins_clear(&cache->vm);
 		cache->vmrelid = InvalidOid;
+		return;
 	}
-	else
+	lion_vm_pins_init(vm);
+	if (cache != NULL)
 		lion_vis_cache_release_vm(cache);
 }
 
@@ -297,7 +297,7 @@ lion_vis_cache_keep_vm(LionVisCache *cache, Relation heap, LionVmPins *vm)
 	{
 		cache->vm = *vm;
 		cache->vmrelid = RelationGetRelid(heap);
-		lion_vm_pins_init(vm);
+		lion_vm_pins_clear(vm);
 	}
 	else
 		lion_vm_pins_release(vm);

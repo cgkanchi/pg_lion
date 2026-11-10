@@ -9554,6 +9554,10 @@ lo_exec(CustomScanState *node)
 					(ExecScanRecheckMtd) lo_recheck);
 }
 
+/*
+ * ReScanCustomScan: the walk starts over, with the set it had unless a Param
+ * of the lion quals changed.
+ */
 static void
 lo_rescan(CustomScanState *node)
 {
@@ -9595,6 +9599,10 @@ lo_rescan(CustomScanState *node)
 	ExecScanReScan(&node->ss);
 }
 
+/*
+ * EndCustomScan: close the scans and indexes, let go of the map pins, and
+ * free the node's memory and its spill file.
+ */
 static void
 lo_end(CustomScanState *node)
 {

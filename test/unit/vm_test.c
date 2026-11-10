@@ -35,6 +35,7 @@ static const char *cur_phase = "startup";
 static long nchecks = 0;
 static long nfail = 0;
 
+/* Count one check, and print the first 40 that fail. */
 static void
 check_impl(bool ok, int line, const char *msg)
 {
@@ -214,6 +215,7 @@ test_frozen_only(void)
 	}
 }
 
+/* Every test; exit status 1 if any check failed. */
 int
 main(void)
 {
