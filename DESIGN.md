@@ -3732,7 +3732,11 @@ the window rel, §39), and puts the LionWindowCount node over each of the relati
 puts a WindowAgg over each. The node has two children: the count, run once before the first row,
 and the rows, handed up in their order with the count beside each. Its startup cost is the count's
 total plus the rows' startup, so under a LIMIT it is priced as what it reads - the count and the
-rows the LIMIT takes - against the WindowAgg's every row.
+rows the LIMIT takes - against the WindowAgg's every row. PostgreSQL 17 prices that WindowAgg's
+first row after every row it reads (`get_windowclause_startup_tuples()`); 16 prices it as its
+input's first row, so under a LIMIT the WindowAgg would look as if it read a few rows and the node
+would never win. On 16, when the node is offered, core's WindowAgg paths for these windows are
+priced as 17 prices them (`lion_window_price_first_row()`).
 
 **Exact.** The count is the number of rows the second child returns: both are the same relation
 and clauses, read under the statement's snapshot, and the count is exact wherever a count is (§9,
