@@ -97,6 +97,8 @@ SELECT p, lion_dr(p) FROM unnest(ARRAY[
 	'ts::date >= ''2026-03-05''',
 	'''2026-03-05'' = ts::date',
 	'''2026-03-05'' < ts::date',
+	'''2026-03-05'' <= ts::date',
+	'''2026-03-05'' > ts::date',
 	'''2026-03-05'' >= ts::date',
 	'CAST(ts AS date) = ''2000-01-01''',
 	'date(ts) = ''1999-12-31''',
@@ -117,7 +119,11 @@ SELECT u, p, lion_dr(format(p, u)) FROM unnest(ARRAY[
 	'date_trunc(%L, ts) > timestamp ''2026-03-05 13:07:42.123456''',
 	'date_trunc(%L, ts) >= timestamp ''2026-03-05 13:07:42.123456''',
 	'date_trunc(%L, ts) >= date_trunc(%1$L, timestamp ''2000-01-01'')',
-	'timestamp ''2000-01-01'' > date_trunc(%L, ts)'
+	'date_trunc(%1$L, timestamp ''2026-03-05 13:07:42.123456'') = date_trunc(%1$L, ts)',
+	'date_trunc(%1$L, timestamp ''2026-03-05 13:07:42.123456'') < date_trunc(%1$L, ts)',
+	'timestamp ''2026-03-05 13:07:42.123456'' <= date_trunc(%L, ts)',
+	'timestamp ''2000-01-01'' > date_trunc(%L, ts)',
+	'timestamp ''2026-03-05 13:07:42.123456'' >= date_trunc(%L, ts)'
 	]) p ORDER BY 1, 2;
 -- a constant inside a bucket is equal to no truncated value: left alone
 SELECT lion_dr('date_trunc(''day'', ts) = ''2026-03-05 12:00''');

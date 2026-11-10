@@ -34355,7 +34355,8 @@ made wherever the clause is in a qual: under OR, inside `IS NOT TRUE` or a CASE,
 than assumed: `A = date_trunc(unit, c)`, `N = A + one step of the unit` (a microsecond up to a
 millennium, a week seven days, a quarter three months), and the bucket is taken only if
 `date_trunc(unit, N) = N` and `date_trunc(unit, N - 1 microsecond) = A`. For the cast, `A` and `N`
-are the timestamps of `c` and `c + 1`, through `date2timestamp_opt_overflow()`. A constant within two
+are the timestamps of `c` and `c + 1`, computed as `date2timestamp()` does once `c` is checked to
+lie inside `timestamp`'s range. A constant within two
 thousand years of either end of `timestamp`'s range, an infinite one, or a date past that range is
 left alone, so that computing a bound never raises an error the clause itself would not.
 
@@ -34382,7 +34383,7 @@ Moncton and Goose Bay stepped back across midnight every autumn from 1987 to 201
 a whole day in 1867 - so the exact set is a union of ranges known only at run time. IN lists of
 days, `<>`, and a comparison across types (`ts::date = timestamp '...'`) are left as written.
 
-Tests: `test/sql/dayrange.sql` (every comparison either way round, every unit on and inside a
+Tests: `test/sql/dayrange.sql` (every comparison with the constant on either side, every unit on and inside a
 bucket's edge, BC buckets, infinities, NULLs, the clause under OR, NOT, `IS NOT TRUE`, CASE and an
 outer join's `ON`, the declines, an expression index, a table without lion, a partitioned table
 pruned by the range, and a generic plan), each against the same query with the rewrite off and

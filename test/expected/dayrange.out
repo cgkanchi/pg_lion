@@ -124,6 +124,8 @@ SELECT p, lion_dr(p) FROM unnest(ARRAY[
 	'ts::date >= ''2026-03-05''',
 	'''2026-03-05'' = ts::date',
 	'''2026-03-05'' < ts::date',
+	'''2026-03-05'' <= ts::date',
+	'''2026-03-05'' > ts::date',
 	'''2026-03-05'' >= ts::date',
 	'CAST(ts AS date) = ''2000-01-01''',
 	'date(ts) = ''1999-12-31''',
@@ -141,6 +143,8 @@ SELECT p, lion_dr(p) FROM unnest(ARRAY[
  ts::date >= '2026-03-05'                       | as a range, 2826 rows
  '2026-03-05' = ts::date                        | as a range, 16 rows
  '2026-03-05' < ts::date                        | as a range, 2810 rows
+ '2026-03-05' <= ts::date                       | as a range, 2826 rows
+ '2026-03-05' > ts::date                        | as a range, 3254 rows
  '2026-03-05' >= ts::date                       | as a range, 3270 rows
  CAST(ts AS date) = '2000-01-01'                | as a range, 2 rows
  date(ts) = '1999-12-31'                        | as a range, 3 rows
@@ -148,7 +152,7 @@ SELECT p, lion_dr(p) FROM unnest(ARRAY[
  ts::date = '0044-03-15 BC'                     | as a range, 2 rows
  ts::date < '0001-01-01'                        | as a range, 14 rows
  ts::date >= '0001-01-01 BC'                    | as a range, 6069 rows
-(14 rows)
+(16 rows)
 
 -- ---- date_trunc(): each unit, a constant on its bucket's edge and inside it ----
 SELECT u, p, lion_dr(format(p, u)) FROM unnest(ARRAY[
@@ -161,102 +165,158 @@ SELECT u, p, lion_dr(format(p, u)) FROM unnest(ARRAY[
 	'date_trunc(%L, ts) > timestamp ''2026-03-05 13:07:42.123456''',
 	'date_trunc(%L, ts) >= timestamp ''2026-03-05 13:07:42.123456''',
 	'date_trunc(%L, ts) >= date_trunc(%1$L, timestamp ''2000-01-01'')',
-	'timestamp ''2000-01-01'' > date_trunc(%L, ts)'
+	'date_trunc(%1$L, timestamp ''2026-03-05 13:07:42.123456'') = date_trunc(%1$L, ts)',
+	'date_trunc(%1$L, timestamp ''2026-03-05 13:07:42.123456'') < date_trunc(%1$L, ts)',
+	'timestamp ''2026-03-05 13:07:42.123456'' <= date_trunc(%L, ts)',
+	'timestamp ''2000-01-01'' > date_trunc(%L, ts)',
+	'timestamp ''2026-03-05 13:07:42.123456'' >= date_trunc(%L, ts)'
 	]) p ORDER BY 1, 2;
-      u       |                                       p                                       |        lion_dr        
---------------+-------------------------------------------------------------------------------+-----------------------
- century      | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 29 rows
- century      | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 6074 rows
- century      | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 6045 rows
- century      | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                   | as a range, 6 rows
- century      | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                | as a range, 6061 rows
- century      | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 6 rows
- century      | timestamp '2000-01-01' > date_trunc(%L, ts)                                   | as a range, 29 rows
- day          | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 3254 rows
- day          | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 3270 rows
- day          | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 16 rows
- day          | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                   | as a range, 2810 rows
- day          | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                | as a range, 6057 rows
- day          | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 2810 rows
- day          | timestamp '2000-01-01' > date_trunc(%L, ts)                                   | as a range, 23 rows
- decade       | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 31 rows
- decade       | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 5107 rows
- decade       | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 5076 rows
- decade       | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                   | as a range, 973 rows
- decade       | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                | as a range, 6057 rows
- decade       | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 973 rows
- decade       | timestamp '2000-01-01' > date_trunc(%L, ts)                                   | as a range, 23 rows
- hour         | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 3258 rows
- hour         | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 3269 rows
- hour         | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 11 rows
- hour         | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                   | as a range, 2811 rows
- hour         | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                | as a range, 6057 rows
- hour         | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 2811 rows
- hour         | timestamp '2000-01-01' > date_trunc(%L, ts)                                   | as a range, 23 rows
- microseconds | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 3269 rows
- microseconds | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 3269 rows
- microseconds | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 0 rows
- microseconds | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                   | as a range, 2811 rows
- microseconds | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                | as a range, 6057 rows
- microseconds | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 2811 rows
- microseconds | timestamp '2000-01-01' > date_trunc(%L, ts)                                   | as a range, 23 rows
- millennium   | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 29 rows
- millennium   | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 6077 rows
- millennium   | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 6048 rows
- millennium   | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                   | as a range, 3 rows
- millennium   | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                | as a range, 6064 rows
- millennium   | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 3 rows
- millennium   | timestamp '2000-01-01' > date_trunc(%L, ts)                                   | as a range, 29 rows
- milliseconds | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 3267 rows
- milliseconds | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 3269 rows
- milliseconds | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 2 rows
- milliseconds | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                   | as a range, 2811 rows
- milliseconds | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                | as a range, 6057 rows
- milliseconds | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 2811 rows
- milliseconds | timestamp '2000-01-01' > date_trunc(%L, ts)                                   | as a range, 23 rows
- minute       | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 3261 rows
- minute       | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 3269 rows
- minute       | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 8 rows
- minute       | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                   | as a range, 2811 rows
- minute       | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                | as a range, 6057 rows
- minute       | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 2811 rows
- minute       | timestamp '2000-01-01' > date_trunc(%L, ts)                                   | as a range, 23 rows
- month        | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 3244 rows
- month        | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 3313 rows
- month        | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 69 rows
- month        | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                   | as a range, 2767 rows
- month        | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                | as a range, 6057 rows
- month        | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 2767 rows
- month        | timestamp '2000-01-01' > date_trunc(%L, ts)                                   | as a range, 23 rows
- quarter      | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 3146 rows
- quarter      | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 3313 rows
- quarter      | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 167 rows
- quarter      | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                   | as a range, 2767 rows
- quarter      | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                | as a range, 6057 rows
- quarter      | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 2767 rows
- quarter      | timestamp '2000-01-01' > date_trunc(%L, ts)                                   | as a range, 23 rows
- second       | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 3264 rows
- second       | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 3269 rows
- second       | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 5 rows
- second       | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                   | as a range, 2811 rows
- second       | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                | as a range, 6057 rows
- second       | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 2811 rows
- second       | timestamp '2000-01-01' > date_trunc(%L, ts)                                   | as a range, 23 rows
- week         | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 3247 rows
- week         | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 3279 rows
- week         | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 32 rows
- week         | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                   | as a range, 2801 rows
- week         | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                | as a range, 6061 rows
- week         | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 2801 rows
- week         | timestamp '2000-01-01' > date_trunc(%L, ts)                                   | as a range, 25 rows
- year         | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 3146 rows
- year         | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 3653 rows
- year         | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') | as a range, 507 rows
- year         | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                   | as a range, 2427 rows
- year         | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                | as a range, 6057 rows
- year         | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                  | as a range, 2427 rows
- year         | timestamp '2000-01-01' > date_trunc(%L, ts)                                   | as a range, 23 rows
-(91 rows)
+      u       |                                        p                                        |        lion_dr        
+--------------+---------------------------------------------------------------------------------+-----------------------
+ century      | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') < date_trunc(%1$L, ts) | as a range, 6 rows
+ century      | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') = date_trunc(%1$L, ts) | as a range, 6045 rows
+ century      | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 29 rows
+ century      | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 6074 rows
+ century      | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 6045 rows
+ century      | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                     | as a range, 6 rows
+ century      | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                  | as a range, 6061 rows
+ century      | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 6 rows
+ century      | timestamp '2000-01-01' > date_trunc(%L, ts)                                     | as a range, 29 rows
+ century      | timestamp '2026-03-05 13:07:42.123456' <= date_trunc(%L, ts)                    | as a range, 6 rows
+ century      | timestamp '2026-03-05 13:07:42.123456' >= date_trunc(%L, ts)                    | as a range, 6074 rows
+ day          | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') < date_trunc(%1$L, ts) | as a range, 2810 rows
+ day          | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') = date_trunc(%1$L, ts) | as a range, 16 rows
+ day          | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 3254 rows
+ day          | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 3270 rows
+ day          | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 16 rows
+ day          | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                     | as a range, 2810 rows
+ day          | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                  | as a range, 6057 rows
+ day          | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 2810 rows
+ day          | timestamp '2000-01-01' > date_trunc(%L, ts)                                     | as a range, 23 rows
+ day          | timestamp '2026-03-05 13:07:42.123456' <= date_trunc(%L, ts)                    | as a range, 2810 rows
+ day          | timestamp '2026-03-05 13:07:42.123456' >= date_trunc(%L, ts)                    | as a range, 3270 rows
+ decade       | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') < date_trunc(%1$L, ts) | as a range, 973 rows
+ decade       | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') = date_trunc(%1$L, ts) | as a range, 5076 rows
+ decade       | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 31 rows
+ decade       | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 5107 rows
+ decade       | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 5076 rows
+ decade       | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                     | as a range, 973 rows
+ decade       | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                  | as a range, 6057 rows
+ decade       | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 973 rows
+ decade       | timestamp '2000-01-01' > date_trunc(%L, ts)                                     | as a range, 23 rows
+ decade       | timestamp '2026-03-05 13:07:42.123456' <= date_trunc(%L, ts)                    | as a range, 973 rows
+ decade       | timestamp '2026-03-05 13:07:42.123456' >= date_trunc(%L, ts)                    | as a range, 5107 rows
+ hour         | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') < date_trunc(%1$L, ts) | as a range, 2811 rows
+ hour         | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') = date_trunc(%1$L, ts) | as a range, 11 rows
+ hour         | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 3258 rows
+ hour         | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 3269 rows
+ hour         | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 11 rows
+ hour         | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                     | as a range, 2811 rows
+ hour         | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                  | as a range, 6057 rows
+ hour         | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 2811 rows
+ hour         | timestamp '2000-01-01' > date_trunc(%L, ts)                                     | as a range, 23 rows
+ hour         | timestamp '2026-03-05 13:07:42.123456' <= date_trunc(%L, ts)                    | as a range, 2811 rows
+ hour         | timestamp '2026-03-05 13:07:42.123456' >= date_trunc(%L, ts)                    | as a range, 3269 rows
+ microseconds | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') < date_trunc(%1$L, ts) | as a range, 2811 rows
+ microseconds | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') = date_trunc(%1$L, ts) | as a range, 0 rows
+ microseconds | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 3269 rows
+ microseconds | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 3269 rows
+ microseconds | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 0 rows
+ microseconds | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                     | as a range, 2811 rows
+ microseconds | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                  | as a range, 6057 rows
+ microseconds | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 2811 rows
+ microseconds | timestamp '2000-01-01' > date_trunc(%L, ts)                                     | as a range, 23 rows
+ microseconds | timestamp '2026-03-05 13:07:42.123456' <= date_trunc(%L, ts)                    | as a range, 2811 rows
+ microseconds | timestamp '2026-03-05 13:07:42.123456' >= date_trunc(%L, ts)                    | as a range, 3269 rows
+ millennium   | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') < date_trunc(%1$L, ts) | as a range, 3 rows
+ millennium   | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') = date_trunc(%1$L, ts) | as a range, 6048 rows
+ millennium   | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 29 rows
+ millennium   | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 6077 rows
+ millennium   | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 6048 rows
+ millennium   | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                     | as a range, 3 rows
+ millennium   | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                  | as a range, 6064 rows
+ millennium   | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 3 rows
+ millennium   | timestamp '2000-01-01' > date_trunc(%L, ts)                                     | as a range, 29 rows
+ millennium   | timestamp '2026-03-05 13:07:42.123456' <= date_trunc(%L, ts)                    | as a range, 3 rows
+ millennium   | timestamp '2026-03-05 13:07:42.123456' >= date_trunc(%L, ts)                    | as a range, 6077 rows
+ milliseconds | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') < date_trunc(%1$L, ts) | as a range, 2811 rows
+ milliseconds | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') = date_trunc(%1$L, ts) | as a range, 2 rows
+ milliseconds | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 3267 rows
+ milliseconds | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 3269 rows
+ milliseconds | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 2 rows
+ milliseconds | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                     | as a range, 2811 rows
+ milliseconds | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                  | as a range, 6057 rows
+ milliseconds | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 2811 rows
+ milliseconds | timestamp '2000-01-01' > date_trunc(%L, ts)                                     | as a range, 23 rows
+ milliseconds | timestamp '2026-03-05 13:07:42.123456' <= date_trunc(%L, ts)                    | as a range, 2811 rows
+ milliseconds | timestamp '2026-03-05 13:07:42.123456' >= date_trunc(%L, ts)                    | as a range, 3269 rows
+ minute       | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') < date_trunc(%1$L, ts) | as a range, 2811 rows
+ minute       | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') = date_trunc(%1$L, ts) | as a range, 8 rows
+ minute       | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 3261 rows
+ minute       | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 3269 rows
+ minute       | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 8 rows
+ minute       | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                     | as a range, 2811 rows
+ minute       | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                  | as a range, 6057 rows
+ minute       | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 2811 rows
+ minute       | timestamp '2000-01-01' > date_trunc(%L, ts)                                     | as a range, 23 rows
+ minute       | timestamp '2026-03-05 13:07:42.123456' <= date_trunc(%L, ts)                    | as a range, 2811 rows
+ minute       | timestamp '2026-03-05 13:07:42.123456' >= date_trunc(%L, ts)                    | as a range, 3269 rows
+ month        | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') < date_trunc(%1$L, ts) | as a range, 2767 rows
+ month        | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') = date_trunc(%1$L, ts) | as a range, 69 rows
+ month        | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 3244 rows
+ month        | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 3313 rows
+ month        | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 69 rows
+ month        | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                     | as a range, 2767 rows
+ month        | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                  | as a range, 6057 rows
+ month        | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 2767 rows
+ month        | timestamp '2000-01-01' > date_trunc(%L, ts)                                     | as a range, 23 rows
+ month        | timestamp '2026-03-05 13:07:42.123456' <= date_trunc(%L, ts)                    | as a range, 2767 rows
+ month        | timestamp '2026-03-05 13:07:42.123456' >= date_trunc(%L, ts)                    | as a range, 3313 rows
+ quarter      | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') < date_trunc(%1$L, ts) | as a range, 2767 rows
+ quarter      | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') = date_trunc(%1$L, ts) | as a range, 167 rows
+ quarter      | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 3146 rows
+ quarter      | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 3313 rows
+ quarter      | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 167 rows
+ quarter      | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                     | as a range, 2767 rows
+ quarter      | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                  | as a range, 6057 rows
+ quarter      | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 2767 rows
+ quarter      | timestamp '2000-01-01' > date_trunc(%L, ts)                                     | as a range, 23 rows
+ quarter      | timestamp '2026-03-05 13:07:42.123456' <= date_trunc(%L, ts)                    | as a range, 2767 rows
+ quarter      | timestamp '2026-03-05 13:07:42.123456' >= date_trunc(%L, ts)                    | as a range, 3313 rows
+ second       | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') < date_trunc(%1$L, ts) | as a range, 2811 rows
+ second       | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') = date_trunc(%1$L, ts) | as a range, 5 rows
+ second       | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 3264 rows
+ second       | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 3269 rows
+ second       | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 5 rows
+ second       | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                     | as a range, 2811 rows
+ second       | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                  | as a range, 6057 rows
+ second       | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 2811 rows
+ second       | timestamp '2000-01-01' > date_trunc(%L, ts)                                     | as a range, 23 rows
+ second       | timestamp '2026-03-05 13:07:42.123456' <= date_trunc(%L, ts)                    | as a range, 2811 rows
+ second       | timestamp '2026-03-05 13:07:42.123456' >= date_trunc(%L, ts)                    | as a range, 3269 rows
+ week         | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') < date_trunc(%1$L, ts) | as a range, 2801 rows
+ week         | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') = date_trunc(%1$L, ts) | as a range, 32 rows
+ week         | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 3247 rows
+ week         | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 3279 rows
+ week         | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 32 rows
+ week         | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                     | as a range, 2801 rows
+ week         | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                  | as a range, 6061 rows
+ week         | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 2801 rows
+ week         | timestamp '2000-01-01' > date_trunc(%L, ts)                                     | as a range, 25 rows
+ week         | timestamp '2026-03-05 13:07:42.123456' <= date_trunc(%L, ts)                    | as a range, 2801 rows
+ week         | timestamp '2026-03-05 13:07:42.123456' >= date_trunc(%L, ts)                    | as a range, 3279 rows
+ year         | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') < date_trunc(%1$L, ts) | as a range, 2427 rows
+ year         | date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456') = date_trunc(%1$L, ts) | as a range, 507 rows
+ year         | date_trunc(%L, ts) < date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 3146 rows
+ year         | date_trunc(%L, ts) <= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 3653 rows
+ year         | date_trunc(%L, ts) = date_trunc(%1$L, timestamp '2026-03-05 13:07:42.123456')   | as a range, 507 rows
+ year         | date_trunc(%L, ts) > timestamp '2026-03-05 13:07:42.123456'                     | as a range, 2427 rows
+ year         | date_trunc(%L, ts) >= date_trunc(%1$L, timestamp '2000-01-01')                  | as a range, 6057 rows
+ year         | date_trunc(%L, ts) >= timestamp '2026-03-05 13:07:42.123456'                    | as a range, 2427 rows
+ year         | timestamp '2000-01-01' > date_trunc(%L, ts)                                     | as a range, 23 rows
+ year         | timestamp '2026-03-05 13:07:42.123456' <= date_trunc(%L, ts)                    | as a range, 2427 rows
+ year         | timestamp '2026-03-05 13:07:42.123456' >= date_trunc(%L, ts)                    | as a range, 3653 rows
+(143 rows)
 
 -- a constant inside a bucket is equal to no truncated value: left alone
 SELECT lion_dr('date_trunc(''day'', ts) = ''2026-03-05 12:00''');
