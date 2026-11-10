@@ -496,9 +496,9 @@ SELECT cp_q($$SELECT x, count(*) FROM pc WHERE x > 20 GROUP BY x$$);
 (1 row)
 
 SELECT cp_q($$SELECT x, count(*) FROM pc WHERE x > 10 GROUP BY x$$);
-            cp_q            
-----------------------------
- LionCount [pc_pn], 89 rows
+                     cp_q                     
+----------------------------------------------
+ LionCount [pc_px] implied: (x > 10), 89 rows
 (1 row)
 
 SELECT cp_q($$SELECT act, st, count(*) FROM pc WHERE act AND st = 'on' AND kind = 'k0' AND g = 2 GROUP BY act, st$$);
@@ -508,9 +508,9 @@ SELECT cp_q($$SELECT act, st, count(*) FROM pc WHERE act AND st = 'on' AND kind 
 (1 row)
 
 SELECT cp_q($$SELECT st, a, count(*) FROM pc WHERE act AND st = 'on' AND kind = 'k0' GROUP BY st, a$$);
-             cp_q             
-------------------------------
- LionCount [pc_full], 21 rows
+                                 cp_q                                 
+----------------------------------------------------------------------
+ LionCount [pc_full pc_p1] implied: act, (kind = 'k0'::text), 21 rows
 (1 row)
 
 -- a GROUP BY folded to a constant, its column printed and not
