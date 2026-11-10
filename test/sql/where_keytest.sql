@@ -283,11 +283,20 @@ SET pg_lion.enable_ordered_scan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_kt WHERE lower(s) = 's1';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_kt WHERE c LIKE 'c1%' AND s = 's3';
 EXPLAIN (COSTS OFF) SELECT s, count(*) FROM lion_kt WHERE c ~ '^c[12]$' GROUP BY 1;
-EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
-SELECT count(*) FROM lion_kt WHERE c ILIKE 'C1%';
+CREATE FUNCTION lion_kt_explain(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	FOR l IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		-- 18 prints rows=N.00 where 16 and 17 print rows=N
+		RETURN NEXT regexp_replace(l, 'rows=(\d+)\.00 ', 'rows=\1 ', 'g');
+	END LOOP;
+END $$;
+SELECT lion_kt_explain('SELECT count(*) FROM lion_kt WHERE c ILIKE ''C1%''');
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET pg_lion.enable_plain_scan;
 RESET pg_lion.enable_ordered_scan;
 DROP TABLE lion_kt, lion_ktp, lion_ktl;
-DROP FUNCTION lion_kt(text), lion_kt_prep(text, text);
+DROP FUNCTION lion_kt(text), lion_kt_prep(text, text), lion_kt_explain(text);

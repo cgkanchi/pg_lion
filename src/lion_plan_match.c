@@ -2656,6 +2656,52 @@ lion_keytest_cannot_fail(Node *clause)
 	return !lion_keytest_fail_walker(clause, NULL);
 }
 
+#if PG_VERSION_NUM < 180000
+/* The rows of the live members of the inherited table relid, leaf by leaf. */
+static double
+lion_keytest_member_rows(PlannerInfo *root, Index relid)
+{
+	double		rows = 0.0;
+	ListCell   *lc;
+
+	foreach(lc, root->append_rel_list)
+	{
+		AppendRelInfo *appinfo = (AppendRelInfo *) lfirst(lc);
+		RelOptInfo *child;
+
+		if (appinfo->parent_relid != relid)
+			continue;
+		child = root->simple_rel_array[appinfo->child_relid];
+		if (child == NULL || IS_DUMMY_REL(child))
+			continue;
+		if (root->simple_rte_array[appinfo->child_relid]->inh)
+			rows += lion_keytest_member_rows(root, appinfo->child_relid);
+		else
+			rows += child->tuples;
+	}
+	return rows;
+}
+#endif
+
+/*
+ * The rows of the table rel reads, which the keys of a column a test of each
+ * key walks are held to a share of: rel->tuples.  For a partitioned or
+ * inherited table that is its members' rows from PostgreSQL 18 on, and before
+ * it the rows the WHERE leaves of them (set_append_rel_size()), which would
+ * hold the keys to a share of the rows the test itself picks; so before 18
+ * the members' are added up here, as 18 adds them.
+ */
+static double
+lion_keytest_table_rows(PlannerInfo *root, RelOptInfo *rel)
+{
+#if PG_VERSION_NUM < 180000
+	if (rel->reloptkind == RELOPT_BASEREL &&
+		root->simple_rte_array[rel->relid]->inh)
+		return Max(lion_keytest_member_rows(root, rel->relid), rel->tuples);
+#endif
+	return rel->tuples;
+}
+
 /*
  * The keys of the column a test of each key walks: the table's, whatever the
  * WHERE leaves of its rows (which estimate_num_groups() would scale them
@@ -2715,7 +2761,8 @@ lion_keytest_leaf(PlannerInfo *root, Node *clause, Index rti,
 		double		nd = lion_keytest_keys(root, var, &isdefault);
 
 		if (isdefault ||
-			nd > Max(rel->tuples * LION_KEYTEST_MAX_KEY_SHARE, 1.0))
+			nd > Max(lion_keytest_table_rows(root, rel) *
+					 LION_KEYTEST_MAX_KEY_SHARE, 1.0))
 			return false;
 	}
 
