@@ -106,6 +106,11 @@ lion_recheck_append(LionCountCtx *cx, const ItemPointerData *tid)
 	cx->ntids = n + 1;
 }
 
+/*
+ * lion_recheck_add() when the list has no room for the TID, a flush may be
+ * due, or the list has spilled: flush or spill the list if the budget says
+ * so, then spill the TID too, or grow the list as needed and append it.
+ */
 static void
 lion_recheck_add_slow(LionCountCtx *cx, uint64 code)
 {
@@ -224,6 +229,10 @@ lion_recheck_add(LionCountCtx *cx, uint64 code)
 		lion_recheck_add_slow(cx, code);
 }
 
+/*
+ * lion_container_iterate() callback: queue the member lo if its heap block is
+ * one of rc->dirty, and count it.
+ */
 static bool
 lion_recheck_cb(uint16 lo, void *arg)
 {
@@ -844,10 +853,14 @@ lion_tid_run_end(const ItemPointerData *tids, int ntids, int i)
  * once, the TIDs being sorted - but for one whose answers the count's
  * visibility cache already holds when cx is set, which lion_recheck_heap_heap()
  * serves without reading it.  The callback only reads the TID list and looks
- * blocks up in the cache, which nothing changes while the stream runs: a
- * block's entry is filled only when the recheck reads that block, and a
- * sorted list names each block once, so the callback, which runs ahead of
- * the recheck, decides for every block exactly as the recheck will.
+ * blocks up in the cache.  The recheck changes the cache while the stream
+ * runs ahead of it - it records the blocks it reads and fills their entries
+ * (lion_vis_cache_prepare(), lion_vis_fill_page()) - but only the entry of
+ * the block in hand, and it empties none; a sorted list names each block
+ * once.  So a block filled when the callback looks is filled when the
+ * recheck gets to it, and one that is not cannot be filled before the
+ * recheck reads it: the callback decides for every block exactly as the
+ * recheck will.
  */
 typedef struct LionTidBlocks
 {
@@ -857,6 +870,10 @@ typedef struct LionTidBlocks
 	LionCountCtx *cx;			/* skip what its cache answers, or NULL */
 } LionTidBlocks;
 
+/*
+ * Read stream callback: the next block of tb's list to read, past the ones
+ * the cache answers, or InvalidBlockNumber at the end of the list.
+ */
 static BlockNumber
 lion_tid_blocks_next(ReadStream *stream, void *arg, void *per_buffer_data)
 {

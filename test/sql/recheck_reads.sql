@@ -54,6 +54,35 @@ BEGIN
 END $$;
 
 /*
+ * lion_rr_reads() runs one query with the count pushdown under EXPLAIN
+ * ANALYZE and reports whether its rechecks read heap blocks and whether the
+ * visibility cache answered others.
+ */
+CREATE FUNCTION lion_rr_reads(q text, OUT read_blocks boolean,
+							  OUT blocks_from_cache boolean)
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	read_blocks := false;
+	blocks_from_cache := false;
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
+		IF ln ~ 'Heap Blocks Rechecked: [1-9]' THEN
+			read_blocks := true;
+		END IF;
+		IF ln ~ 'Heap Blocks From Cache: [1-9]' THEN
+			blocks_from_cache := true;
+		END IF;
+	END LOOP;
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+END $$;
+
+/*
  * 40 rows a page at fillfactor 50, so that updates stay on their page (HOT)
  * and a page holds chains as well as plain rows.
  */
@@ -90,6 +119,10 @@ SELECT lion_rrcmp('SELECT count(*) FROM lion_rr WHERE g = 5 AND k = 1');
 SELECT lion_rrcmp('SELECT count(*) FROM lion_rr WHERE k = 2');
 SELECT lion_rrcmp('SELECT g, count(*) FROM lion_rr GROUP BY g');
 SELECT lion_rrcmp('SELECT g, count(*) FROM lion_rr WHERE k = 0 GROUP BY g');
+-- ... and the grouped count did both: it read blocks and was answered by the
+-- cache for others, which the stream has to skip (a block skipped wrongly,
+-- or read when it should not be, is lion_recheck_read()'s ERROR)
+SELECT * FROM lion_rr_reads('SELECT g, count(*) FROM lion_rr GROUP BY g');
 -- a count with a row filter, which reads every candidate's page
 SELECT lion_rrcmp('SELECT count(*) FROM lion_rr WHERE g = 7 AND id % 5 = 1');
 SELECT lion_rrcmp('SELECT g, count(*) FROM lion_rr WHERE k = 1 AND id % 5 = 1 GROUP BY g');
@@ -115,3 +148,4 @@ SELECT lion_rrcmp('SELECT g, count(*) FROM lion_rr GROUP BY g');
 
 DROP TABLE lion_rr;
 DROP FUNCTION lion_rrcmp(text);
+DROP FUNCTION lion_rr_reads(text);

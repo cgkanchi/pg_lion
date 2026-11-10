@@ -2076,10 +2076,12 @@ changes, none of which changes what is read or what is counted:
 - **The blocks come through a read stream** (PostgreSQL 17 on): `lion_recheck_heap_heap()` reads
   its blocks as `lion_recheck_heap_filtered()` already did and a bitmap heap scan does, batched on
   18 (`READ_STREAM_USE_BATCHING`, whose callback may neither lock nor read). The callback
-  (`lion_tid_blocks_next()`) skips the blocks the visibility cache already answers. It looks each
-  one up in the cache, which nothing changes while the stream runs - an entry is filled only when
-  the recheck reads its block, and a sorted list names each block once - so the callback, running
-  ahead, decides every block as the recheck will; a buffer for another block is an ERROR. A stream
+  (`lion_tid_blocks_next()`) skips the blocks the visibility cache already answers, looking each one
+  up ahead of the recheck. The recheck changes the cache meanwhile - it records the blocks it reads
+  and fills their entries - but only the entry of the block in hand, and it empties none; a sorted
+  list names each block once. So a block filled when the callback looks is filled when the recheck
+  gets to it, and one that is not cannot be filled before the recheck reads it: the callback decides
+  every block as the recheck will, and a buffer for another block is an ERROR. A stream
   is begun for every recheck, however short: 20,000 groups' counts of a few rows each took the same
   time with one per count as with none. Warm, it changes nothing; read from storage, it is most of
   the gain below.
