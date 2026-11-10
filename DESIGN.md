@@ -23506,20 +23506,22 @@ So a column whose largest entries are about as large as the ones after them fall
 WHERE that takes away more than they differ by, a skewed one only where the WHERE takes away more
 than the bounds fall from the k-th to the first left out - which the candidates, 2k/s of them,
 are sized to cover - and keys of exactly the same rows always fall back under the strict rule.
-On the table above (PostgreSQL 18, warm cache, best of three), `WHERE kind < n` keeping the share
-shown, against the plans before this change:
+On the table above (PostgreSQL 18, warm cache, best of several runs), `WHERE kind < n` keeping
+the share shown, against the plans before this change (with the GROUP BY walk reading each leaf
+once, §28 "One read per leaf"):
 
 | WHERE keeps | falls back, priced | before | now | strictly, priced | before | now |
 | --- | --- | --- | --- | --- | --- | --- |
-| 100% | 0 | top k, 10 counted, 7 ms | the same | 0 | top k, 12 counted, 7 ms | the same |
-| 95% | 3e-26 | top k, 23 counted, 19 ms | the same | 3e-9 | top k, 50 counted, 22 ms | the same |
-| 90% | 3e-7 | top k, 40 counted, 19 ms | the same | 0.02 | top k, 50 counted, 24 ms | the same |
-| 85% | 0.04 | walked whole, 1,041 ms | the same | 0.80 | walked whole, 914 ms | hash aggregate, 718 ms |
-| 80% | 0.84 | walked whole, 896 ms | hash aggregate, 672 ms | 1 | walked whole, 921 ms | hash aggregate, 598 ms |
-| 70% | 1 | walked whole, 904 ms | hash aggregate, 630 ms | 1 | walked whole, 907 ms | hash aggregate, 568 ms |
-| 50% | 1 | walked whole, 887 ms | hash aggregate, 452 ms | 1 | walked whole, 1,013 ms | hash aggregate, 533 ms |
+| 100% | 0 | top k, 10 counted, 7 ms | the same | 0 | top k, 12 counted, 8 ms | the same |
+| 95% | 2e-25 | top k, 23 counted, 19 ms | the same | 8e-9 | top k, 50 counted, 18 ms | the same |
+| 90% | 5e-7 | top k, 40 counted, 18 ms | the same | 0.04 | top k, 50 counted, 17 ms | the same |
+| 85% | 0.06 | walked whole, 592 ms | the same | 0.86 | walked whole, 599 ms | hash aggregate, 531 ms |
+| 80% | 0.88 | walked whole, 602 ms | hash aggregate, 531 ms | 1 | walked whole, 706 ms | hash aggregate, 523 ms |
+| 70% | 1 | walked whole, 626 ms | hash aggregate, 499 ms | 1 | walked whole, 639 ms | hash aggregate, 531 ms |
+| 50% | 1 | walked whole, 614 ms | hash aggregate, 424 ms | 1 | walked whole, 585 ms | hash aggregate, 445 ms |
 
-At 85% the top k counts 21 for the 10th group against a first bound left out of 22: a near
+The query that lost, under a WHERE keeping a fifth, went from 468 ms to 210 ms. At 85% the top k
+counts 21 for the 10th group against a first bound left out of 22: a near
 thing, priced as unlikely, and planned as before. On a Zipf-like column of 160,714 keys in 2M
 rows, under WHERE clauses keeping 5% or 20% of the rows and under none, and the same with a
 statistics target of 10, every plan is as before.
