@@ -2165,9 +2165,11 @@ counted, after it was copied under its pins, exactly as with one pin, never reme
 earlier read; a map page is no index page and nothing waits for its pin. On a pool small for its
 connections - the backend's fair share (`lion_pin_fair_share()`) under 32 buffers - the set has one
 slot, so the pin budget (§15, "The pin budget"), which leaves room for one map page, still holds. A
-backend holds at most eight map pages, and backends counting the same heap pin the same pages, so
-one heap's map takes no more buffers of the pool than it has pages, one per 255 MB of heap, however
-many backends count it: at most eight for a heap up to 2 GB, at most eight a backend past that.
+set holds at most eight map pages, and every set over the same heap pins the same pages, so one
+heap's map takes no more buffers of the pool than it has pages, one per 255 MB of heap, however many
+sets and backends read it: at most eight for a heap up to 2 GB. Past that the bound is eight a set,
+and a backend can hold several: one for each node of its plan that reads the map, and one for each
+group or column context a count rechecks through.
 
 The read itself is a word at a time: a container's sixteen map bytes (at 8 kB pages; eight at 16 kB,
 four at 32 kB) as two 64-bit words, each word's 32 all-visible bits squeezed together in five
