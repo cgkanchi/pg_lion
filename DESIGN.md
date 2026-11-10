@@ -6578,10 +6578,11 @@ KEYS trees:
   `gin_extract_tsquery()` numbers the keys it returns by scanning that array from 0 and counting
   QI_VAL items, so the j'th key is the j'th QI_VAL in array order; the same item -> key map is
   recomputed rather than fished out of extra_data.  QI_VAL with no prefix flag and weight mask 0
-  becomes a leaf; OP_AND and OP_OR become AND and OR nodes; **OP_NOT, OP_PHRASE, a prefix and a
-  weight mask make the whole query ALL**.  (`!a` has no complement over posting sets that is not
-  "every row minus a's", and the ALL fallback is that set anyway; a phrase needs lexeme positions
-  and a weight needs weights, neither of which the index stores.)
+  becomes a leaf; OP_AND and OP_OR become AND and OR nodes, and an OP_AND one of whose operands is
+  an OP_NOT an ANDNOT node (below, "A NOT beside an AND"); **any other OP_NOT, OP_PHRASE, a prefix
+  and a weight mask make the whole query ALL**.  (`!a` has no complement over posting sets that is
+  not "every row minus a's", and the ALL fallback is that set anyway; a phrase needs lexeme
+  positions and a weight needs weights, neither of which the index stores.)
 - `<@` is unreachable (extractQuery says INCLUDE_EMPTY first) and would be ALL.
 
 ### Bitmap scans (`lion_scan.c`)
@@ -6893,7 +6894,7 @@ literal is exact.
 
 `test/sql/countmultikey.sql` runs every shape against the pushdown off, with the node's recheck
 counters beside the answer: `@>`, `&&` over text[] and int[] and `@@` in generic plans with values
-that are exact, select nothing, are NULL, widen (a NULL element, a phrase, a weight, `a & !b`, a
+that are exact, select nothing, are NULL, widen (a NULL element, a phrase, a weight, `a & !b:A`, a
 prefix beside a lexeme) and are every row (`{}`, `!a`, `a:*`, `a | !b`), queries built by
 `to_tsquery($1)` and `websearch_to_tsquery($1)`, `ARRAY[$1, $2]`; beside other clauses, two such
 clauses and an `IS NOT NULL` read by the sequential scan, `count(col)`, GROUP BY (one column and two),
@@ -6952,6 +6953,40 @@ the price, which is now the superset's size rather than the index's: a rare phra
 median 120 words, warm).  The count's gain over GIN is the heap-skipping kind only where the
 superset is narrow; on a wide superset both do the same detoast per candidate.  Exact phrase
 counts need stored positions, which is a separate design.
+
+### A NOT beside an AND (2026-11-10)
+
+`x & !y` is a set difference: outside a phrase `TS_execute()` decides `!y` as "the row does not
+match y", so the rows the operator selects are x's less y's, and the shared evaluator already has the
+node for it, `LION_KN_ANDNOT` (§14, `IS NOT NULL`), whose first child's containers are taken the
+others' members away at the keys the first child stands at.  `lion_tsquery_tree()` builds one for an
+AND exactly one of whose operands is a NOT - either way round, the other operand and the NOT's
+operand both exact trees themselves (`(a <-> c) & !b` is not one, and is the superset's below) -
+and folds a run of them into one node (`a & !b & !c` is ANDNOT(a, b, c)); a NOT that is itself an
+OR's operand (`a | !b`), one alone, or one on both sides of an AND still needs every row and stays
+ALL, while an ANDNOT under an OR (`(a & !b) | c`) is an ordinary operand of it.  The query is then
+KEYS: exact for the scans (no recheck), the count (no row filter, no position filter) and every
+count shape that takes an exact multi-key leaf - GROUP BY, count(DISTINCT), the FK-side join,
+counts by cells, whose mask test reads an ANDNOT as its first child's keys and none of the others'
+(`lion_cells_tree()`), and LionOrdered's lazy set.
+
+The superset (`lion_tsquery_superset()`) does the same wherever it would have dropped the NOT, so
+`(a <-> c) & !b` decides positions only for the rows of `a & c` that lack `b`, but not inside a
+phrase, where a NOT is about positions (`(a & !b) <-> c` matches a row that has `b` somewhere
+else), not where y is not exact (`a & !b:A`, `a & !(b <-> c)`, which stay `a`), not where the other
+side's superset is every row, and never for an extraction that is not the plain one: an ambiguous
+long lexeme's set ("Long lexemes") may hold rows without its lexeme, and taking those away would
+lose rows.  The cost model's superset share (`lion_tsquery_walk_sel()`) follows the same rule,
+an ambiguous long lexeme anywhere in the query included (`lion_tsquery_ambiguous()`); a prefix past
+the expansion cap, which the planner cannot see, it takes as expanded, as it takes every prefix.
+
+On 500,000 synthetic documents (PostgreSQL 18.7, warm, serial), `count(*) WHERE tsv @@ 'w2 & !w5'`
+of a lexeme in nearly every row and one in 93% of them took 55 ms, every candidate of `w2` decided
+by the position filter; it now takes 1.9 ms, where `w2 & w5` takes 1.6 to 2.4.  `test/sql/tsvector.sql`
+compares the rows with a sequential scan for nested and folded NOTs, under an OR, a NOT inside and
+of a phrase, under a weight and of a prefix; `countcells.sql`, `countmultikey.sql`,
+`positions.sql`, `indexscan.sql` and `ordered_lazy_query.sql` show the shapes that became exact and
+keep one that still rechecks.
 
 ### Stored positions: position trees (in progress, 2026-10-07)
 
@@ -34367,6 +34402,71 @@ and VACUUM, the plans and `EXPLAIN ANALYZE`'s counters, and the declines: a leaf
 not slice the column, until pruning leaves it out, and the switch); `slices_range.sql`'s
 partitioned table now answered; and the isolation spec `slices_partitioned.spec` with a count and a
 sum under a range from slices beside the aggregates.
+
+## 54. Day filters as ranges (2026-11-10)
+
+`count(*) ... WHERE ts::date = '2026-03-05'`, `WHERE date_trunc('day', ts) = '2026-03-05'` and
+`WHERE ts::date BETWEEN '2026-03-01' AND '2026-03-07'` read every row: a function of the column is
+in no operator family, lion's or a B-tree's, and the plan was a sequential scan (192 to 254 ms on 2M
+rows against 1 to 2 ms for the same counts written as ranges of `ts`). For a `timestamp` column
+they are ranges of `ts`, and are now planned as those ranges (`lion_plan_dayrange.c`).
+
+**Why it is exact.** `ts::date` (`date(timestamp)`) and `date_trunc(unit, ts)` of a `timestamp
+without time zone` are immutable and monotone - never smaller for a larger `ts` - and constant over
+buckets `[A, N(A))`, a day for the cast and the unit's bucket for `date_trunc()`. With `[A, N)` the
+bucket of the constant `c`:
+
+| clause | is |
+|---|---|
+| `f(ts) = c` | `ts >= A AND ts < N` (when `f(A) = c`; a `c` inside a bucket equals no `f(ts)`, left alone) |
+| `f(ts) < c` | `ts < A` when `c` is its bucket's value, else `ts < N` |
+| `f(ts) <= c` | `ts < N` |
+| `f(ts) > c` | `ts >= N` |
+| `f(ts) >= c` | `ts >= A` when `c` is its bucket's value, else `ts >= N` |
+
+and the constant on the left is the same with the strategy commuted. `f` of an infinite `ts` is the
+infinite value of the result type, which compares with `c` as `ts` compares with the bounds, and both
+sides are NULL exactly when `ts` is. So the replacement has the clause's value for every row, and is
+made wherever the clause is in a qual: under OR, inside `IS NOT TRUE` or a CASE, in an outer join's
+`ON` clause.
+
+`A` and `N` are computed from the constant at plan time, and checked against the function rather
+than assumed: `A = date_trunc(unit, c)`, `N = A + one step of the unit` (a microsecond up to a
+millennium, a week seven days, a quarter three months), and the bucket is taken only if
+`date_trunc(unit, N) = N` and `date_trunc(unit, N - 1 microsecond) = A`. For the cast, `A` and `N`
+are the timestamps of `c` and `c + 1`, computed as `date2timestamp()` does once `c` is checked to
+lie inside `timestamp`'s range. A constant within two
+thousand years of either end of `timestamp`'s range, an infinite one, or a date past that range is
+left alone, so that computing a bound never raises an error the clause itself would not.
+
+**Where.** The query's quals are rewritten in place, once for each base relation, from the hook
+after `get_relation_info()` (`lion_get_relation_info()`, `build_simple_rel_hook` from 19): it runs
+from `add_base_rels_to_query()`, before `deconstruct_jointree()` makes RestrictInfos of the quals,
+so every estimate, path, EquivalenceClass and partition pruning step after it sees the ranges, and
+the plan shows them (`ts >= '...' AND ts < '...'`). The jointree's quals are implicit-AND lists by
+then (`preprocess_qual_conditions()`), and a top-level member that becomes two clauses becomes two
+members, as if written so; elsewhere it is an AND. Nothing else of the jointree changes, so the
+walk `add_base_rels_to_query()` is in the middle of is undisturbed. An appendrel child's quals are
+its parent's, translated after this, and are not looked at.
+
+**Which relations.** Only a column with a lion index key on it (a plain column, `timestamp`), and
+only a clause no index of the relation has as an expression key - an expression index on
+`(ts::date)` keeps its clause. A table without lion keeps PostgreSQL's plans as they were.
+Only constants: a generic plan's `$1`, `current_date` and other stable expressions are left as
+written, since the bound's conversion could then fail at run time where the clause does not.
+`pg_lion.enable_date_ranges` (on) turns it off.
+
+**Not done.** `timestamptz` columns: the cast and the two-argument `date_trunc()` depend on the
+session's time zone, and a day of some zones' clocks is not one range - the clocks of St. John's,
+Moncton and Goose Bay stepped back across midnight every autumn from 1987 to 2010, and Alaska's by
+a whole day in 1867 - so the exact set is a union of ranges known only at run time. IN lists of
+days, `<>`, and a comparison across types (`ts::date = timestamp '...'`) are left as written.
+
+Tests: `test/sql/dayrange.sql` (every comparison with the constant on either side, every unit on and inside a
+bucket's edge, BC buckets, infinities, NULLs, the clause under OR, NOT, `IS NOT TRUE`, CASE and an
+outer join's `ON`, the declines, an expression index, a table without lion, a partitioned table
+pruned by the range, and a generic plan), each against the same query with the rewrite off and
+sequential scans only.
 
 ## 55. A grouped subquery joined in, planned again as LATERAL (2026-11-10)
 

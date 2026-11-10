@@ -320,9 +320,12 @@ bytes is not expanded, and every row is rechecked. A `text`, `varchar` or `bytea
 a query is rechecked. An element of another type longer than 2047 bytes is stored compressed, and is
 an error only if that does not fit, as a GIN index tuple that does not fit is.
 
-Without positions, everything a plain AND/OR of key sets cannot express is rechecked in the heap. A
-NULL element and a tsquery phrase, weight or `a & !b` are answered from the rows of their keys (the
-other elements, the phrase's lexemes, `a`), then rechecked, in counts and scans alike. `<@`, `@> '{}'` and a bare `!a` fall back to scanning
+A NOT beside the rest of an AND (`a & !b`, `(a | c) & !(b | d)`) is a set difference: the rows of
+`b` are taken away from the rows of `a`, so it is exact with positions or without, and costs about
+what `a & b` does. Without positions, everything else a plain AND/OR of key sets cannot express is
+rechecked in the heap. A NULL element and a tsquery phrase, weight or `a & !b:A` are answered from
+the rows of their keys (the other elements, the phrase's lexemes, `a`), then rechecked, in counts and
+scans alike. `<@`, `@> '{}'`, a bare `!a` and `a | !b` fall back to scanning
 every indexed row and rechecking it if the Lion index is used; the planner may choose a sequential
 scan instead.
 
@@ -338,7 +341,7 @@ prepared statement's generic plan (`tags @> $1`, `tsv @@ to_tsquery($1)`) or a s
 (`tsv @@ to_tsquery(current_setting('app.q'))`) - is pushed down whatever it turns out to be
 (DESIGN.md §17): exactly when the key sets answer it; from a superset of its rows, each rechecked in
 the heap, when they do not (`@>` with a NULL element counts the other elements' rows, a phrase the
-rows with all of its lexemes, `a & !b` the rows with `a`); and when no key narrows it at all (`@>
+rows with all of its lexemes, `a & !b:A` the rows with `a`); and when no key narrows it at all (`@>
 '{}'`, `!a`, `foo:*`), by rechecking the rows the other clauses select, or every row by a
 sequential scan when there is no other clause. `EXPLAIN ANALYZE` reports the rows the recheck
 turned away as `Rows Removed by Recheck`. A value the planner cannot estimate is priced as the case
@@ -1134,6 +1137,15 @@ working around a bad choice:
   key the visibility map vouches for, in one pass of the bit-plane kernel (`lion_planes_count_strided()`,
   DESIGN.md §50, §52). Off, each slice's container is ANDed with the `WHERE` and counted on its own;
   the answers are the same.
+- `pg_lion.enable_date_ranges`: plan `ts::date <op> constant` and `date_trunc(unit, ts) <op>
+  constant`, with `<op>` one of `=`, `<`, `<=`, `>`, `>=` and the constant on either side, over a
+  `timestamp` column with a lion index, as the range of `ts` they are (`ts::date = '2026-03-05'` is
+  `ts >= '2026-03-05' AND ts < '2026-03-06'`), which every index of `ts` and partition pruning
+  answer (DESIGN.md §54). EXPLAIN shows the range. Off, the clause is left as written. Also left as
+  written: `timestamptz` columns; a constant that is infinite or within 2000 years of either end of
+  `timestamp`'s range; parameters and stable expressions such as `current_date`; `<>`, IN lists and
+  comparisons across types (`ts::date = timestamp '...'`); `date_trunc()` with a unit that isn't a
+  constant; and a clause some index has as an expression key.
 - `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot

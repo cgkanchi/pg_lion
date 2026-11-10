@@ -1305,9 +1305,10 @@ lion_index_row_column(const LionIndexState *ix)
  *	LION_QMODE_LOSSY	at least the rows the query selects, and perhaps
  *					more: the key tree selects a SUPERSET, which the caller
  *					rechecks (lion_extract_query_superset() only: a phrase
- *					as the AND of its lexemes, `a & !b` as `a`)
+ *					as the AND of its lexemes, `a & !b:A` as `a`)
  *	LION_QMODE_ALL	every indexed row, with recheck (`tags @> '{}'`, `<@`,
- *					a tsquery with NOT/phrase/prefix/weights, a NULL key)
+ *					a tsquery with a bare NOT, a phrase, a prefix or a
+ *					weight, a NULL key)
  */
 typedef enum LionQueryMode
 {
@@ -1334,7 +1335,8 @@ typedef enum LionKeyNodeKind
 	LION_KN_ANDNOT				/* its first child's members less every other
 								 * child's: `col IS NOT NULL` beside other
 								 * quals, the column's NULL entry subtracted
-								 * (DESIGN.md §14, §29.2); the scans' only */
+								 * (DESIGN.md §14, §29.2), and a tsquery's
+								 * `a & !b` (§17) */
 } LionKeyNodeKind;
 
 /*
@@ -2457,6 +2459,11 @@ struct RelOptInfo;
 extern double lion_index_slice_pages(Relation index, double heap_pages,
 									 double tuples);
 extern void lion_leave_out_slice_pages(struct RelOptInfo *rel);
+/* day filters as ranges of the column (lion_plan_dayrange.c, DESIGN.md §54) */
+struct PlannerInfo;
+extern bool lion_enable_date_ranges;	/* GUC pg_lion.enable_date_ranges */
+extern void lion_rewrite_day_filters(struct PlannerInfo *root,
+									 struct RelOptInfo *rel);
 /* the entries a lion path's lookups hand their answer out by (lion_amcost.c) */
 extern double lion_cost_path_entries(struct PlannerInfo *root,
 									 struct IndexPath *path);
