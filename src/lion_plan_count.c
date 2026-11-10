@@ -432,6 +432,11 @@ typedef struct LionCountPathBuild
 								 * collect by ranges (§10) */
 	List	   *groupdeps;		/* GROUP BY expressions of the columns
 								 * (§36), which split no group */
+	bool		groupderived;	/* ... of columns the GROUP BY does not
+								 * name, which the walk groups by and a
+								 * Finalize Agg merges (§36, "Expressions of
+								 * columns not grouped") */
+	double		finalgroups;	/* ... and the groups the merge makes */
 	List	   *wattnos;		/* §37: the columns aggregates are taken
 								 * over, weighted by their entries' rows */
 	List	   *widx;			/* ... their indexes (IndexOptInfo) */
@@ -791,6 +796,93 @@ lion_group_dependent(LionCountPathBuild *cx, Node *expr)
 }
 
 /*
+ * A GROUP BY of expressions of columns it does not name - `GROUP BY
+ * upper(status)`, `GROUP BY kind / 5` - is the GROUP BY of those columns,
+ * merged (DESIGN.md §36, "Expressions of columns not grouped").  Where the
+ * node can print a column from its stored keys (lion_index_can_emit_value(),
+ * decided per relation once the indexes are known), every row of the
+ * column's group holds the same value, not merely an equal one, so an
+ * immutable expression of the columns (lion_group_dependent()) is the same
+ * for every row of a group, and each group of the expressions is a union of
+ * the columns' groups.  The walk counts the columns' groups and emits them as
+ * partial rows, the projection computing the expressions from each group's
+ * key, and core's Finalize Agg adds up the rows that share a value.
+ *
+ * Each column the expressions read and the GROUP BY does not name becomes a
+ * grouping column, under its type's own equality and its own collation - a
+ * finer grouping than any the expressions make - and two grouping columns at
+ * most: the nested loop of §20.  The rows are partial, so core has to be able
+ * to add them up: partial counts, and the expressions hashable.  The
+ * expressions are computed for the groups that have rows, from the value
+ * every one of those rows holds, which is the value the ordinary plan computes
+ * them from: an error they raise, it raises too.  What wants finished groups
+ * - filtered counts, the decoded walk, a GROUP BY in parallel, the top k, an
+ * order claimed - is refused with any expression of the columns already
+ * (groupdeps), and lion_count_path_derived_ok() refuses the rest.
+ */
+static bool
+lion_count_path_derive_groups(LionCountPathBuild *cx)
+{
+	List	   *vars = NIL;
+	ListCell   *lc;
+
+	cx->groupderived = false;
+	if (!lion_enable_expr_groups)
+		return true;
+	foreach(lc, cx->groupdeps)
+		vars = list_concat(vars, pull_var_clause((Node *) lfirst(lc),
+												 PVC_RECURSE_PLACEHOLDERS));
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+		TypeCacheEntry *typentry;
+		int			g;
+
+		if (!IsA(v, Var) || v->varno != (int) cx->rti ||
+			v->varlevelsup != 0 || v->varattno <= 0)
+			return false;
+		for (g = 0; g < cx->ngroup; g++)
+		{
+			if (cx->groupattno[g] == v->varattno)
+				break;
+		}
+		if (g < cx->ngroup)
+			continue;
+		if (cx->ngroup >= 2)
+			return false;
+
+		typentry = lookup_type_cache(v->vartype, TYPECACHE_EQ_OPR);
+		if (!OidIsValid(typentry->eq_opr))
+			return false;
+		cx->groupvar[cx->ngroup] = (Var *) copyObject(v);
+		cx->groupattno[cx->ngroup] = v->varattno;
+		cx->groupcoll[cx->ngroup] = v->varcollid;
+		cx->groupeqop[cx->ngroup] = typentry->eq_opr;
+		cx->ngroup++;
+		cx->groupderived = true;
+	}
+	if (!cx->groupderived)
+		return true;
+	return cx->extra != NULL &&
+		(cx->extra->flags & GROUPING_CAN_PARTIAL_AGG) != 0 &&
+		grouping_is_hashable(cx->root->processed_groupClause);
+}
+
+/*
+ * ... and what may stand beside it, once the query's aggregates are known:
+ * counts and plain columns.  Not a count(DISTINCT), whose partial counts the
+ * Finalize Agg could not add, a SELECT DISTINCT's keys, the FK-side join or
+ * the anti join over a small inner side.
+ */
+static bool
+lion_count_path_derived_ok(const LionCountPathBuild *cx)
+{
+	return !cx->groupderived ||
+		(cx->distvar == NULL && !cx->distinctstage && cx->fj == NULL &&
+		 cx->anti == NULL && cx->wattnos == NIL && cx->nfilter == 0);
+}
+
+/*
  * GROUP BY: nothing, one indexed column, or two.  Fills in the grouping
  * columns (groupvar and the arrays beside it, ngroup), the coalesce group, or
  * singlegroup for a GROUP BY the planner folded to constants.
@@ -968,13 +1060,22 @@ lion_count_path_group_by(LionCountPathBuild *cx)
 		cx->decode = (cx->ngroup > 2);
 
 		/*
+		 * Expressions of columns the GROUP BY does not name are grouped by
+		 * those columns, and merged (lion_count_path_derive_groups()).
+		 */
+		if (!cx->decode && !lion_count_path_derive_groups(cx))
+			return false;
+
+		/*
 		 * The expressions of the grouping columns split no group: only in
 		 * one table, which emits its finished groups, and with a column to
-		 * be an expression of.
+		 * be an expression of - or as partial rows a Finalize Agg merges,
+		 * where the walk groups by columns the GROUP BY does not name.
 		 */
 		foreach(lc, cx->groupdeps)
 		{
-			if (cx->ngroup == 0 || cx->partitioned || cx->decode ||
+			if (cx->ngroup == 0 || (cx->partitioned && !cx->groupderived) ||
+				cx->decode ||
 				!lion_group_dependent(cx, (Node *) lfirst(lc)))
 				return false;
 		}
@@ -2642,7 +2743,7 @@ lion_count_path_sagg(LionCountPathBuild *cx, AttrNumber attno, int skind,
 
 	if (cx->fj != NULL || cx->anti != NULL || cx->ngroup > 2 ||
 		cx->singlegroup || (cx->partitioned && cx->ngroup > 0) ||
-		cx->distvar != NULL ||
+		cx->groupderived || cx->distvar != NULL ||
 		cx->groupcoal != NULL || cx->cells || LION_ATTNO_IS_VCOL(attno))
 		return false;
 
@@ -4138,7 +4239,18 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 													 cx->having);
 	}
 	else if (!cx->partitioned)
+	{
 		cx->outrows = cx->numgroups;
+
+		/*
+		 * ... and partial too where the walk groups by columns the GROUP BY
+		 * does not name, for the Finalize Agg to merge (DESIGN.md §36)
+		 */
+		if (cx->groupderived)
+			cx->partialtarget = lion_make_partial_target(root,
+														 output_rel->reltarget,
+														 cx->having);
+	}
 	else
 	{
 		cx->outrows = 0.0;
@@ -4204,6 +4316,21 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 		cx->partialtarget = lion_make_partial_target(root,
 													 output_rel->reltarget,
 													 cx->having);
+	}
+
+	/*
+	 * The groups the Finalize Agg makes of the walk's where they are merged:
+	 * those of the GROUP BY's expressions, never more than the walk's.
+	 */
+	cx->finalgroups = cx->numgroups;
+	if (cx->groupderived)
+	{
+		List	   *exprs = get_sortgrouplist_exprs(root->processed_groupClause,
+													root->processed_tlist);
+
+		cx->finalgroups = Min(estimate_num_groups(root, exprs,
+												  input_rel->rows, NULL, NULL),
+							  cx->numgroups);
 	}
 
 	/*
@@ -4386,6 +4513,7 @@ lion_count_path_topk(LionCountPathBuild *cx)
 		cx->ngroup != 1 ||
 		cx->nfilter > 0 ||
 		cx->decode || cx->partitioned || cx->sumall || cx->singlegroup ||
+		cx->groupderived ||
 		cx->distvar != NULL || cx->groupcoal != NULL || cx->having != NIL ||
 		first == NULL || first->driveidx[0] == NULL)
 		return;
@@ -5872,7 +6000,7 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 								 root->processed_groupClause,
 								 cx->having,
 								 &agg_final_costs,
-								 cx->numgroups));
+								 cx->finalgroups));
 		return;
 	}
 
@@ -6750,6 +6878,8 @@ lion_try_count_path_once(LionCountPathBuild *cx)
 	if (!lion_count_path_countcol(cx))
 		return false;
 	if (!lion_count_path_outputs(cx))
+		return false;
+	if (!lion_count_path_derived_ok(cx))
 		return false;
 	if (!lion_count_path_strategy(cx))
 		return false;

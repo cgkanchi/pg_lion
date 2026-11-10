@@ -2063,6 +2063,13 @@ extern PGDLLIMPORT bool lion_enable_count_cells;
 extern PGDLLIMPORT int lion_count_cells_max;
 
 /*
+ * Whether a GROUP BY of expressions of lion-indexed columns it does not name
+ * may be counted by those columns' groups and merged (DESIGN.md §36,
+ * "Expressions of columns not grouped").  A planner switch.
+ */
+extern PGDLLIMPORT bool lion_enable_expr_groups;
+
+/*
  * Whether the count pushdown may test WHERE clauses no posting set answers
  * on the heap rows the others select (DESIGN.md §10, "Residual clauses").
  * A planner switch.

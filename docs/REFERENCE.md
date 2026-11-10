@@ -852,6 +852,22 @@ working around a bad choice:
               Cell Columns: t_k (k)
               Cell Predicates: (k = ANY ('{1,2,3}'::integer[])), ((k = 4) OR (k = 5)), (k IS NULL)
               Cells: 4
+- `pg_lion.enable_expr_groups`: count a `GROUP BY` of immutable expressions of one or two
+  Lion-indexed columns it does not name - `GROUP BY upper(status)`, `GROUP BY kind / 5`, `GROUP BY
+  CASE WHEN k IN (1, 2) THEN 'a' ELSE 'b' END` - by the columns' own groups, the expressions
+  computed once a group from its key and the groups that share a value merged by a `Finalize
+  HashAggregate` (DESIGN.md §36, "Expressions of columns not grouped"). The column's index has to
+  store the rows' exact values: not `numeric`, a float or a nondeterministic collation, whose equal
+  values may print differently. Taken beside `count(*)`, `count(col)` of a grouped column, the
+  `WHERE` and a `HAVING`; not beside a `count(DISTINCT)`, a filtered count, a join or the top k.
+  Where both apply, the cost model chooses between this and a count by cells. Off, such a `GROUP
+  BY` goes to a count by cells or the ordinary plan:
+
+      Finalize HashAggregate
+        Group Key: upper(t)
+        ->  Custom Scan (LionCount)
+              Lion Indexes: t_t (t)
+              Group Key: t
 - `pg_lion.enable_count_partial`: let the count pushdown read a partial Lion index whose predicate
   the query's `WHERE` implies - `CREATE INDEX ... USING lion (g, c) WHERE f AND s = 'a'` for a
   query with `WHERE f AND s = 'a' AND c = 3` - leaving out the clauses the predicate implies, as a

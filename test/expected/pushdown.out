@@ -742,11 +742,11 @@ SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
  pushed down, 70 rows
 (1 row)
 
--- GROUP BY an expression
+-- GROUP BY an expression: a's groups, merged (DESIGN.md §36)
 SELECT lion_pd('SELECT a + 1, count(*) FROM lion_pdt GROUP BY a + 1');
-         lion_pd          
---------------------------
- not pushed down, 10 rows
+       lion_pd        
+----------------------
+ pushed down, 10 rows
 (1 row)
 
 -- a join
