@@ -4759,9 +4759,10 @@ lion_count_path_topk(LionCountPathBuild *cx)
 	cx->topkrows = lion_topk_rows(&freqs, tuples, cand, cx->groupest[0]);
 
 	/*
-	 * With nothing in the WHERE but g's own clauses, every count is its
-	 * entry's bound, and the k-th is at least the next: only the strict rule
-	 * may fall back then.  The spread of the values past the list is asked
+	 * With nothing in the WHERE but g's own clauses, every count is taken to
+	 * be its entry's bound, and the k-th at least the next: only the strict
+	 * rule may fall back then.  (Dead or invisible TIDs an entry still holds
+	 * make a count smaller than its bound, which this does not foresee.)  The spread of the values past the list is asked
 	 * for where a candidate, or the first entry left out, is one of them.
 	 */
 	if (sel < 1.0 || cx->topkstrict)

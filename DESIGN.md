@@ -23475,7 +23475,10 @@ the rows independently of the group, a candidate of bound b reaches that bound T
 binomial chance P(Bin(b, s) >= T), taken as normal with a continuity correction; the number that
 do is a sum of those chances, taken as normal too, and P(fewer than k) is how often the top k
 falls back (`lion_topk_whole_share()`). With nothing in the WHERE but g's own clauses every count
-is its bound, and only the strict rule can fall back.
+is taken to be its bound, and only the strict rule to fall back. That is an estimate: an entry
+still holding TIDs of dead or invisible rows counts fewer visible rows than its bound, and a
+non-strict top k can then fall back with no WHERE at all, which the price does not foresee - as
+before this change, it pays for the walk it makes.
 
 **The bounds.** The column's most common values give theirs, largest first, but for those a
 clause on g alone rejects (`lion_topk_freqs()`). Past that list the r-th largest key's rows are
@@ -23483,8 +23486,8 @@ read where the share (r - 1/2) / n of the keys lie above (`lion_topk_tail_bound(
 the list's smallest; the candidates there are taken in 32 strata of equal numbers, each at its
 middle one's bound. How many keys there are past the list, their rows and the spread of those are
 what a lion index on the column counted (§33, "The rows of a probed key"): its keys less the
-list's, the rows the list leaves, and the square root of Σn² over the keys less the mean's square
-(`lion_key_tail_counted()`), whatever `pg_lion.enable_skew_estimate` says. Where no index counted
+list's, the rows the list leaves, and the spread sqrt(Σn² / keys - mean²), Σn² counted over
+those keys (`lion_key_tail_counted()`), whatever `pg_lion.enable_skew_estimate` says. Where no index counted
 them, ANALYZE's distinct values less the list's, the rows it leaves them, and the spread of rows
 put in keys at random: the square root of the mean. A clause on g alone keeps the share of the
 keys past the list that its selectivity keeps of their rows.
