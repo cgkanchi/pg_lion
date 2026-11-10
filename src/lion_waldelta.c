@@ -193,8 +193,13 @@ lion_delta_encode_item(const char *old, Size oldlen, const char *cur, Size len,
 
 	*kind = LION_DELTA_KIND_NONE;
 
+	/*
+	 * RANGES goes straight into out: it is what is kept unless a SPLICE turns
+	 * out smaller, which then overwrites it.  A RANGES past cap stops before
+	 * writing past it.
+	 */
 	lion_delta_plain_base(old, oldlen, scratch, len);
-	rlen = lion_delta_ranges(scratch, cur, len, NULL, cap);
+	rlen = lion_delta_ranges(scratch, cur, len, out, cap);
 
 	/*
 	 * Can a SPLICE beat it?  Not when the ranges are already as small as the
@@ -256,8 +261,7 @@ lion_delta_encode_item(const char *old, Size oldlen, const char *cur, Size len,
 
 	if (rlen >= 0)
 	{
-		lion_delta_plain_base(old, oldlen, scratch, len);
-		(void) lion_delta_ranges(scratch, cur, len, out, (Size) rlen);
+		/* out holds it already */
 		*kind = LION_DELTA_KIND_RANGES;
 		return (Size) rlen;
 	}
