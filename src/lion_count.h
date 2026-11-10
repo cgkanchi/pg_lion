@@ -2226,6 +2226,10 @@ extern void lion_ordjoin_init(void);
 /* get_relation_stats_hook; called from _PG_init. */
 extern void lion_selfuncs_init(void);
 
+/* lion_plan_lateral.c: a grouped subquery joined in, tried as LATERAL (§55) */
+extern PGDLLIMPORT bool lion_enable_lateral_counts;
+extern void lion_lateral_init(void);
+
 /*
  * How many containers a key of lion index idx's key column col (from 1) has,
  * on average over the column's keys, as its meta page counted them, and the

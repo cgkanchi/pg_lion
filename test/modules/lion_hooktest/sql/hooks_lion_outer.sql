@@ -50,3 +50,41 @@ SELECT lion_hooktest_rel_calls() > 0 AS rel_hook_ran,
 -- both prefixes are reserved
 SET pg_lion.no_such_setting = 1;
 SET lion_hooktest.no_such_setting = 1;
+
+-- pg_lion's planner hook (DESIGN.md §55) plans a grouped subquery joined in
+-- again as a LATERAL subquery, through the other planner hook, which here
+-- refuses that form with an error: the error is dropped with the plan, and
+-- the query runs as written, with the same rows, in a transaction that
+-- carries on.
+CREATE TABLE hk_u (id int PRIMARY KEY, r int);
+INSERT INTO hk_u SELECT i, i % 100 FROM generate_series(1, 5000) i;
+CREATE TABLE hk_e (uid int, s int);
+INSERT INTO hk_e SELECT 1 + (i * 7) % 5000, i % 3 FROM generate_series(1, 100000) i;
+CREATE INDEX hk_e_uid ON hk_e USING lion (uid);
+CREATE INDEX hk_u_r ON hk_u (r);
+VACUUM ANALYZE hk_u, hk_e;
+EXPLAIN (COSTS OFF)
+SELECT u.id, e.n FROM hk_u u
+  JOIN (SELECT uid, count(*) AS n FROM hk_e GROUP BY uid) e ON e.uid = u.id
+ WHERE u.r = 7;
+SELECT count(*), sum(e.n) FROM hk_u u
+  JOIN (SELECT uid, count(*) AS n FROM hk_e GROUP BY uid) e ON e.uid = u.id
+ WHERE u.r = 7;
+BEGIN;
+SET LOCAL lion_hooktest.refuse_lateral = on;
+EXPLAIN (COSTS OFF)
+SELECT u.id, e.n FROM hk_u u
+  JOIN (SELECT uid, count(*) AS n FROM hk_e GROUP BY uid) e ON e.uid = u.id
+ WHERE u.r = 7;
+SELECT count(*), sum(e.n) FROM hk_u u
+  JOIN (SELECT uid, count(*) AS n FROM hk_e GROUP BY uid) e ON e.uid = u.id
+ WHERE u.r = 7;
+SELECT 1 AS still_in_the_transaction;
+COMMIT;
+-- the form itself, written by hand, is what the other hook refuses
+SET lion_hooktest.refuse_lateral = on;
+SELECT count(*) FROM hk_u u
+  JOIN LATERAL (SELECT uid FROM hk_e WHERE uid = u.id GROUP BY uid) e ON true
+ WHERE u.r = 7;
+RESET lion_hooktest.refuse_lateral;
+DROP TABLE hk_u, hk_e;

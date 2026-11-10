@@ -708,6 +708,22 @@ working around a bad choice:
 
 - `pg_lion.enable_count_pushdown`: answer `count(*)` from Lion indexes with the `LionCount`
   custom scan (DESIGN.md §10). Off, it turns off `pg_lion.enable_semijoin`'s joins too.
+- `pg_lion.enable_lateral_counts`: plan a query that joins in a grouped subquery a second time,
+  with the join clause moved into the subquery as a `LATERAL` reference, and keep the cheaper
+  plan (DESIGN.md §55). For
+
+      SELECT u.id, s.n FROM users u
+        JOIN (SELECT user_id, count(*) AS n FROM events WHERE status = 'paid'
+               GROUP BY user_id) s ON s.user_id = u.id
+       WHERE u.region = 'r3';
+
+  that is one `LionCount` of each user's paid events per outer row instead of every user's
+  count grouped first. Tried when the clause is an equality of the subquery's grouping column,
+  that column has a Lion index, every join is an inner join and the subquery's rows are its
+  groups' own (no window function, `DISTINCT`, `LIMIT`, grouping sets or volatile function);
+  each such query is planned twice. Needs the library loaded before the query is planned
+  (`shared_preload_libraries` or `session_preload_libraries`): otherwise the first query of a
+  session, the one that loads it, is planned as written.
 - `pg_lion.enable_semijoin`: offer `LionSemiJoin` and `LionAntiJoin`, a semi or anti join over a
   fact table answered from the Lion index on its foreign key (DESIGN.md §27, "The semi and anti
   join as a join path"). PostgreSQL's `enable_hashjoin`, `enable_mergejoin` and `enable_nestloop`

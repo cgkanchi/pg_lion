@@ -1,0 +1,440 @@
+-- A grouped subquery joined in, planned again as a LATERAL subquery
+-- (DESIGN.md §55): where the rewrite is tried, that the cheaper of the two
+-- plans is kept, and that every answer is the same as with the rewrite off.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+SET max_parallel_workers_per_gather = 0;
+CREATE TABLE lat_u (id int PRIMARY KEY, plan text, region text, big bigint);
+CREATE TABLE lat_e (id int, user_id int, status text, amt int, tag text);
+INSERT INTO lat_u
+SELECT g, (ARRAY['free', 'pro', 'ent'])[1 + g % 3], 'r' || (g % 40), g
+  FROM generate_series(1, 20000) g;
+INSERT INTO lat_e
+SELECT g, CASE WHEN g % 97 = 0 THEN NULL ELSE 1 + (g * 7919) % 20000 END,
+	   (ARRAY['paid', 'void', 'open', 'paid'])[1 + (g / 3) % 4], g % 1000,
+	   't' || (g % 5000)
+  FROM generate_series(1, 200000) g;
+CREATE INDEX lat_e_user ON lat_e USING lion (user_id);
+CREATE INDEX lat_e_status ON lat_e USING lion (status);
+CREATE INDEX lat_e_tag ON lat_e USING lion (tag);
+CREATE INDEX lat_u_region ON lat_u (region);
+VACUUM ANALYZE lat_u, lat_e;
+/*
+ * lat_check() says whether the planner kept the rewritten plan (its plan
+ * differs from the one with pg_lion.enable_lateral_counts off) and compares
+ * the rows of the two as multisets.
+ */
+CREATE FUNCTION lat_check(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	p_on text := '';
+	p_off text := '';
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('pg_lion.enable_lateral_counts', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		p_on := p_on || ln || E'\n';
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lat_on AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('pg_lion.enable_lateral_counts', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		p_off := p_off || ln || E'\n';
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lat_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('pg_lion.enable_lateral_counts', 'on', true);
+	SELECT count(*) INTO nrows FROM lat_on;
+	SELECT (SELECT count(*) FROM (TABLE lat_on EXCEPT ALL TABLE lat_off) a) +
+		   (SELECT count(*) FROM (TABLE lat_off EXCEPT ALL TABLE lat_on) b)
+	  INTO ndiff;
+	DROP TABLE lat_on, lat_off;
+	RETURN CASE WHEN p_on = p_off THEN 'as written' ELSE 'lateral' END ||
+		   ', ' || nrows || ' rows' ||
+		   CASE WHEN ndiff = 0 THEN '' ELSE ', ' || ndiff || ' DIFFER' END;
+END
+$$;
+-- the shape: a count per key of the subquery, a few keys from the outer side
+EXPLAIN (COSTS OFF)
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT user_id, count(*) AS n FROM lat_e WHERE status = 'paid'
+		 GROUP BY user_id) s ON s.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent';
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Nested Loop
+   ->  Bitmap Heap Scan on lat_u u
+         Recheck Cond: (region = 'r7'::text)
+         Filter: (plan = 'ent'::text)
+         ->  Bitmap Index Scan on lat_u_region
+               Index Cond: (region = 'r7'::text)
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lat_e_status (status = 'paid'::text), lat_e_user (user_id = u.id)
+(8 rows)
+
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT user_id, count(*) AS n FROM lat_e WHERE status = 'paid'
+		 GROUP BY user_id) s ON s.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+     lat_check     
+-------------------
+ lateral, 167 rows
+(1 row)
+
+-- the clause either way round, beside others in ON, in WHERE over a comma
+-- join, with an expression of the outer side, across integer widths
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT user_id, count(*) AS n FROM lat_e GROUP BY user_id) s
+	ON u.id = s.user_id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+     lat_check     
+-------------------
+ lateral, 167 rows
+(1 row)
+
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT user_id, count(*) AS n FROM lat_e GROUP BY user_id) s
+	ON s.n > 9 AND s.user_id = u.id AND u.id > 100
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+     lat_check     
+-------------------
+ lateral, 150 rows
+(1 row)
+
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u, (SELECT user_id, count(*) AS n FROM lat_e GROUP BY user_id) s
+ WHERE s.user_id = u.id + 1 AND u.region = 'r7' AND u.plan = 'ent'$$);
+     lat_check     
+-------------------
+ lateral, 167 rows
+(1 row)
+
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT user_id, count(*) AS n FROM lat_e GROUP BY user_id) s
+	ON s.user_id = u.big
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+     lat_check     
+-------------------
+ lateral, 167 rows
+(1 row)
+
+-- HAVING and a FILTER; other aggregates, which lion does not count per key,
+-- so grouping once stays cheaper
+SELECT lat_check($$
+SELECT u.id, s.n, s.paid
+  FROM lat_u u
+  JOIN (SELECT user_id, count(*) AS n,
+			   count(*) FILTER (WHERE status = 'paid') AS paid
+		  FROM lat_e GROUP BY user_id HAVING count(*) > 9) s
+	ON s.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+     lat_check     
+-------------------
+ lateral, 151 rows
+(1 row)
+
+SELECT lat_check($$
+SELECT u.id, s.lo, s.hi, s.total
+  FROM lat_u u
+  JOIN (SELECT user_id, min(amt) AS lo, max(amt) AS hi, sum(amt) AS total
+		  FROM lat_e WHERE status <> 'void'
+		 GROUP BY user_id HAVING count(*) > 2) s ON s.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+      lat_check       
+----------------------
+ as written, 167 rows
+(1 row)
+
+-- a join inside the subquery, a third relation outside it, two subqueries
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT e.user_id, count(*) AS n
+		  FROM lat_e e JOIN lat_u w ON w.id = e.id
+		 WHERE w.plan = 'pro' GROUP BY e.user_id) s ON s.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+      lat_check      
+---------------------
+ as written, 55 rows
+(1 row)
+
+SELECT lat_check($$
+SELECT u.id, v.id, s.n
+  FROM lat_u u
+  JOIN lat_u v ON v.id = u.id + 20
+  JOIN (SELECT user_id, count(*) AS n FROM lat_e GROUP BY user_id) s
+	ON s.user_id = v.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+     lat_check     
+-------------------
+ lateral, 167 rows
+(1 row)
+
+SELECT lat_check($$
+SELECT u.id, a.n, b.n
+  FROM lat_u u
+  JOIN (SELECT user_id, count(*) AS n FROM lat_e WHERE status = 'paid'
+		 GROUP BY user_id) a ON a.user_id = u.id
+  JOIN (SELECT user_id, count(*) AS n FROM lat_e WHERE status = 'open'
+		 GROUP BY user_id) b ON b.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+     lat_check     
+-------------------
+ lateral, 167 rows
+(1 row)
+
+-- a text key in the column's own collation; a view
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT tag, count(*) AS n FROM lat_e GROUP BY tag) s
+	ON s.tag = 't' || (u.id % 6000)
+ WHERE u.region = 'r7' AND u.plan = 'ent' AND u.id < 4000$$);
+    lat_check     
+------------------
+ lateral, 33 rows
+(1 row)
+
+CREATE VIEW lat_paid AS
+SELECT user_id, count(*) AS n FROM lat_e WHERE status = 'paid' GROUP BY user_id;
+SELECT lat_check($$
+SELECT u.id, p.n FROM lat_u u JOIN lat_paid p ON p.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+     lat_check     
+-------------------
+ lateral, 167 rows
+(1 row)
+
+-- many outer rows: grouping once is cheaper, and the plan is kept
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT user_id, count(*) AS n FROM lat_e GROUP BY user_id) s
+	ON s.user_id = u.id$$);
+       lat_check        
+------------------------
+ as written, 20000 rows
+(1 row)
+
+-- not tried: an outer join, the subquery first, another collation, not an
+-- equality, a grouping column without a lion index or not a plain column,
+-- and a subquery whose result depends on more than its group's rows
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  LEFT JOIN (SELECT user_id, count(*) AS n FROM lat_e GROUP BY user_id) s
+	ON s.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+      lat_check       
+----------------------
+ as written, 167 rows
+(1 row)
+
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM (SELECT user_id, count(*) AS n FROM lat_e GROUP BY user_id) s
+  JOIN lat_u u ON s.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+      lat_check       
+----------------------
+ as written, 167 rows
+(1 row)
+
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT tag, count(*) AS n FROM lat_e GROUP BY tag) s
+	ON s.tag = ('t' || (u.id % 6000)) COLLATE "C"
+ WHERE u.region = 'r7' AND u.plan = 'ent' AND u.id < 4000$$);
+      lat_check      
+---------------------
+ as written, 33 rows
+(1 row)
+
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT user_id, count(*) AS n FROM lat_e GROUP BY user_id) s
+	ON s.user_id < u.id
+ WHERE u.id < 4$$);
+     lat_check      
+--------------------
+ as written, 3 rows
+(1 row)
+
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT amt, count(*) AS n FROM lat_e GROUP BY amt) s
+	ON s.amt = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+     lat_check      
+--------------------
+ as written, 8 rows
+(1 row)
+
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT user_id + 0 AS k, count(*) AS n FROM lat_e GROUP BY 1) s
+	ON s.k = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+      lat_check       
+----------------------
+ as written, 167 rows
+(1 row)
+
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT user_id, count(*) AS n FROM lat_e GROUP BY user_id
+		 ORDER BY n DESC LIMIT 500) s ON s.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+     lat_check      
+--------------------
+ as written, 5 rows
+(1 row)
+
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT user_id, count(*) AS n, rank() OVER (ORDER BY count(*)) AS r
+		  FROM lat_e GROUP BY user_id) s ON s.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+      lat_check       
+----------------------
+ as written, 167 rows
+(1 row)
+
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT user_id, status, count(*) AS n FROM lat_e
+		 GROUP BY GROUPING SETS ((user_id), (user_id, status))) s
+	ON s.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+      lat_check       
+----------------------
+ as written, 501 rows
+(1 row)
+
+SELECT lat_check($$
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT user_id, count(*) AS n FROM lat_e WHERE random() >= 0
+		 GROUP BY user_id) s ON s.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+      lat_check       
+----------------------
+ as written, 167 rows
+(1 row)
+
+CREATE VIEW lat_paid_sb WITH (security_barrier) AS
+SELECT user_id, count(*) AS n FROM lat_e WHERE status = 'paid' GROUP BY user_id;
+SELECT lat_check($$
+SELECT u.id, p.n FROM lat_u u JOIN lat_paid_sb p ON p.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent'$$);
+      lat_check       
+----------------------
+ as written, 167 rows
+(1 row)
+
+-- off
+SET pg_lion.enable_lateral_counts = off;
+EXPLAIN (COSTS OFF)
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT user_id, count(*) AS n FROM lat_e WHERE status = 'paid'
+		 GROUP BY user_id) s ON s.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent';
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Hash Join
+   Hash Cond: (lat_e.user_id = u.id)
+   ->  HashAggregate
+         Group Key: lat_e.user_id
+         ->  Bitmap Heap Scan on lat_e
+               Recheck Cond: (status = 'paid'::text)
+               ->  Bitmap Index Scan on lat_e_status
+                     Index Cond: (status = 'paid'::text)
+   ->  Hash
+         ->  Bitmap Heap Scan on lat_u u
+               Recheck Cond: (region = 'r7'::text)
+               Filter: (plan = 'ent'::text)
+               ->  Bitmap Index Scan on lat_u_region
+                     Index Cond: (region = 'r7'::text)
+(14 rows)
+
+RESET pg_lion.enable_lateral_counts;
+-- a prepared statement, custom and generic plans
+PREPARE lat_q(text) AS
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT user_id, count(*) AS n FROM lat_e WHERE status = 'paid'
+		 GROUP BY user_id) s ON s.user_id = u.id
+ WHERE u.region = $1 AND u.plan = 'ent';
+SET plan_cache_mode = force_custom_plan;
+EXPLAIN (COSTS OFF) EXECUTE lat_q('r7');
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Nested Loop
+   ->  Bitmap Heap Scan on lat_u u
+         Recheck Cond: (region = 'r7'::text)
+         Filter: (plan = 'ent'::text)
+         ->  Bitmap Index Scan on lat_u_region
+               Index Cond: (region = 'r7'::text)
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lat_e_status (status = 'paid'::text), lat_e_user (user_id = u.id)
+(8 rows)
+
+CREATE TEMP TABLE lat_custom AS EXECUTE lat_q('r7');
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE lat_q('r7');
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Nested Loop
+   ->  Bitmap Heap Scan on lat_u u
+         Recheck Cond: (region = $1)
+         Filter: (plan = 'ent'::text)
+         ->  Bitmap Index Scan on lat_u_region
+               Index Cond: (region = $1)
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lat_e_status (status = 'paid'::text), lat_e_user (user_id = u.id)
+(8 rows)
+
+CREATE TEMP TABLE lat_generic AS EXECUTE lat_q('r7');
+RESET plan_cache_mode;
+SET pg_lion.enable_lateral_counts = off;
+CREATE TEMP TABLE lat_plain AS
+SELECT u.id, s.n
+  FROM lat_u u
+  JOIN (SELECT user_id, count(*) AS n FROM lat_e WHERE status = 'paid'
+		 GROUP BY user_id) s ON s.user_id = u.id
+ WHERE u.region = 'r7' AND u.plan = 'ent';
+RESET pg_lion.enable_lateral_counts;
+SELECT (SELECT count(*) FROM lat_plain) AS n,
+	   (SELECT count(*) FROM (TABLE lat_custom EXCEPT ALL TABLE lat_plain) a) +
+	   (SELECT count(*) FROM (TABLE lat_plain EXCEPT ALL TABLE lat_custom) b) AS custom_diff,
+	   (SELECT count(*) FROM (TABLE lat_generic EXCEPT ALL TABLE lat_plain) a) +
+	   (SELECT count(*) FROM (TABLE lat_plain EXCEPT ALL TABLE lat_generic) b) AS generic_diff;
+  n  | custom_diff | generic_diff 
+-----+-------------+--------------
+ 167 |           0 |            0
+(1 row)
+
+DEALLOCATE lat_q;
+DROP VIEW lat_paid, lat_paid_sb;
+DROP TABLE lat_u, lat_e;
+DROP FUNCTION lat_check(text);

@@ -10303,8 +10303,10 @@ What pg_lion installs into the server, all of it from `_PG_init()` (lion_am.c, l
 lion_ordered.c, lion_bm25_scan.c, lion_selfuncs.c, lion_wal.c): `create_upper_paths_hook` and
 `set_join_pathlist_hook`; `set_rel_pathlist_hook` three times over - `LionOrdered` (§30), `LionBm25`
 (§39) and the plain-scan repricing with the row correction (§33, §40), installed in that order, so
-the repricing runs first -; `get_relation_stats_hook` and `get_index_stats_hook` (§33, §41); and
-nothing else among the hooks - no planner, executor, ProcessUtility or object-access hook -; a
+the repricing runs first -; `get_relation_stats_hook` and `get_index_stats_hook` (§33, §41);
+`planner_hook` (§55, lion_plan_lateral.c), which calls the previous hook - or
+`standard_planner()` - once, or twice for a query it rewrites; and nothing else among the hooks -
+no executor, ProcessUtility or object-access hook -; a
 custom WAL resource manager, only while `shared_preload_libraries` is processed; its GUCs, with the
 `pg_lion` prefix reserved by `MarkGUCPrefixReserved()`. Every hook saves the previous value and
 calls it: all but one FIRST, adding their own path after (`lion_create_upper_paths()`,
@@ -34323,3 +34325,111 @@ and VACUUM, the plans and `EXPLAIN ANALYZE`'s counters, and the declines: a leaf
 not slice the column, until pruning leaves it out, and the switch); `slices_range.sql`'s
 partitioned table now answered; and the isolation spec `slices_partitioned.spec` with a count and a
 sum under a range from slices beside the aggregates.
+
+## 55. A grouped subquery joined in, planned again as LATERAL (2026-11-10)
+
+    SELECT u.id, s.n
+      FROM users u
+      JOIN (SELECT user_id, count(*) AS n FROM events
+             WHERE status = 'paid' GROUP BY user_id) s ON s.user_id = u.id
+     WHERE u.plan = 'ent' AND u.region = 'r3';
+
+PostgreSQL plans the subquery on its own - every user's count, from every paid event - and joins
+the few users the outer side keeps to the result. The join clause cannot reach the subquery as a
+restriction, since it names another relation, and a grouped subquery is never pulled up into the
+join. Written by hand with the clause inside it,
+
+    JOIN LATERAL (SELECT user_id, count(*) AS n FROM events
+                   WHERE status = 'paid' AND user_id = u.id
+                   GROUP BY user_id) s ON true
+
+the subquery counts one key for each outer row, which LionCount answers from the sets of a lion
+index on `user_id` - the count pushdown's equality on a nested loop's parameter (§10).
+`pg_lion.enable_lateral_counts` (lion_plan_lateral.c) makes that rewrite itself and lets the
+planner choose.
+
+### 55.1 When the two are the same query
+
+`lion_lateral_rewrite()` moves a clause `s.k OP expr` (or `expr OP s.k`) of the outer query into
+the grouped subquery `s` as `k OP expr`, `expr`'s Vars one level up, and marks `s` LATERAL. That
+returns the same rows where:
+
+- **The clause is an equality of the grouping.** OP is strict, mergejoinable or hashjoinable, and
+  `equality_ops_are_compatible()` with the grouping's own equality on `k`, in the same collation:
+  rows the grouping puts in one group are then all equal to `expr` under OP or all unequal, so
+  filtering rows by OP before the grouping keeps or drops whole groups, and drops exactly the
+  groups the join would have dropped. A strict OP drops the NULL group either way.
+- **Every join of the outer query is an inner join**, so that nothing nullable sits between the
+  subquery and the relations `expr` reads, and `expr` reads only relations named before `s` in
+  the FROM list - those a LATERAL subquery may see - and no aggregate, window function, sublink
+  or volatile function.
+- **Nothing in the subquery's result depends on rows outside the group**, or on how many times
+  it runs: a plain `SELECT ... GROUP BY` (no grouping sets) with an aggregate, and no window
+  function, set-returning function in the target list, `DISTINCT`, `LIMIT`/`OFFSET`, row lock,
+  set operation, CTE, sublink or volatile function. `HAVING` and `FILTER` are a group's own, and
+  stay.
+- **`k` is a plain column of a table** (read through the group RTE from PostgreSQL 18 on), with
+  no row-level security on the subquery and no `security_barrier` view around it - the moved
+  clause would otherwise run beside the view's quals before them - and a lion index has the
+  column among its keys, so that a query that cannot gain is not planned twice.
+
+The clause is taken out of the outer query rather than kept there too: every group the rewritten
+subquery returns meets it, and kept it would be estimated a second time as a join filter (the
+example's join was estimated at 25 rows with it, 5,006 without, and returns 4,262). The rewrite is applied to every subquery that
+qualifies, each with its own clause.
+
+### 55.2 Which plan
+
+Which is faster turns on how many outer rows there are, which only the planner knows: one count
+per outer row against one grouping of every row. The planner hook (`lion_lateral_planner()`)
+plans the query as written, then the rewritten copy, and keeps the plan with the lower total
+cost. Both go through the previous hook, or `standard_planner()`. A cursor that asks for its
+first rows fast (`CURSOR_OPT_FAST_PLAN`) is planned as written only, the total costs not being
+what it is decided on, and so is a query planned in a parallel worker (a PL/pgSQL function's,
+say), where the next point needs a subtransaction.
+
+The rewritten copy is planned inside a subtransaction, as a PL/pgSQL exception block runs, and an
+error from it - another extension's planner hook that does not take a LATERAL subquery, say - is
+dropped with its plan: the query as written already has one. A cancel, and anything above ERROR,
+is not dropped. `test/modules/lion_hooktest` has a planner hook that refuses LATERAL subqueries
+while `lion_hooktest.refuse_lateral` is on, and `make hookcheck` runs the example under it.
+
+The price is a second planning of a query that qualifies (0.53 ms against 0.38 for the example),
+and for any other a pass over its range table, or, where it has a grouped subquery, a copy of it
+and the checks above. Two consequences of the hook's place in the chain:
+
+- **pg_stat_statements** counts two plannings of a qualifying query when it was loaded before
+  pg_lion (its hook is then the previous one, called twice), and one when it was loaded after.
+- **The library has to be loaded before the query is planned.** pg_lion is otherwise loaded by
+  the first query that opens a lion index, in the middle of its planning, after the planner hook
+  would have run: preload it (`shared_preload_libraries` or `session_preload_libraries`), or that
+  first query of a session is planned as written.
+
+### 55.3 Measured
+
+PostgreSQL 18.7, release build, 2 parallel workers per gather, warm, best of 6; a synthetic
+`users` of 200,000 rows (lion indexes on `plan` and `region`) and `events` of 2,000,031 (lion
+indexes on `status` and `user_id`, 399,548 paid, a B-tree on `users.id`):
+
+| outer rows | as written (Hash Join over HashAggregate) | rewrite on | |
+| --- | --- | --- | --- |
+| 4,262 (the example) | 258 ms | 54 ms (Nested Loop over LionCount) | 4.8x |
+| 44,641 (`u.plan = 'ent'` alone) | 319 ms | 263 ms (as written kept; the LATERAL plan forced runs 464 ms) | 1.0x |
+
+### 55.4 Not done
+
+- A subquery named before the relations its clause reads (`FROM (SELECT ...) s JOIN users u`):
+  reordering the FROM list to put it after them is possible but not done.
+- An outer join to the subquery. `u LEFT JOIN (SELECT ...) s ON s.k = u.id` is the same query
+  as a `LEFT JOIN LATERAL` with the clause inside; the outer-join cases (which side the subquery
+  is on, which `ON` the clause is in) need checks of their own, and are left for later.
+- A grouping key that is an expression (`GROUP BY date_trunc('day', ts)`), which the clause
+  would have to match as an expression index's column.
+- `DISTINCT` without aggregates, the same idea as a semi join.
+
+Tests: `test/sql/lateral_count.sql` (the clause either way round, in `ON` beside other clauses,
+in `WHERE` over a comma join, an expression of the outer side, across integer widths, `HAVING`
+and `FILTER`, aggregates lion does not count per key, a join inside the subquery and a third
+relation outside it, two subqueries, a text key, a view, many outer rows, every decline above,
+the setting off, and a prepared statement's custom and generic plans; every answer compared with
+the setting off), and `test/modules/lion_hooktest/sql/hooks_lion_outer.sql` (the refusing hook).

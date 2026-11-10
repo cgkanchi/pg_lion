@@ -23,7 +23,13 @@
  *	  OID in lion_hooktest.deny_execute, as a security module such as sepgsql
  *	  refuses one: the hook that InvokeFunctionExecuteHook() calls, which a
  *	  lion node that stands in for an expression must call as the executor
- *	  would have (sql/exec_hook.sql).
+ *	  would have (sql/exec_hook.sql);
+ *	- planner_hook, refusing with an error, while lion_hooktest.refuse_lateral
+ *	  is on, a query with a LATERAL subquery in its FROM list, as a planner
+ *	  extension that does not take one would: pg_lion's planner hook plans a
+ *	  query again as rewritten with such a subquery (DESIGN.md §55), which
+ *	  must not fail a statement whose own plan does not have one
+ *	  (sql/hooks_lion_outer.sql).
  *
  * It also provides lion_hooktest_heapcopy_handler(), a table access method
  * whose routine is a copy of the heap's: a table AM that stores heap tuples
@@ -46,6 +52,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
+#include "nodes/parsenodes.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/paths.h"
 #include "optimizer/planner.h"
@@ -79,6 +86,8 @@ static int	hooktest_rmgr_id = RM_EXPERIMENTAL_ID;
 static TableAmRoutine heapcopy_routine;
 static object_access_hook_type prev_object_access_hook = NULL;
 static char *hooktest_deny_execute = NULL;
+static planner_hook_type prev_planner_hook = NULL;
+static bool hooktest_refuse_lateral = false;
 
 static void
 hooktest_redo(XLogReaderState *record)
@@ -176,6 +185,46 @@ hooktest_object_access(ObjectAccessType access, Oid classId, Oid objectId,
 						format_procedure(objectId))));
 }
 
+/*
+ * While lion_hooktest.refuse_lateral is on, a LATERAL subquery in the FROM
+ * list is refused.
+ */
+static PlannedStmt *
+hooktest_planner(Query *parse, const char *query_string, int cursorOptions,
+				 ParamListInfo boundParams
+#if PG_VERSION_NUM >= 190000
+				 ,ExplainState *es
+#endif
+)
+{
+	ListCell   *lc;
+
+	if (hooktest_refuse_lateral)
+	{
+		foreach(lc, parse->rtable)
+		{
+			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+			if (rte->rtekind == RTE_SUBQUERY && rte->lateral)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("lion_hooktest: LATERAL subquery refused")));
+		}
+	}
+	if (prev_planner_hook != NULL)
+		return prev_planner_hook(parse, query_string, cursorOptions,
+								 boundParams
+#if PG_VERSION_NUM >= 190000
+								 ,es
+#endif
+			);
+	return standard_planner(parse, query_string, cursorOptions, boundParams
+#if PG_VERSION_NUM >= 190000
+							,es
+#endif
+		);
+}
+
 void
 _PG_init(void)
 {
@@ -200,6 +249,14 @@ _PG_init(void)
 							   PGC_SUSET,
 							   0,
 							   NULL, NULL, NULL);
+	DefineCustomBoolVariable("lion_hooktest.refuse_lateral",
+							 "The planner hook refuses a LATERAL subquery with an error.",
+							 NULL,
+							 &hooktest_refuse_lateral,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 	MarkGUCPrefixReserved("lion_hooktest");
 
 	prev_create_upper_paths_hook = create_upper_paths_hook;
@@ -208,6 +265,8 @@ _PG_init(void)
 	set_rel_pathlist_hook = hooktest_set_rel_pathlist;
 	prev_object_access_hook = object_access_hook;
 	object_access_hook = hooktest_object_access;
+	prev_planner_hook = planner_hook;
+	planner_hook = hooktest_planner;
 }
 
 Datum
