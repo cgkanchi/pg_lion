@@ -94,23 +94,6 @@ lion_index_dir_pages(IndexOptInfo *idx, double *height)
 }
 
 /*
- * The largest posting set, in bytes, that an entry of idx keeps INLINE: the
- * inline_limit its meta page records, read through its cached state.  That
- * is the limit its entries were written under; the reloption may differ from
- * it until the next REINDEX.
- */
-double
-lion_index_inline_limit(IndexOptInfo *idx)
-{
-	Relation	indexrel = index_open(idx->indexoid, AccessShareLock);
-	double		limit;
-
-	limit = (double) lion_get_index_state(indexrel)->meta.inline_limit;
-	index_close(indexrel, AccessShareLock);
-	return limit;
-}
-
-/*
  * A clause of rel's as lion's cost model hands it to core's selectivity
  * functions, which it asks with varRelid 0: the clause itself where it is of
  * rel alone, and a join clause - `fk = outer.pk`, taken as a parameterized
@@ -1688,7 +1671,7 @@ lion_cost_notnull(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 													lion_containers_for(heap_pages,
 																		perentry));
 		double		walk = 1.0 + entries *
-			((entrypages * BLCKSZ <= lion_index_inline_limit(idx)) ?
+			((entrypages * BLCKSZ <= lion_index_inline_limit(root, idx)) ?
 			 entrypages : Max(1.0, entrypages));
 		double		windows = Max(1.0, ceil(sc.containers /
 										  (double) lion_walk_window()));
@@ -4315,7 +4298,7 @@ lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
 			entry = LION_LIST_GROUP_COST;
 		else if (!c->whereonce && c->topk <= 0.0 &&
 				 lion_set_pages_for(gm, keys[c->nsrc]) * BLCKSZ <=
-				 lion_index_inline_limit(c->groupidx))
+				 lion_index_inline_limit(c->root, c->groupidx))
 			entry = LION_INLINE_ENTRY_COUNT_COST;
 		c->merge_cpu += c->walked * entry;
 	}

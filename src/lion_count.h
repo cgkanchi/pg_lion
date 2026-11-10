@@ -2247,6 +2247,12 @@ extern void lion_ordjoin_init(void);
 extern void lion_selfuncs_init(void);
 
 /*
+ * The INLINE limit lion index idx's entries were written under, from its meta
+ * page (DESIGN.md §10, "Planner integration").
+ */
+extern double lion_index_inline_limit(PlannerInfo *root, IndexOptInfo *idx);
+
+/*
  * How many containers a key of lion index idx's key column col (from 1) has,
  * on average over the column's keys, as its meta page counted them, and the
  * rows a key had then (*keyrows); 0 when the page has no count of it or the
