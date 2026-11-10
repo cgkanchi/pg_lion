@@ -442,6 +442,11 @@ typedef struct LionCountPathBuild
 								 * key") */
 	bool		nokeytest;		/* ... none: the build that leaves them
 								 * residual */
+	bool		rangeortest;	/* ... and an OR of one column with a range
+								 * among its arms too, which a union would
+								 * collect with no pin (§32) */
+	int			nrangeor;		/* such ORs a build without that took as a
+								 * union */
 	List	   *wattnos;		/* §37: the columns aggregates are taken
 								 * over, weighted by their entries' rows */
 	List	   *widx;			/* ... their indexes (IndexOptInfo) */
@@ -1346,6 +1351,30 @@ lion_count_path_keytest_ok(const LionCountPathBuild *cx)
 }
 
 /*
+ * Did lion_count_path_where_or() take the OR clause, whose leaves begin at
+ * position first, as a union with a range among its arms that it collects
+ * from the entries rather than the slices - and is it an OR of one column
+ * whose keys could be tested instead (lion_keytest_leaf())?
+ */
+static bool
+lion_count_path_or_range(const LionCountPathBuild *cx, int first,
+						 Node *clause)
+{
+	LionLeafInfo leaf;
+	bool		range = false;
+	ListCell   *lc;
+
+	for_each_from(lc, cx->clauseinfos, first)
+	{
+		LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
+
+		if (ci->kind == LION_CLAUSE_RANGESRC && !ci->sliced)
+			range = true;
+	}
+	return range && lion_keytest_leaf(cx->root, clause, cx->rti, &leaf);
+}
+
+/*
  * A WHERE restriction that is no OR (lion_count_path_where()): a range
  * comparison, gathered per column, or a clause the posting sets answer, with
  * what it says of its column noted.  False when no posting set answers it;
@@ -2201,7 +2230,37 @@ lion_count_path_where(LionCountPathBuild *cx)
 		 * (lion_count_path_where_leaf()).
 		 */
 		if (IsA(clause, BoolExpr) && ((BoolExpr *) clause)->boolop == OR_EXPR)
+		{
 			answered = lion_count_path_where_or(cx, clause);
+
+			/*
+			 * An OR of one column with a range among its arms - `c LIKE
+			 * 'c1%' OR c = 'c5'`, the LIKE its range (lion_like_as_and()) -
+			 * that the keys passing it could answer as well: the union
+			 * collects the range with no pin (DESIGN.md §32), and a count
+			 * with no other pinned source declines it, where the IN list
+			 * of the keys is pinned.  The build that tests its keys is made
+			 * as well (lion_try_count_path_scoped()), and add_path() keeps
+			 * the cheaper.
+			 */
+			if (answered && lion_count_path_keytest_allowed(cx) &&
+				lion_count_path_or_range(cx, startlen, clause))
+			{
+				if (!cx->rangeortest)
+					cx->nrangeor++;
+				else
+				{
+					lion_count_path_restore(cx, &snap);
+					lion_count_path_snapshot(cx, &snap);
+					if (!lion_count_path_where_leaf(cx, rinfo, clause))
+					{
+						lion_count_path_restore(cx, &snap);
+						lion_count_path_snapshot(cx, &snap);
+						answered = lion_count_path_where_or(cx, clause);
+					}
+				}
+			}
+		}
 		else if ((ands = lion_all_as_and(clause)) != NIL)
 		{
 			ListCell   *la;
@@ -2247,7 +2306,7 @@ lion_count_path_where(LionCountPathBuild *cx)
 
 		/*
 		 * An OR whose arms the posting sets do not all answer, of one column -
-		 * `t LIKE 'a%' OR t LIKE 'b%'`, `upper(t) = 'A' OR t = 'b'` - may be
+		 * `t LIKE '%a' OR t LIKE '%b'`, `upper(t) = 'A' OR t = 'b'` - may be
 		 * a test of each key (DESIGN.md §10, "A test of each key"), its arms
 		 * taken back first.
 		 */
@@ -7212,6 +7271,19 @@ lion_try_count_path_scoped(LionCountPathBuild *cxp)
 	 * a residual clause.
 	 */
 	ok = lion_try_count_path_once(&cx);
+
+	/*
+	 * ... and where it took an OR of one column with a range among its arms
+	 * as a union, once more with the keys that pass the OR tested instead.
+	 */
+	if (cx.nrangeor > 0)
+	{
+		LionCountPathBuild kt = *cxp;
+
+		kt.rangeortest = true;
+		if (lion_try_count_path_once(&kt))
+			ok = true;
+	}
 	if (cx.nkeytest > 0)
 	{
 		LionCountPathBuild nk = *cxp;

@@ -156,6 +156,8 @@ SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE lower(s) = ''s0''');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE upper(s) = ''S0''');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE lower(s) IN (''s1'', ''s2'')');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE NOT (lower(s) = ''s1'')');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''%1%''');
+-- a prefix is the range it spells (spellings.sql): no key is tested
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%''');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c NOT LIKE ''c1%''');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c ILIKE ''C1%''');
@@ -164,7 +166,7 @@ SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c ~ ''^c[12]$''');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c !~ ''1''');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c ~* ''^C1''');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c SIMILAR TO ''c1[0-3]''');
-SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1#_'' ESCAPE ''#''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''%1#_'' ESCAPE ''#''');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ANY (ARRAY[''c1%'', ''c3''])');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE length(c) = 3');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE left(c, 2) = ''c1''');
@@ -176,21 +178,22 @@ SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE CASE WHEN k < 10 THEN ''low''
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE v ILIKE ''V2''');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE lower(s) = ''nothing''');
 -- ---- 2. beside other clauses ---------------------------------------------
-SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%'' AND s = ''s3''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''%1%'' AND s = ''s3''');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE lower(s) = ''s1'' AND c ~ ''^c1''');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c ILIKE ''c1%'' AND k IN (1, 2, 3)');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE k % 5 = 0 AND k > 10');
-SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%'' AND c <> ''c12''');
-SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%'' AND u < 1000');
--- an OR of the one column is one test; an OR of two columns is not
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''%1%'' AND c <> ''c12''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''%1%'' AND u < 1000');
+-- an OR of the one column is one test, with a prefix's range among its arms
+-- too; an OR of two columns is not
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%'' OR c = ''c5''');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE lower(s) = ''s1'' OR c = ''c5''');
 -- ---- 3. GROUP BY and count(DISTINCT) -------------------------------------
 SELECT lion_kt('SELECT s, count(*) FROM lion_kt WHERE c ILIKE ''c1%'' GROUP BY 1');
-SELECT lion_kt('SELECT c, count(*) FROM lion_kt WHERE c LIKE ''c1%'' GROUP BY 1');
+SELECT lion_kt('SELECT c, count(*) FROM lion_kt WHERE c LIKE ''%1%'' GROUP BY 1');
 SELECT lion_kt('SELECT k / 5, count(*) FROM lion_kt WHERE lower(s) IN (''s1'', ''s0'') GROUP BY 1');
 SELECT lion_kt('SELECT upper(s), count(*) FROM lion_kt GROUP BY 1 HAVING upper(s) > ''S1''');
-SELECT lion_kt('SELECT count(DISTINCT k) FROM lion_kt WHERE c LIKE ''c1%''');
+SELECT lion_kt('SELECT count(DISTINCT k) FROM lion_kt WHERE c LIKE ''%1%''');
 -- ---- 4. declined ---------------------------------------------------------
 -- true where the column is NULL: the NULL entry is never in the list
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE lower(s) IS NULL');
@@ -210,7 +213,7 @@ SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE b LIKE ''b1%''');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE u % 7 = 3');
 -- switched off
 SET pg_lion.enable_key_tests = off;
-SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''%1%''');
 RESET pg_lion.enable_key_tests;
 -- ---- 5. a dirty heap: deleted and updated rows, not vacuumed --------------
 -- c = 'cz' is only in deleted rows: its key is not tested
@@ -219,8 +222,8 @@ DELETE FROM lion_kt WHERE c = 'cz';
 DELETE FROM lion_kt WHERE id % 13 = 0;
 UPDATE lion_kt SET c = 'c1x' WHERE id % 31 = 0;
 UPDATE lion_kt SET s = 'S1' WHERE id % 37 = 0;
-SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c%''');
-SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''%c%''');
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''%1%''');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE upper(s) = ''S1''');
 SELECT lion_kt('SELECT s, count(*) FROM lion_kt WHERE c ~ ''^c1.$'' GROUP BY 1');
 -- ---- 6. parameters, and a rescan per outer row ---------------------------
@@ -236,7 +239,7 @@ INSERT INTO lion_ktp SELECT id, s, c FROM lion_kt;
 CREATE INDEX ON lion_ktp USING lion (s);
 CREATE INDEX ON lion_ktp USING lion (c);
 VACUUM (FREEZE, ANALYZE) lion_ktp;
-SELECT lion_kt('SELECT count(*) FROM lion_ktp WHERE c LIKE ''c1%''');
+SELECT lion_kt('SELECT count(*) FROM lion_ktp WHERE c LIKE ''%1%''');
 SELECT lion_kt('SELECT s, count(*) FROM lion_ktp WHERE c ILIKE ''C1%'' GROUP BY 1');
 SELECT lion_kt('SELECT count(*) FROM lion_ktp WHERE lower(s) = ''s1'' AND c ~ ''^c1''');
 -- a partition whose bounds imply the test leaves it out, and walks nothing:
@@ -267,7 +270,7 @@ RESET enable_bitmapscan;
 RESET pg_lion.enable_plain_scan;
 RESET pg_lion.enable_ordered_scan;
 -- how many participants tested the keys varies
-SELECT regexp_replace(lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''c1%'''), '\d+ of \d+ keys', 'keys');
+SELECT regexp_replace(lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''%1%'''), '\d+ of \d+ keys', 'keys');
 SELECT regexp_replace(lion_kt('SELECT s, count(*) FROM lion_kt WHERE c ILIKE ''C1%'' GROUP BY 1'), '\d+ of \d+ keys', 'keys');
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
@@ -281,7 +284,7 @@ SET enable_bitmapscan = off;
 SET pg_lion.enable_plain_scan = off;
 SET pg_lion.enable_ordered_scan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_kt WHERE lower(s) = 's1';
-EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_kt WHERE c LIKE 'c1%' AND s = 's3';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_kt WHERE c LIKE '%1%' AND s = 's3';
 EXPLAIN (COSTS OFF) SELECT s, count(*) FROM lion_kt WHERE c ~ '^c[12]$' GROUP BY 1;
 CREATE FUNCTION lion_kt_explain(q text) RETURNS SETOF text
 LANGUAGE plpgsql AS $$

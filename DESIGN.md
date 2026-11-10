@@ -4060,16 +4060,20 @@ table.
   (`LION_KEYTEST_MAX_KEY_SHARE`). The list is held whole, as a parameter's of any length is, and
   every key is tested.
 
-An OR of the one column is one test, taken whole (`c LIKE 'c1%' OR c = 'c5'`); an OR across columns
-is not. The clause may stand in a count, a GROUP BY (§36's derived groups included), a
-count(DISTINCT), over a partitioned table, whose every partition tests its own keys, and in the
-parallel count and GROUP BY, whose participants each make the list. Not in a filtered count's
-condition or beside filtered counts, a count by cells, the FK-side join, the anti join, the decoded
-walk, §37's aggregates over keys, a SELECT DISTINCT's keys or the top k
-(`lion_count_path_keytest_ok()`). Where a build takes a test, it is made once more with the clause
-left to what else would take it - residual, or the ordinary plan - and add_path() keeps the
-cheaper: a few rows the other clauses select are fetched for less than every key is tested, and a
-shape that takes no test may take a residual clause.
+An OR of the one column is one test, taken whole (`upper(c) = 'C1' OR c = 'c5'`); an OR across
+columns is not. A LIKE prefix is the range it spells ("Other spellings of answered clauses", above)
+and takes no test, but in an OR the posting sets otherwise answer - `c LIKE 'c1%' OR c = 'c5'` - its
+range is a leaf of a union, collected with no pin (§32), which a count with no other pinned source
+declines. Where such an OR could be a test, the build that takes the union is made once more with
+the OR's keys tested instead (`lion_count_path_or_range()`), and add_path() keeps the cheaper. The
+clause may stand in a count, a GROUP BY (§36's derived groups included), a count(DISTINCT), over a
+partitioned table, whose every partition tests its own keys, and in the parallel count and GROUP BY,
+whose participants each make the list. Not in a filtered count's condition or beside filtered
+counts, a count by cells, the FK-side join, the anti join, the decoded walk, §37's aggregates over
+keys, a SELECT DISTINCT's keys or the top k (`lion_count_path_keytest_ok()`). Where a build takes a
+test, it is made once more with the clause left to what else would take it - residual, or the
+ordinary plan - and add_path() keeps the cheaper: a few rows the other clauses select are fetched
+for less than every key is tested, and a shape that takes no test may take a residual clause.
 
 **A key no visible row holds** is not tested. The clause cannot fail on the column's value, but it
 fails on any key where its constant does (`c LIKE $1` with a pattern ending in its escape
@@ -4096,11 +4100,10 @@ priced as the IN list of the most common values that pass it, folded on each at 
 and by core's estimate of the clause otherwise.
 
 Measured on 2M rows (PostgreSQL 18.7 release build, warm, `status` of 5 values, `country` of 50,
-`kind` of 20), against the plan with `pg_lion.enable_key_tests` off and a sequential scan:
-`count(*) WHERE lower(status) = 'paid'` 0.4 ms against 458 and 457; `country ILIKE 'C1%'` 2.2
-against 655 and 621; `country ~ '^c[12]$'` 0.5 against 411 and 448; `country LIKE 'c1%' AND status
-= 'paid'` 2.1 against 72 (residual) and 147; `status, count(*) WHERE country ILIKE 'C1%' GROUP BY
-status` 4.1 against 609 and 601; `kind % 5 = 0` 1.2 against 120 and 118.
+`kind` of 20), against the plan with `pg_lion.enable_key_tests` off and a sequential scan: `count(*)
+WHERE lower(status) = 'paid'` 0.4 ms against 458 and 457; `country ILIKE 'C1%'` 2.2 against 655 and
+621; `country ~ '^c[12]$'` 0.5 against 411 and 448; `status, count(*) WHERE country ILIKE 'C1%'
+GROUP BY status` 4.1 against 609 and 601; `kind % 5 = 0` 1.2 against 120 and 118.
 
 EXPLAIN prints the clause as itself, `t_c ((c ~~* 'C1%'::text))`, and ANALYZE counts `Keys Tested`
 and `Keys Passed` over every relation, run and participant. `pg_lion.enable_key_tests` turns it
