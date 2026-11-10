@@ -1136,8 +1136,8 @@ lion_segment_inplace_check(Relation index, Buffer buf, OffsetNumber off,
 
 /*
  * The second half: the pair in, inside the record, and the page's bounds.
- * pr, if not NULL, is the segment's probe for the pair from the first half,
- * whose bytes the page image the record registers has too.
+ * pr is the segment's probe for the pair from the first half, taken under
+ * the same lock, whose bytes the page image the record registers has too.
  */
 static void
 lion_segment_inplace_apply(LionWalState *xstate, Buffer buf, OffsetNumber off,
@@ -1149,10 +1149,7 @@ lion_segment_inplace_apply(LionWalState *xstate, Buffer buf, OffsetNumber off,
 	bool		dup = false;
 	bool		ok;
 
-	if (pr != NULL)
-		ok = lion_sparse_insert_probed(s, pr, &dup);
-	else
-		ok = lion_sparse_insert(s, ckey, lo, &dup);
+	ok = lion_sparse_insert_probed(s, pr, &dup);
 	if (!ok || dup)
 		elog(ERROR, "lion index: sparse segment %u on block %u changed under an exclusive lock",
 			 off, BufferGetBlockNumber(buf));
@@ -2129,6 +2126,8 @@ typedef struct LionSliceAdd
 								 * InvalidBuffer, an INLINE slice */
 	OffsetNumber off;			/* the item that takes the member */
 	bool		segment;		/* a sparse segment, else a container */
+	LionSparseProbe probe;		/* a segment: its probe for the pair, taken
+								 * under the lock buf stays in */
 	OffsetNumber entryoff;		/* the slice's entry on the batch's leaf */
 	LionEntryTuple *ecopy;		/* an INLINE slice: the entry as it is to be,
 								 * its payload grown and its count raised;
@@ -2271,6 +2270,8 @@ lion_slice_batch_add(Relation index, LionSliceBatch *b, Buffer leafbuf,
 	a->buf = buf;
 	a->off = off;
 	a->segment = (target == LION_TARGET_SEGMENT);
+	if (a->segment)
+		a->probe = probe;
 	a->entryoff = entryoff;
 	a->ecopy = NULL;
 	a->esize = 0;
@@ -2415,7 +2416,7 @@ lion_slice_batch_write(Relation index, Buffer leafbuf, LionSliceBatch *b)
 			continue;
 		if (a->segment)
 			lion_segment_inplace_apply(xstate, a->buf, a->off, b->ckey, b->lo,
-									   NULL);
+									   &a->probe);
 		else
 			lion_container_inplace_apply(xstate, a->buf, a->off, b->lo);
 	}

@@ -104,3 +104,47 @@ SELECT count(*) AS keys,
 
 DROP TABLE lion_scatter;
 DROP FUNCTION lion_scatter_sum(text, text);
+-- A sliced column (DESIGN.md §51) whose slices have spilled into posting
+-- trees, on a heap of one row a page: every 128 rows start a container key,
+-- whose first members in each slice go into a sparse segment at the tail of
+-- its tree, and a row's in-place adds to those segments are gathered into a
+-- batch for one record (lion_slice_batch_add()).
+CREATE TABLE lion_scatter_sl (id int, v int8, pad text)
+	WITH (autovacuum_enabled = off, fillfactor = 10);
+ALTER TABLE lion_scatter_sl ALTER pad SET STORAGE PLAIN;
+CREATE INDEX lion_scatter_sl_v ON lion_scatter_sl USING lion (v)
+	WITH (slices = on, inline_limit = 64);
+INSERT INTO lion_scatter_sl
+SELECT i, hashint8(i) % 1000, repeat('x', 600) FROM generate_series(1, 1500) i;
+SELECT count(*) FILTER (WHERE (ctid::text::point)[0] <> id - 1) AS moved
+  FROM lion_scatter_sl;
+ moved 
+-------
+     0
+(1 row)
+
+SELECT slice_entries > 0 AS sliced, slice_pages >= slice_entries AS slices_spilled
+  FROM lion_index_stats('lion_scatter_sl_v');
+ sliced | slices_spilled 
+--------+----------------
+ t      | t
+(1 row)
+
+SELECT lion_index_verify('lion_scatter_sl_v', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT (l.count, l.sum, l.min, l.max) IS NOT DISTINCT FROM
+	   (r.count, r.sum, r.min, r.max) AS slice_agg_agrees
+  FROM lion_index_slice_agg('lion_scatter_sl_v', NULL, 1::int2) l,
+	   (SELECT count(v) AS count, sum(v)::numeric AS sum, min(v)::text AS min,
+			   max(v)::text AS max
+		  FROM lion_scatter_sl) r;
+ slice_agg_agrees 
+------------------
+ t
+(1 row)
+
+DROP TABLE lion_scatter_sl;
