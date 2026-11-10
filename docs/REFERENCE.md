@@ -219,8 +219,8 @@ Several such quals on one column (`tags && '{a}' AND tags && '{b}'`), like two l
 column, are ANDed in the index, as quals on several columns are, so the heap gets only the rows they
 select together (DESIGN.md §5, SCAN step 5).
 `count(*)` over `@>`, `&&` and an AND/OR tsquery is pushed down like any other clause, and can be
-combined with a `GROUP BY` on a scalar roaring column. Array `=` and `@@@` are answered by bitmap and
-index scans only, as GIN answers them.
+combined with a `GROUP BY` on a scalar roaring column; `'a' = ANY (tags)` is counted as `tags @>
+'{a}'`. Array `=` and `@@@` are answered by bitmap and index scans only, as GIN answers them.
 
 Whether an array is empty is answered from an `array_ops` index too, which keeps a column's NULL
 arrays, its empty ones and the rest apart (DESIGN.md §17, "Non-empty arrays"). `count(*)` pushes

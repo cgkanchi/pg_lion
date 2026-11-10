@@ -3533,6 +3533,94 @@ Unique over a full index-only scan, priced as such, and the cost model decides. 
 DISTINCT c200` 128 ms to 4.6 ms (51 ms with a B-tree on c200); `c20, c200 ... GROUP BY 1, 2`
 127 ms to 15 ms (decoded walk).
 
+### Other spellings of answered clauses (2026-11-10)
+
+Three clauses that test what the posting sets already answer, written another way, used to leave
+the count to the ordinary plan: `'t1' = ANY (tags)`, `status IS NOT DISTINCT FROM 'paid'` and
+`status LIKE 'pa%'`. Each is now rewritten, as the clause analysis meets it, into the clause it is
+true of the same rows as, and that clause is what the cost model, EXPLAIN and a partition's bounds
+see (`LionLeafInfo.costclause`, with `costexact`) - or, where that clause's own analysis makes a
+clause for the cost model (`tags IS NOT DISTINCT FROM '{}'` is the `tags = '{}'` of §17), that one.
+Being true of the same rows is what a WHERE, a
+FILTER and an OR's arm ask of a clause: false and NULL are the same there. The rewrites are not
+the same value, which only a NOT could tell apart, and none is taken under one: the planner has
+already turned each NOT it can into the operator's negator (`NOT (c = ANY (tags))` is `c <> ALL
+(tags)`, which stays with the ordinary plan), and lion_analyze_leaf()'s own NOT branch takes no
+leaf that has a costclause. Neither GIN nor a B-tree answers the first two, so they are gains over
+core, not parity. `test/sql/spellings.sql` checks every form against a sequential scan, over NULL
+columns, arrays with NULL elements, empty arrays, partitions and dead and updated rows;
+`test/sql/spellings_coll.sql` does the same under ICU collations.
+
+**`c = ANY (array_col)`** (`lion_any_column_as_contains()`): the array column on the right of the
+ANY, which no index matches. The ANY is true where some element equals c, NULL where none does but
+one is NULL, and NULL for a NULL array. `array_col @> ARRAY[c]` is true where some element equals
+c - array_contain_compare() tests with the element type's default equality, under the clause's
+collation - and false or NULL everywhere else. So the two select the same rows when the ANY's
+operator is that equality: with c of the element's type, or of one binary-coercible to it (text
+against a varchar[] column, which the parser coerces to text[] with an ArrayCoerceExpr that only
+relabels, and which the array is built of the column's element type for, as array_contains()
+insists); or the integer family's equality across two widths, `1 = ANY (ids)` of a bigint[] column
+with its int4 literal, which compares the numbers, so that the literal as the element's type is the
+same test, and one the element's type cannot hold is declined. A literal c is a literal
+containment, answered exactly (§17); a value the executor has once per scan - a generic plan's `$1
+= ANY (tags)` - is the run-time `tags @> ARRAY[$1]` of §17, "A query known only at run time",
+answered from a superset and rechecked. A NULL selects nothing either way.
+
+**`col IS NOT DISTINCT FROM c`** (`lion_not_distinct_as_eq()`), which the planner keeps as a NOT
+over a DistinctExpr, for a constant c. Where col is NULL it is false and `col = c` NULL; everywhere
+else both are the equality, so it is `col = c`, and `col IS NULL` for a NULL c (the planner folds
+the untyped literal NULL itself). A value known only at run time is not taken: one that comes out
+NULL makes the clause `col IS NULL`, where an equality with a NULL parameter selects nothing
+(`col IS DISTINCT FROM $1` has its own kind, §35, which a NULL turns into `IS NOT NULL`).
+
+**`col LIKE 'p%'`** (`lion_like_as_and()`). Under a deterministic collation LIKE compares the
+characters themselves, so a pattern with no wildcard is `col = 'p'`, an equality that under any
+deterministic collation compares the bytes; a pattern of `%`s alone is `col IS NOT NULL`; and a
+prefix p followed by `%`s alone is the strings that begin with p, `col >= 'p' AND col < q` for q
+the least string above all of them, where the column's collation orders strings as bytes (C, POSIX,
+the builtin provider's: `collate_is_c`). That is the range core derives for a B-tree
+(like_support.c), but core's upper bound need not be the least (make_greater_string() may drop
+characters), so core keeps the LIKE as a filter; q is the least (`lion_like_prefix_upper()`), so the
+range is exact and the LIKE is not tested again:
+
+- under UTF-8, whose byte order is code point order, q is p with its last character replaced by
+  the next code point, past the surrogates no string holds: a string at or above p and below q
+  begins with p's other characters and then a character at least p's last and below the next one,
+  which is the last. The last byte plus one would not do: U+043F ends in 0xBF, whose next byte is no
+  continuation byte, and U+007F's next byte 0x80 starts no character. U+10FFFF has no next code
+  point, and its pattern is declined;
+- under another encoding q is p with its last byte one higher - for byte strings the least above
+  every one with p's bytes - taken only when it is itself a string of the encoding.
+
+The clauses compare the column as the LIKE does, relabels and all, under the column's own
+collation, which an index on it was built under; an index under another collation answers none of
+them (`lion_index_answers()`, as for any clause). They share the restriction's position, as `NOT
+IN`'s `<>`s do (above), and the range's two bounds are gathered into one range of the column
+(§28); in an OR's arm they are two range leaves of the arm (§32), and the OR is taken or declined
+as one written with the range would be. The ordinary plan keeps: a range under any other
+collation; anything after the first wildcard but `%` (`p_d`, `p%d`), which no range is; a pattern
+that ends in the escape character, an error LIKE raises on the rows it gets that far into (and on
+no other: `'pa' LIKE 'pa\'` is false); `NOT LIKE`, `ILIKE`, `LIKE` over a nondeterministic
+collation, and a pattern known only at run time.
+
+Measured on PostgreSQL 18.7 over 2,000,000 synthetic rows (five statuses, fifty countries, a
+twenty-value `int` with one row in ten NULL, two-element `text[]` and `bigint[]`), one lion index
+per column, a database whose default collation is C, warm, `count(*)` the fastest of three runs.
+"Before" is main's plan for the clause as written; "written out" is the clause it is counted as,
+written by hand, on this change:
+
+| clause | before | after | speedup | written out |
+|---|---:|---:|---:|---:|
+| `'t1' = ANY (tags)` | 342.7 ms | 3.2 ms | 108x | 2.8 ms |
+| `7 = ANY (ids)` (`bigint[]`, `int` literal) | 324.7 ms | 0.38 ms | 850x | 0.44 ms |
+| `'t1' = ANY (tags) AND status = 'paid'` | 168.0 ms | 1.0 ms | 170x | 1.0 ms |
+| `status IS NOT DISTINCT FROM 'paid'` | 179.4 ms | 7.2 ms | 25x | 7.2 ms |
+| `n IS NOT DISTINCT FROM 3` | 160.9 ms | 2.6 ms | 62x | 3.9 ms |
+| `n IS NOT DISTINCT FROM 3`, `GROUP BY country` | 170.1 ms | 33.8 ms | 5.0x | 33.0 ms |
+| `status LIKE 'pa%'` | 117.9 ms | 8.2 ms | 14x | 7.8 ms |
+| `country LIKE 'c1%' AND status = 'paid'` | 108.8 ms | 16.3 ms | 6.7x | 15.2 ms |
+| `country LIKE 'c4%'`, `GROUP BY status` | 186.6 ms | 40.3 ms | 4.6x | 39.5 ms |
+
 ### Grouping sets (2026-10-11)
 
 `GROUP BY ROLLUP (...)`, `CUBE (...)` and `GROUPING SETS (...)` over one table

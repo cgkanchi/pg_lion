@@ -4318,6 +4318,7 @@ extern LionQueryMode lion_multikey_literal_mode(IndexOptInfo *idx,
 extern BoolExpr *lion_boolean_not_test(Node *clause);
 extern List *lion_or_arms(Node *clause);
 extern List *lion_all_as_and(Node *clause);
+extern List *lion_like_as_and(Node *clause);
 extern Node *lion_multikey_any_as_or(Node *clause);
 extern bool lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 							  bool allow_negated, bool allow_range,
