@@ -273,8 +273,10 @@ SELECT what, s.*
 
 -- ---------- 9. plans ----------
 -- The planner that expected 34 rows of five heavy values reads them through
--- an index scan and groups them; with their 11,250 rows it counts the top k
--- from the index.  (The join of those rows to their owners goes to a hash
+-- an index scan and groups them; with their 11,250 rows it reads them by a
+-- bitmap scan and hashes them - the owners' counts are too even for a top k
+-- from the index to stop early, and it would count every group (DESIGN.md
+-- §36, "The fallback").  (The join of those rows to their owners goes to a hash
 -- join or to the FK-side join depending on the major, and the two run within
 -- a third of each other; only its answers are checked, below.)
 SET enable_seqscan = off;
@@ -290,16 +292,18 @@ EXPLAIN (COSTS OFF) SELECT * FROM events WHERE kind IN (1, 2, 3, 4, 5);
 EXPLAIN (COSTS OFF)
 SELECT owner_id, count(*) FROM events WHERE kind IN (1, 2, 3, 4, 5)
  GROUP BY owner_id ORDER BY count(*) DESC, owner_id LIMIT 3;
-                                                      QUERY PLAN                                                       
------------------------------------------------------------------------------------------------------------------------
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
  Limit
    ->  Sort
          Sort Key: (count(*)) DESC, owner_id
-         ->  Custom Scan (LionCount)
-               Lion Indexes: events_lion.owner_id (owner_id), events_lion.kind (kind = ANY ('{1,2,3,4,5}'::integer[]))
+         ->  HashAggregate
                Group Key: owner_id
-               Top K: 3 by count with ties, 67 candidates
-(7 rows)
+               ->  Bitmap Heap Scan on events
+                     Recheck Cond: (kind = ANY ('{1,2,3,4,5}'::integer[]))
+                     ->  Bitmap Index Scan on events_lion
+                           Index Cond: (kind = ANY ('{1,2,3,4,5}'::integer[]))
+(9 rows)
 
 SET pg_lion.enable_index_mcv = off;
 EXPLAIN (COSTS OFF) SELECT * FROM events WHERE kind IN (1, 2, 3, 4, 5);

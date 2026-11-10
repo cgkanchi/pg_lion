@@ -11,6 +11,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "lion_customscan.h"
 #include "lion_plan_private.h"
 
@@ -456,6 +458,10 @@ typedef struct LionCountPathBuild
 	int			topkcand;		/* ... the candidates its walk keeps */
 	double		topkrows;		/* ... and the rows of their entries */
 	bool		topkstrict;		/* ... every group tied with the k-th */
+	double		topkwhole;		/* ... how likely it counts every group */
+	Cost		topkwholecost;	/* ... the price of that, as a path */
+	Cost		addedcost;		/* the last path lion_count_path_add()
+								 * added, its price */
 	List	   *vcols;			/* the expression columns (DESIGN.md §41) */
 	bool		distinctstage;	/* a SELECT DISTINCT's keys as the groups */
 	int			ncompl;			/* ORs with a complement arm (§35) */
@@ -4256,65 +4262,319 @@ lion_topk_value_kept(Var *var, Expr *gclause, Datum v)
 }
 
 /*
- * The rows of the cand largest groups of var, of ngroups: the frequencies of
- * its most common values, which the statistics keep largest first - but for
- * those a clause of the WHERE on var alone (gclauses) rejects, whose entries
- * the walk passes by - and past the end of that list the frequency of a
- * value it leaves out; at the least cand average groups.
+ * The bounds of var's largest entries, as its statistics have them: the
+ * frequencies of its most common values, which the statistics keep largest
+ * first - but for those a clause of the WHERE on var alone (gclauses)
+ * rejects, whose entries the walk passes by - and, past the end of that
+ * list, the frequency of a value it leaves out (rest), of ngroups.  With no
+ * list, every value is an average one of ngroups.  The NULL entry is left
+ * out.
+ *
+ * ... and, for the fallback's likelihood (lion_topk_whole_share()), the
+ * values past the list as the walk meets them: how many (tailkeys: the
+ * column's distinct values, the share of them gclauses keeps), the rows of
+ * one on average (tailrows), and how those spread (tailsd).  The spread is
+ * what a lion index on the column counted - Σn²/Σn of the keys past the list
+ * is their mean plus their variance over it (lion_key_tail_counted()) - or,
+ * where none did, a count's of rows put in keys at random: the square root
+ * of the mean.
  */
-static double
-lion_topk_rows(PlannerInfo *root, RelOptInfo *rel, Var *var, List *gclauses,
-			   double cand, double ngroups)
+typedef struct LionTopkFreqs
+{
+	double	   *freq;			/* the kept values', largest first */
+	int			n;				/* ... how many */
+	double		rest;			/* a value's past them */
+	double		listmin;		/* the list's smallest frequency, or 0 */
+	double		tailkeys;		/* the values past the list the walk meets */
+	double		tailshare;		/* ... of all of them */
+	double		tailrows;		/* ... the rows of one */
+	double		tailsd;			/* ... and their spread */
+} LionTopkFreqs;
+
+static void
+lion_topk_freqs(PlannerInfo *root, RelOptInfo *rel, Var *var,
+				List *gclauses, double ngroups, LionTopkFreqs *f)
 {
 	VariableStatData vardata;
 	AttStatsSlot sslot;
 	double		tuples = Max(rel->tuples, 1.0);
-	double		rows = cand * tuples / Max(ngroups, 1.0);
+	double		restshare = 1.0;	/* of the rows, past the list */
+	double		keptshare = 0.0;	/* ... and of the list, kept */
+	double		ndistinct = Max(ngroups, 1.0);
+	int			nlist = 0;
 
+	f->freq = NULL;
+	f->n = 0;
+	f->rest = 1.0 / Max(ngroups, 1.0);
+	f->listmin = 0.0;
 	examine_variable(root, lion_vcol_unvar((Node *) var), 0, &vardata);
-	if (HeapTupleIsValid(vardata.statsTuple) &&
-		get_attstatsslot(&sslot, vardata.statsTuple, STATISTIC_KIND_MCV,
-						 InvalidOid,
-						 ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS))
+	if (HeapTupleIsValid(vardata.statsTuple))
 	{
 		Form_pg_statistic stats =
 			(Form_pg_statistic) GETSTRUCT(vardata.statsTuple);
-		double		mcv = 0.0;
-		double		top = 0.0;
-		int			kept = 0;
-		int			i;
+		bool		isdefault;
+		double		nd = get_variable_numdistinct(&vardata, &isdefault);
 
-		for (i = 0; i < sslot.nnumbers; i++)
+		if (!isdefault)
+			ndistinct = Max(nd, 1.0);
+		restshare = Max(1.0 - stats->stanullfrac, 0.0);
+		if (get_attstatsslot(&sslot, vardata.statsTuple, STATISTIC_KIND_MCV,
+							 InvalidOid,
+							 ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS))
 		{
-			ListCell   *lc;
-			bool		keep = true;
+			double		mcv = 0.0;
+			int			i;
 
-			mcv += sslot.numbers[i];
-			if (i < sslot.nvalues)
-				foreach(lc, gclauses)
-				{
-					if (!lion_topk_value_kept(var, (Expr *) lfirst(lc),
-											  sslot.values[i]))
-					{
-						keep = false;
-						break;
-					}
-				}
-			if (keep && kept < cand)
+			f->freq = (double *) palloc(sizeof(double) *
+										Max(sslot.nnumbers, 1));
+			for (i = 0; i < sslot.nnumbers; i++)
 			{
-				top += sslot.numbers[i];
-				kept++;
+				ListCell   *lc;
+				bool		keep = true;
+
+				mcv += sslot.numbers[i];
+				if (i < sslot.nvalues)
+					foreach(lc, gclauses)
+					{
+						if (!lion_topk_value_kept(var, (Expr *) lfirst(lc),
+												  sslot.values[i]))
+						{
+							keep = false;
+							break;
+						}
+					}
+				if (keep)
+				{
+					f->freq[f->n++] = sslot.numbers[i];
+					keptshare += sslot.numbers[i];
+				}
 			}
-		}
-		if (cand > kept)
-			top += (cand - kept) *
-				Max(1.0 - mcv - stats->stanullfrac, 0.0) /
+			f->rest = Max(1.0 - mcv - stats->stanullfrac, 0.0) /
 				Max(ngroups - sslot.nnumbers, 1.0);
-		rows = Max(rows, top * tuples);
-		free_attstatsslot(&sslot);
+			if (sslot.nnumbers > 0)
+				f->listmin = sslot.numbers[sslot.nnumbers - 1];
+			restshare = Max(restshare - mcv, 0.0);
+			nlist = sslot.nnumbers;
+			free_attstatsslot(&sslot);
+		}
 	}
 	ReleaseVariableStats(vardata);
+
+	f->tailkeys = Max(ndistinct - nlist, 0.0);
+	f->tailrows = restshare * tuples / Max(f->tailkeys, 1.0);
+	f->tailshare = 1.0;
+	if (gclauses != NIL && restshare > 0.0)
+	{
+		/* what the clauses keep past the list, as a share of its values */
+		Selectivity gsel = clauselist_selectivity(root, gclauses, 0,
+												  JOIN_INNER, NULL);
+
+		f->tailshare = Min(Max((gsel - keptshare) / restshare, 0.0), 1.0);
+	}
+	f->tailkeys *= f->tailshare;
+	f->tailsd = sqrt(f->tailrows);
+}
+
+/*
+ * ... and the values past the list as a lion index on the column counted
+ * them, once they are asked for: how many, their rows and the spread of
+ * those, each of the keys the walk meets of them (tailshare) - or, where no
+ * index did, the spread of a count of rows put in keys at random, the square
+ * root of the mean.
+ */
+static void
+lion_topk_tail_spread(PlannerInfo *root, RelOptInfo *rel, Var *var,
+					  LionTopkFreqs *f)
+{
+	Node	   *uvar = lion_vcol_unvar((Node *) var);
+	LionKeyTail tail;
+
+	if (IsA(uvar, Var) &&
+		lion_key_tail_counted(root, rel, (Var *) uvar, &tail))
+	{
+		f->tailkeys = tail.nkeys * f->tailshare;
+		f->tailrows = tail.mean;
+		f->tailsd = tail.sd;
+	}
+	else
+		f->tailsd = sqrt(f->tailrows);
+}
+
+/* the share of the rows in the i-th largest entry the walk keeps, from 0 */
+static inline double
+lion_topk_freq(const LionTopkFreqs *f, int i)
+{
+	return (i < f->n) ? f->freq[i] : f->rest;
+}
+
+/*
+ * The rows of the cand largest groups, of ngroups: the kept common values'
+ * frequencies and past them the rest's (lion_topk_freqs()); at the least
+ * cand average groups.
+ */
+static double
+lion_topk_rows(const LionTopkFreqs *f, double tuples, double cand,
+			   double ngroups)
+{
+	double		rows = cand * tuples / Max(ngroups, 1.0);
+	double		top = 0.0;
+	int			i;
+
+	if (f->freq == NULL)
+		return Min(rows, tuples);
+	for (i = 0; i < f->n && i < cand; i++)
+		top += f->freq[i];
+	if (cand > i)
+		top += (cand - i) * f->rest;
+	rows = Max(rows, top * tuples);
 	return Min(rows, tuples);
+}
+
+/*
+ * The rows of the r-th largest key (from 1) past the list, of tailkeys keys
+ * with tailrows rows on average and the spread tailsd: the value the share
+ * (r - 1/2) / tailkeys of them lie above, and none above the list's
+ * smallest; 0 where there is no such key.
+ *
+ * Rows put in keys at random spread as a count does, by the square root of
+ * the mean, and that part of the spread is taken as a gamma variable, read
+ * by Wilson and Hilferty's cube-root normal form (a count of mean m and
+ * variance v is near m (1 - 1/9a + z / 3 sqrt(a))^3, a = m^2 / v), which
+ * keeps a count's upper tail where a normal one cuts it short; what spreads
+ * beyond chance is the column's skew, which has a longer upper tail still,
+ * and is taken as log-normal.  A key's rows are read at the larger of the
+ * two: the first where the keys are about equal - the spread no larger than
+ * chance's, or smaller, down to none for keys of exactly the same rows - and
+ * the second where they are skewed.
+ */
+static double
+lion_topk_tail_bound(const LionTopkFreqs *f, double tuples, double r)
+{
+	double		b;
+
+	if (r > f->tailkeys)
+		return 0.0;
+	if (f->tailsd <= 0.0 || f->tailrows <= 0.0)
+		b = f->tailrows;
+	else
+	{
+		double		var = f->tailsd * f->tailsd;
+		double		chance = Min(var, f->tailrows);
+		double		s2 = log1p((var - chance) /
+							   (f->tailrows * f->tailrows));
+		double		q = (r - 0.5) / f->tailkeys;
+		double		lo = -40.0;
+		double		hi = 40.0;
+		double		a = f->tailrows * f->tailrows / chance;
+		double		c;
+		int			i;
+
+		/* the normal quantile whose upper tail is q, by halving */
+		for (i = 0; i < 60; i++)
+		{
+			double		mid = (lo + hi) / 2.0;
+
+			if (0.5 * erfc(mid / M_SQRT2) > q)
+				lo = mid;
+			else
+				hi = mid;
+		}
+		c = Max(1.0 - 1.0 / (9.0 * a) + lo / (3.0 * sqrt(a)), 0.0);
+		b = Max(f->tailrows * c * c * c,
+				exp(log(f->tailrows) - s2 / 2.0 + sqrt(s2) * lo));
+	}
+	if (f->listmin > 0.0)
+		b = Min(b, f->listmin * tuples);
+	return Max(b, 0.0);
+}
+
+/*
+ * How likely is a count of b rows' group, under a WHERE that keeps a share
+ * sel of them, to reach need?  The count is binomial, b trials at sel, taken
+ * as normal with a continuity correction; never above b.
+ */
+static double
+lion_topk_reach(double b, double sel, double need)
+{
+	double		mean = b * sel;
+	double		var = mean * (1.0 - sel);
+
+	if (b < need - 0.5)
+		return 0.0;
+	if (var < 1e-9)
+		return (mean >= need - 0.5) ? 1.0 : 0.0;
+	return 0.5 * erfc((need - 0.5 - mean) / sqrt(2.0 * var));
+}
+
+/* the strata the candidates past the list are taken in */
+#define LION_TOPK_TAIL_STRATA	32
+
+/*
+ * HOW LIKELY THE TOP k FALLS BACK ON COUNTING EVERY GROUP (DESIGN.md §36,
+ * "The fallback"): the walk counts its cand candidates largest bound first
+ * and stops once the k-th count is at least the next bound - more than it,
+ * strictly - and counts every group when it runs out of candidates first.
+ * The k-th count only grows and the next bound only falls as it goes, so it
+ * runs out exactly when, of all cand candidates, fewer than k reach the
+ * bound of the first entry left out.
+ *
+ * Under a WHERE that keeps a share sel of the rows independently of the
+ * group, each candidate reaches it with lion_topk_reach() of its own bound,
+ * and the number that do is a sum of those trials, taken as normal.  The
+ * bounds are the statistics' (lion_topk_freqs()): the list's, and past it
+ * the keys' spread about their mean, the candidates there taken in strata
+ * of equal numbers at the bound of each one's middle.  So a column whose
+ * largest entries are about as large as the ones after them falls back
+ * under a WHERE that takes away more than they differ by, and a skewed one
+ * only where the WHERE takes away more than the bounds fall from the k-th to
+ * the first left out - which the candidates, 2k/sel of them, are sized to
+ * cover.  Every key of the same rows falls back when it must show the k-th
+ * count larger than the rest, with or without a WHERE.
+ */
+static double
+lion_topk_whole_share(const LionTopkFreqs *f, double tuples, int64 k,
+					  int cand, double sel, bool strict)
+{
+	int			nlist = Min(f->n, cand);	/* candidates from the list */
+	int			ntail = cand - nlist;	/* ... and past it */
+	double		next;
+	double		need;
+	double		mean = 0.0;
+	double		var = 0.0;
+	int			i;
+
+	sel = Min(sel, 1.0);
+	next = (cand < f->n) ? f->freq[cand] * tuples :
+		lion_topk_tail_bound(f, tuples, (double) (ntail + 1));
+	if (next <= 0.0)
+		return 0.0;
+	need = strict ? next + 1.0 : next;
+	for (i = 0; i < nlist; i++)
+	{
+		double		p = lion_topk_reach(f->freq[i] * tuples, sel, need);
+
+		mean += p;
+		var += p * (1.0 - p);
+	}
+	if (ntail > 0)
+	{
+		int			strata = Min(ntail, LION_TOPK_TAIL_STRATA);
+		double		each = (double) ntail / strata;
+
+		for (i = 0; i < strata; i++)
+		{
+			double		b = lion_topk_tail_bound(f, tuples,
+												 i * each + (each + 1.0) / 2.0);
+			double		p = lion_topk_reach(b, sel, need);
+
+			mean += each * p;
+			var += each * p * (1.0 - p);
+		}
+	}
+	if (var < 1e-9)
+		return (mean < (double) k - 0.5) ? 1.0 : 0.0;
+	return Min(Max(0.5 * erfc((mean - ((double) k - 0.5)) / sqrt(2.0 * var)),
+				   0.0), 1.0);
 }
 
 static void
@@ -4336,9 +4596,12 @@ lion_count_path_topk(LionCountPathBuild *cx)
 	List	   *gonly = NIL;
 	Selectivity sel;
 	double		cand;
+	LionTopkFreqs freqs;
+	double		tuples;
 	ListCell   *lc;
 
 	cx->topkn = 0;
+	cx->topkwhole = 0.0;
 	if (!lion_enable_topk || cx->fj != NULL || cx->anti != NULL ||
 		cx->ngroup != 1 ||
 		cx->nfilter > 0 ||
@@ -4445,10 +4708,32 @@ lion_count_path_topk(LionCountPathBuild *cx)
 
 	cx->topkn = limit + offset;
 	cx->topkcand = (int) cand;
-	cx->topkrows = lion_topk_rows(root, cx->input_rel, cx->groupvar[0],
-								  gonly, cand, cx->groupest[0]);
 	cx->topkstrict = (list_length(parse->sortClause) > 1 ||
 					  parse->limitOption == LIMIT_OPTION_WITH_TIES);
+	lion_topk_freqs(root, cx->input_rel, cx->groupvar[0], gonly,
+					cx->groupest[0], &freqs);
+	tuples = Max(cx->input_rel->tuples, 1.0);
+	cx->topkrows = lion_topk_rows(&freqs, tuples, cand, cx->groupest[0]);
+
+	/*
+	 * With nothing in the WHERE but g's own clauses, every count is its
+	 * entry's bound, and the k-th is at least the next: only the strict rule
+	 * may fall back then.  The spread of the values past the list is asked
+	 * for where a candidate, or the first entry left out, is one of them.
+	 */
+	if (sel < 1.0 || cx->topkstrict)
+	{
+		if (cx->topkcand >= freqs.n)
+			lion_topk_tail_spread(root, cx->input_rel, cx->groupvar[0],
+								  &freqs);
+		cx->topkwhole = lion_topk_whole_share(&freqs, tuples, cx->topkn,
+											  cx->topkcand, sel,
+											  cx->topkstrict);
+	}
+	elog(DEBUG2, "lion: a top %lld from %d candidates, under a WHERE that keeps %.3g of the rows, counts every group in %.3g of runs",
+		 (long long) cx->topkn, cx->topkcand, sel, cx->topkwhole);
+	if (freqs.freq != NULL)
+		pfree(freqs.freq);
 }
 
 /*
@@ -5747,6 +6032,17 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	rangeprice.perrange = lion_units_price(&units, rangeprice.perrange);
 	rangeprice.countrange = lion_units_price(&units, rangeprice.countrange);
 	rangeprice.whole = lion_units_price(&units, rangeprice.whole);
+
+	/*
+	 * The top k's fallback (DESIGN.md §36): every group counted, at the
+	 * price of the path that walk is, as often as it is expected - before
+	 * the first row, like the rest of the top k's price.
+	 */
+	if (cx->topkn > 0 && cx->topkwholecost > 0.0)
+	{
+		cpath->path.total_cost += cx->topkwhole * cx->topkwholecost;
+		cpath->path.startup_cost += cx->topkwhole * cx->topkwholecost;
+	}
 	serialrun = cpath->path.total_cost;
 
 	/* the anti join over a small inner side (DESIGN.md §27) */
@@ -5886,6 +6182,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 									 serialrun, &rangeprice, cx->having,
 									 antichild, antirun);
 
+	/* read before add_path(), which may free the path */
+	cx->addedcost = cpath->path.total_cost;
 	add_path(output_rel, &cpath->path);
 }
 
@@ -6729,6 +7027,29 @@ lion_try_count_path_once(LionCountPathBuild *cx)
 
 	lion_count_path_estimate(cx);
 	lion_count_path_topk(cx);
+
+	/*
+	 * A top k whose candidates may not be enough counts every group instead
+	 * (DESIGN.md §36, "The fallback"): that walk is the plain GROUP BY's,
+	 * made a path of its own, and the top k's price adds its price as often
+	 * as the fallback is expected.  add_path() keeps the cheaper.
+	 */
+	cx->topkwholecost = 0.0;
+	if (cx->topkn > 0 && cx->topkwhole > 0.0)
+	{
+		int64		topkn = cx->topkn;
+
+		cx->topkn = 0;
+		lion_count_path_fill(cx);
+		if (lion_count_path_anti(cx))
+		{
+			cx->addedcost = 0.0;
+			cpath = lion_count_path_make(cx);
+			lion_count_path_add(cx, cpath);
+			cx->topkwholecost = cx->addedcost;
+		}
+		cx->topkn = topkn;
+	}
 	lion_count_path_fill(cx);
 	if (!lion_count_path_anti(cx))
 		return false;

@@ -84,7 +84,10 @@ took 153 ms against 361.
 `GROUP BY g ORDER BY count(*) DESC LIMIT k` counts only the groups that can be among the first `k`
 (`Top K` in EXPLAIN; DESIGN.md §36): each key's entry records how many rows it holds, which bounds
 its group's count, so the largest entries are counted first and the rest never once they cannot
-catch up - ten groups of 3.4 million on ClickBench's `UserID`. Expressions of the grouping column
+catch up - ten groups of 3.4 million on ClickBench's `UserID`. A `WHERE` on another column cuts
+the counts below their bounds: where the keys hold about the same number of rows, the largest
+counts then never pass the bounds left, every group is counted after all, and the planner prices
+it so - usually picking a hash aggregate instead. Expressions of the grouping column
 (`GROUP BY ip, ip - 1`) split no group and are computed from it.
 
 These forms are answered as the counts they stand for (DESIGN.md §10, "Shapes rewritten to the

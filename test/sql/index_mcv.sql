@@ -197,8 +197,10 @@ SELECT what, s.*
 
 -- ---------- 9. plans ----------
 -- The planner that expected 34 rows of five heavy values reads them through
--- an index scan and groups them; with their 11,250 rows it counts the top k
--- from the index.  (The join of those rows to their owners goes to a hash
+-- an index scan and groups them; with their 11,250 rows it reads them by a
+-- bitmap scan and hashes them - the owners' counts are too even for a top k
+-- from the index to stop early, and it would count every group (DESIGN.md
+-- §36, "The fallback").  (The join of those rows to their owners goes to a hash
 -- join or to the FK-side join depending on the major, and the two run within
 -- a third of each other; only its answers are checked, below.)
 SET enable_seqscan = off;
