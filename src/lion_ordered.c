@@ -110,6 +110,7 @@
 #include "lion_costs.h"
 #include "lion_customscan.h"
 #include "lion_vec.h"
+#include "lion_vm.h"
 #include "lion_arena.h"
 
 /* GUCs, and the hook this file chains (all installed by lion_ordered_init). */
@@ -951,7 +952,7 @@ typedef struct LionOrderedState
 	Datum	   *iovals;			/* [niocols] the index tuple, deformed */
 	bool	   *ionulls;
 	TupleTableSlot *tabslot;	/* the heap tuple, for its visibility */
-	Buffer		vmbuffer;		/* the visibility map page last read */
+	LionVmPins	vm;				/* the visibility map pages read (lion_vm.h) */
 
 	/* the lion side; noset: none, every row the walk meets is fetched */
 	bool		noset;
@@ -8247,7 +8248,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->side = (priv.flags & LO_FLAG_SIDE) != 0;
 	st->keyed = (priv.flags & LO_FLAG_KEYED) != 0;
 	st->nkeyleaves = priv.nkeyleaves;
-	st->vmbuffer = InvalidBuffer;
+	lion_vm_pins_init(&st->vm);
 	st->walknulls = priv.nulls;
 	st->walkattno = priv.walkattno;
 	tree = priv.tree;
@@ -8679,8 +8680,8 @@ lo_fetch_indexonly(LionOrderedState *st, TupleTableSlot *slot, bool *fromheap)
 	int			i;
 
 	*fromheap = false;
-	if (!VM_ALL_VISIBLE(scan->heapRelation, ItemPointerGetBlockNumber(tid),
-						&st->vmbuffer))
+	if (!lion_vm_all_visible(scan->heapRelation, ItemPointerGetBlockNumber(tid),
+							 &st->vm))
 	{
 		st->fetched++;
 		if (!lo_fetch_btree(st, st->tabslot))
@@ -9560,18 +9561,15 @@ lo_rescan(CustomScanState *node)
 
 	/*
 	 * The walk restarts, with its keys evaluated again.  A nested loop's
-	 * probe keeps the visibility map's page it read last, as core's Index
-	 * Only Scan keeps it across its rescans: the next outer row's key is
+	 * probe keeps the visibility map's pages it read, as core's Index Only
+	 * Scan keeps its one across its rescans: the next outer row's key is
 	 * often on the same page (DESIGN.md §40.10).
 	 */
 	st->started = false;
 	st->done = false;
 	lo_scan_reset(st);
-	if (BufferIsValid(st->vmbuffer) && !st->probe)
-	{
-		ReleaseBuffer(st->vmbuffer);
-		st->vmbuffer = InvalidBuffer;
-	}
+	if (!st->probe)
+		lion_vm_pins_release(&st->vm);
 
 	/*
 	 * The set is rebuilt only when a Param of the lion quals changed; the
@@ -9606,9 +9604,7 @@ lo_end(CustomScanState *node)
 	if (st->scan != NULL)
 		index_endscan(st->scan);
 	st->scan = NULL;
-	if (BufferIsValid(st->vmbuffer))
-		ReleaseBuffer(st->vmbuffer);
-	st->vmbuffer = InvalidBuffer;
+	lion_vm_pins_release(&st->vm);
 	if (st->tabslot != NULL)
 		ExecClearTuple(st->tabslot);
 	if (st->owalk != NULL)
@@ -10301,11 +10297,7 @@ lion_ordered_keyset_keys(PlanState *ps, int keyset, Datum array)
 
 	/* the walk, and what it met of the old set, before the set */
 	lo_scan_reset(st);
-	if (BufferIsValid(st->vmbuffer))
-	{
-		ReleaseBuffer(st->vmbuffer);
-		st->vmbuffer = InvalidBuffer;
-	}
+	lion_vm_pins_release(&st->vm);
 	st->started = false;
 	st->done = false;
 	if (st->lazy)
@@ -10857,7 +10849,7 @@ lion_probe_sets_begin(PlanState *ps, List *trees, List *leafoids, List *quals,
 
 	/* lo_spill_begin() finds the query's memory through it */
 	st->css.ss.ps.state = estate;
-	st->vmbuffer = InvalidBuffer;
+	lion_vm_pins_init(&st->vm);
 	st->arenafile = -1;
 	st->nleaves = list_length(leafoids);
 	st->leaves = (LoLeaf *) palloc0(sizeof(LoLeaf) * Max(st->nleaves, 1));

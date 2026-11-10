@@ -113,6 +113,7 @@
 
 #include "lion.h"
 #include "lion_count.h"
+#include "lion_vm.h"
 
 
 /*
@@ -184,8 +185,9 @@ StaticAssertDecl(LION_RECHECK_BLOCK_TIDS <= LION_RECHECK_MIN_BATCH,
  */
 
 /*
- * Per-call state of one count.  The visibility map buffer is kept for the
- * whole call (one VM page covers ~32k heap blocks) and released at the end.
+ * Per-call state of one count.  The visibility map pages it pins are kept for
+ * the whole call (one map page covers ~32k heap blocks), and handed to the
+ * node's cache or released at the end.
  */
 typedef struct LionCountCtx
 {
@@ -195,7 +197,7 @@ typedef struct LionCountCtx
 								 * passes of a disjoint sum (DESIGN.md §15) */
 	Relation	heap;
 	Snapshot	snapshot;
-	Buffer		vmbuf;			/* pinned VM page, or InvalidBuffer */
+	LionVmPins	vm;				/* the map pages pinned (lion_vm.h) */
 	bool		serializable;	/* IsolationIsSerializable() at start: take page predicate locks */
 	bool		in_recovery;	/* hot standby: the pin interlock does not hold, recheck everything */
 	bool		novm;			/* no source carries the interlock (NOPIN
@@ -832,19 +834,12 @@ typedef struct LionExprCursor
 	(2 * sizeof(LionOrHeapEnt) + sizeof(LionContainer *))
 #define LION_WIDE_END	(((uint64) PG_UINT32_MAX) + 1)	/* past every key */
 /*
- * The layout of a visibility map page.  These mirror the private macros of
- * the same name in src/backend/access/heap/visibilitymap.c, which is the only
- * place the format is written down; nothing outside that file exports them.
- * Keep them in step with it.  The static assertions below pin down the parts
- * of the format that visibilitymapdefs.h does export, which is what the bit
- * twiddling in lion_vm_allvisible_mask() actually depends on.
+ * The layout of a visibility map page is lion_vm.h's (LION_VM_MAPSIZE and
+ * the rest).  The static assertions below pin down the parts of the format
+ * that visibilitymapdefs.h does export, which is what the bit twiddling in
+ * lion_vm_allvisible_bytes() and lion_vm_allvisible_mask() actually depends
+ * on.
  */
-#define LION_VM_MAPSIZE				(BLCKSZ - MAXALIGN(SizeOfPageHeaderData))
-#define LION_VM_HEAPBLOCKS_PER_BYTE	(BITS_PER_BYTE / BITS_PER_HEAPBLOCK)
-#define LION_VM_HEAPBLOCKS_PER_PAGE	(LION_VM_MAPSIZE * LION_VM_HEAPBLOCKS_PER_BYTE)
-#define LION_VM_HEAPBLK_TO_MAPBYTE(x) \
-	(((x) % LION_VM_HEAPBLOCKS_PER_PAGE) / LION_VM_HEAPBLOCKS_PER_BYTE)
-
 StaticAssertDecl(BITS_PER_HEAPBLOCK == 2,
 				 "pg_lion: the visibility map is no longer two bits per heap block");
 StaticAssertDecl(VISIBILITYMAP_VALID_BITS == 0x03,
@@ -864,6 +859,16 @@ StaticAssertDecl(LION_BLOCKS_PER_CONTAINER % LION_VM_HEAPBLOCKS_PER_BYTE == 0,
 				 "pg_lion: container block range is not map-byte aligned");
 StaticAssertDecl(LION_VM_HEAPBLOCKS_PER_PAGE % LION_VM_HEAPBLOCKS_PER_BYTE == 0,
 				 "pg_lion: map page does not hold a whole number of map bytes");
+/*
+ * The map bytes of a container's blocks: what lion_vm_allvisible_bytes() reads
+ * in one go when they are all on one map page - 16 at 8 kB pages, 8 at 16 kB,
+ * 4 at 32 kB.
+ */
+#define LION_VM_CONTAINER_BYTES \
+	(LION_BLOCKS_PER_CONTAINER / LION_VM_HEAPBLOCKS_PER_BYTE)
+StaticAssertDecl(LION_VM_CONTAINER_BYTES == 4 || LION_VM_CONTAINER_BYTES == 8 ||
+				 LION_VM_CONTAINER_BYTES == 16,
+				 "pg_lion: a container's map bytes are not a run lion_vm_allvisible_bytes() reads");
 
 /*
  * Assert builds cross-check every mask against the function it replaces.  This
@@ -952,23 +957,26 @@ struct LionVisCache
 	 *				when a count is over rather than made and deleted by every
 	 *				count.  scratchbusy while a count uses it: a count made
 	 *				inside another (none is, today) makes its own.
-	 *	vmbuf		the visibility-map page the last count left pinned, of
-	 *				relation vmrelid, which the next count of that relation
-	 *				starts from instead of pinning it again - between the rows
-	 *				of a node as well, as an index-only scan keeps its map page
-	 *				(ioss_VMBuffer).  It is a map page, not an index page: no
-	 *				part of the §9 interlock, and no VACUUM waits for its pin
-	 *				(setting a bit takes the page's content lock, and only a
-	 *				truncation, under an AccessExclusiveLock this query's lock
-	 *				excludes, would drop it).  The holder of the cache lets go
-	 *				of it when it is done, rescans, ends or moves to another
-	 *				relation (lion_vis_cache_release_vm()); a reset and a
-	 *				destroy do too.
+	 *	vm			the visibility-map pages the last count left pinned
+	 *				(lion_vm.h's LionVmPins), of relation vmrelid, which the
+	 *				next count of that relation starts from instead of pinning
+	 *				them again - between the rows of a node as well, as an
+	 *				index-only scan keeps its map page (ioss_VMBuffer).  They
+	 *				are map pages, not index pages: no part of the §9
+	 *				interlock, and no VACUUM waits for their pins (setting a
+	 *				bit takes the page's content lock, and only a truncation,
+	 *				under an AccessExclusiveLock this query's lock excludes,
+	 *				would drop them).  A count takes them over and hands them
+	 *				back (lion_vis_cache_take_vm(), lion_vis_cache_keep_vm()).
+	 *				The holder of the cache lets go of them when it is done,
+	 *				rescans, ends or moves to another relation
+	 *				(lion_vis_cache_release_vm()); a reset and a destroy do
+	 *				too.
 	 */
 	MemoryContext parent;
 	MemoryContext scratch;
 	bool		scratchbusy;
-	Buffer		vmbuf;
+	LionVmPins	vm;
 	Oid			vmrelid;
 };
 
@@ -1049,7 +1057,11 @@ extern bool lion_source_pinned(const LionKeyNode *node,
 
 /* lion_vis.c */
 extern void lion_vm_mask_check(Relation heap, BlockNumber firstblk,
-							   uint64 members, uint64 allvis, Buffer *vmbuf);
+							   uint64 members, uint64 allvis, LionVmPins *vm);
+extern void lion_vis_cache_take_vm(LionVisCache *cache, Relation heap,
+								   LionVmPins *vm);
+extern void lion_vis_cache_keep_vm(LionVisCache *cache, Relation heap,
+								   LionVmPins *vm);
 extern void lion_vis_cache_begin(LionVisCache *cache, Relation heap,
 								 Snapshot snapshot);
 extern LionVisEntry *lion_vis_cache_lookup(LionCountCtx *cx,
@@ -1267,50 +1279,25 @@ lion_node_overhead(LionKeyNodeKind kind, int nargs)
 }
 
 /*
- * The blocks of one map page: `seg`, the wanted bits shifted down so that bit 0
- * is block blk, whose answers belong at bit `b` of the result.  seg != 0.
+ * The blocks of one map page, a byte at a time: `seg`, the wanted bits shifted
+ * down so that bit 0 is block blk, whose answers belong at bit `b` of the
+ * result.  seg != 0.  Only the map bytes that hold a block the caller asked
+ * about are read.  This is the straddling container's (below), whose two
+ * halves stop short of a whole container's run of bytes, and the assert
+ * build's check of it (lion_vm_mask_check()); `map` is the page's contents.
  */
-static pg_always_inline uint64
-lion_vm_allvisible_page(Relation heap, BlockNumber blk, uint64 seg, int b,
-					   Buffer *vmbuf, int64 *pins)
+static inline uint64
+lion_vm_allvisible_page_bytes(const char *map, BlockNumber blk, uint64 seg,
+							  int b)
 {
 	uint64		mask = 0;
-	const char *map;
-	uint32		mapbyte;
+	uint32		mapbyte = LION_VM_HEAPBLK_TO_MAPBYTE(blk);
 	int			jlo;
 	int			jhi;
 	int			j;
 
 	Assert(seg != 0);
 
-	/*
-	 * Take the pin the way visibilitymap_get_status() does: same buffer reuse,
-	 * same refusal to extend the fork.  Its return value is the status of blk
-	 * itself, which the byte read below repeats.
-	 */
-	if (!visibilitymap_pin_ok(blk, *vmbuf))
-	{
-		(void) visibilitymap_get_status(heap, blk, vmbuf);
-		if (pins != NULL)
-			(*pins)++;
-	}
-
-	/* the fork stops short of these blocks: none of them is all-visible */
-	if (!BufferIsValid(*vmbuf))
-		return 0;
-
-	map = (const char *) PageGetContents(BufferGetPage(*vmbuf));
-	mapbyte = LION_VM_HEAPBLK_TO_MAPBYTE(blk);
-
-	/*
-	 * Only the map bytes that hold a block the caller asked about.  A container
-	 * built from a sparse segment (DESIGN.md §13) has its members on ONE of the
-	 * sixty-four heap blocks it covers, so that is one byte instead of sixteen
-	 * - and a disjoint sum (§15) asks this question once per entry per
-	 * container key, tens of thousands of times for one IN list.  A container
-	 * with members everywhere, which is what a low-cardinality column has,
-	 * still reads its sixteen bytes in one unbroken run.
-	 */
 	jlo = pg_rightmost_one_pos64(seg) / LION_VM_HEAPBLOCKS_PER_BYTE;
 	jhi = pg_leftmost_one_pos64(seg) / LION_VM_HEAPBLOCKS_PER_BYTE;
 
@@ -1336,34 +1323,58 @@ lion_vm_allvisible_page(Relation heap, BlockNumber blk, uint64 seg, int b,
  * LION_BLOCKS_PER_CONTAINER, so roughly one container in five hundred does; it
  * can never be three pages, a map page holding five hundred times a
  * container's worth of blocks.  `n` is how many of the container's blocks are
- * on the first of the two.
+ * on the first of the two.  The two map pages are consecutive, so they share
+ * a slot of the pin set (lion_vm_pins_slot()) only in a set of one slot.
  */
 static pg_noinline uint64
 lion_vm_allvisible_mask_split(Relation heap, BlockNumber firstblk, uint64 wanted,
-							 int n, Buffer *vmbuf, int64 *pins)
+							  int n, LionVmPins *vm, int64 *pins)
 {
 	uint64		mask = 0;
 	uint64		seg;
+	Buffer		vmbuf;
 
 	Assert(n > 0 && n < LION_BLOCKS_PER_CONTAINER);
 	Assert(n % LION_VM_HEAPBLOCKS_PER_BYTE == 0);
 
 	seg = wanted & ((UINT64CONST(1) << n) - 1);
 	if (seg != 0)
-		mask |= lion_vm_allvisible_page(heap, firstblk, seg, 0, vmbuf, pins);
+	{
+		vmbuf = lion_vm_pin(heap, firstblk, vm, pins);
+		if (BufferIsValid(vmbuf))
+			mask |= lion_vm_allvisible_page_bytes(PageGetContents(BufferGetPage(vmbuf)),
+												  firstblk, seg, 0);
+	}
 
 	seg = wanted >> n;
 	if (seg != 0)
-		mask |= lion_vm_allvisible_page(heap, firstblk + (BlockNumber) n, seg,
-									   n, vmbuf, pins);
+	{
+		vmbuf = lion_vm_pin(heap, firstblk + (BlockNumber) n, vm, pins);
+		if (BufferIsValid(vmbuf))
+			mask |= lion_vm_allvisible_page_bytes(PageGetContents(BufferGetPage(vmbuf)),
+												  firstblk + (BlockNumber) n,
+												  seg, n);
+	}
 
 	return mask;
 }
 
+/*
+ * The all-visible bits of the container's blocks (lion_vis.c has the whole
+ * story).  Every container but the straddling one in five hundred has its
+ * blocks' map bytes in one run on one map page, LION_VM_CONTAINER_BYTES of
+ * them, which are read a word at a time whatever `wanted` asks for: a
+ * container with members everywhere, which is what a low-cardinality column
+ * has, costs two loads and two squeezes at 8 kB pages instead of sixteen
+ * byte-sized ones, and a container of one member - a sparse segment's
+ * (DESIGN.md §13) - two loads instead of one, which it does not notice.  The
+ * mask answers every block of the run; callers look only at the wanted bits.
+ */
 static pg_always_inline uint64
 lion_vm_allvisible_mask(Relation heap, BlockNumber firstblk, uint64 wanted,
-					   Buffer *vmbuf, int64 *pins)
+						LionVmPins *vm, int64 *pins)
 {
+	Buffer		vmbuf;
 	int			n;
 
 	Assert(firstblk % LION_BLOCKS_PER_CONTAINER == 0);
@@ -1376,10 +1387,18 @@ lion_vm_allvisible_mask(Relation heap, BlockNumber firstblk, uint64 wanted,
 	n = (int) (LION_VM_HEAPBLOCKS_PER_PAGE -
 			   (firstblk % LION_VM_HEAPBLOCKS_PER_PAGE));
 	if (unlikely(n < LION_BLOCKS_PER_CONTAINER))
-		return lion_vm_allvisible_mask_split(heap, firstblk, wanted, n, vmbuf,
-											pins);
+		return lion_vm_allvisible_mask_split(heap, firstblk, wanted, n, vm,
+											 pins);
 
-	return lion_vm_allvisible_page(heap, firstblk, wanted, 0, vmbuf, pins);
+	vmbuf = lion_vm_pin(heap, firstblk, vm, pins);
+
+	/* the fork stops short of these blocks: none of them is all-visible */
+	if (!BufferIsValid(vmbuf))
+		return 0;
+
+	return lion_vm_allvisible_bytes(PageGetContents(BufferGetPage(vmbuf)) +
+									LION_VM_HEAPBLK_TO_MAPBYTE(firstblk),
+									LION_VM_CONTAINER_BYTES);
 }
 
 static inline bool

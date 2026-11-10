@@ -291,18 +291,7 @@ lion_count_groups_slices(Relation heap, Snapshot snapshot, int ngroups,
 	base.cxt = cxt;
 	base.heap = heap;
 	base.snapshot = snapshot;
-	base.vmbuf = InvalidBuffer;
-	if (cache != NULL && BufferIsValid(cache->vmbuf))
-	{
-		if (cache->vmrelid == RelationGetRelid(heap))
-		{
-			base.vmbuf = cache->vmbuf;
-			cache->vmbuf = InvalidBuffer;
-			cache->vmrelid = InvalidOid;
-		}
-		else
-			lion_vis_cache_release_vm(cache);
-	}
+	lion_vis_cache_take_vm(cache, heap, &base.vm);
 	base.serializable = IsolationIsSerializable();
 	base.in_recovery = RecoveryInProgress();
 	base.rel_read_only = rel_read_only;
@@ -339,10 +328,10 @@ lion_count_groups_slices(Relation heap, Snapshot snapshot, int ngroups,
 	 * the copy's first key can be counted: every cursor begins there.
 	 */
 	gcx = base;
-	gcx.vmbuf = InvalidBuffer;
+	lion_vm_pins_init(&gcx.vm);
 	gcx.droppins = false;
 	scx = base;
-	scx.vmbuf = InvalidBuffer;
+	lion_vm_pins_init(&scx.vm);
 	scx.droppins = true;
 	for (g = 0; g < ngroups; g++)
 	{
@@ -457,12 +446,12 @@ lion_count_groups_slices(Relation heap, Snapshot snapshot, int ngroups,
 			else
 			{
 				allvis = lion_vm_allvisible_mask(heap, firstblk, wanted,
-												 &base.vmbuf,
+												 &base.vm,
 												 &base.stats.vm_pins);
 				base.stats.vm_checks++;
 #ifdef LION_VM_MASK_CHECK
 				lion_vm_mask_check(heap, firstblk, wanted, allvis,
-								   &base.vmbuf);
+								   &base.vm);
 #endif
 			}
 
@@ -618,20 +607,9 @@ lion_count_groups_slices(Relation heap, Snapshot snapshot, int ngroups,
 		lion_count_stats_add(stats, &gcx.stats);
 		lion_count_stats_add(stats, &scx.stats);
 	}
-	if (BufferIsValid(gcx.vmbuf))
-		ReleaseBuffer(gcx.vmbuf);
-	if (BufferIsValid(scx.vmbuf))
-		ReleaseBuffer(scx.vmbuf);
-	if (BufferIsValid(base.vmbuf))
-	{
-		if (cache != NULL && !BufferIsValid(cache->vmbuf))
-		{
-			cache->vmbuf = base.vmbuf;
-			cache->vmrelid = RelationGetRelid(heap);
-		}
-		else
-			ReleaseBuffer(base.vmbuf);
-	}
+	lion_vm_pins_release(&gcx.vm);
+	lion_vm_pins_release(&scx.vm);
+	lion_vis_cache_keep_vm(cache, heap, &base.vm);
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);

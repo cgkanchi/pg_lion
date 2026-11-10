@@ -306,18 +306,7 @@ lion_count_groups_copy_ext(Relation heap, Snapshot snapshot, int ngroups,
 	base.cxt = cxt;
 	base.heap = heap;
 	base.snapshot = snapshot;
-	base.vmbuf = InvalidBuffer;
-	if (cache != NULL && BufferIsValid(cache->vmbuf))
-	{
-		if (cache->vmrelid == RelationGetRelid(heap))
-		{
-			base.vmbuf = cache->vmbuf;
-			cache->vmbuf = InvalidBuffer;
-			cache->vmrelid = InvalidOid;
-		}
-		else
-			lion_vis_cache_release_vm(cache);
-	}
+	lion_vis_cache_take_vm(cache, heap, &base.vm);
 	base.serializable = IsolationIsSerializable();
 	/* a copy is never made in recovery; were it, nothing would trust the map */
 	base.in_recovery = RecoveryInProgress();
@@ -377,7 +366,7 @@ lion_count_groups_copy_ext(Relation heap, Snapshot snapshot, int ngroups,
 
 		gcx[g] = base;
 		gcx[g].filter = gfilter;
-		gcx[g].vmbuf = InvalidBuffer;
+		lion_vm_pins_init(&gcx[g].vm);
 		gcx[g].batchmax = batchmax;
 		gcx[g].keyset = ps;
 		trust[g] = ps->found && !ps->nopin && ps->mat == NULL;
@@ -466,12 +455,12 @@ lion_count_groups_copy_ext(Relation heap, Snapshot snapshot, int ngroups,
 		else
 		{
 			allvis = lion_vm_allvisible_mask(heap, lion_ckey_first_block(key),
-											 wanted, &base.vmbuf,
+											 wanted, &base.vm,
 											 &base.stats.vm_pins);
 			base.stats.vm_checks++;
 #ifdef LION_VM_MASK_CHECK
 			lion_vm_mask_check(heap, lion_ckey_first_block(key), wanted,
-							   allvis, &base.vmbuf);
+							   allvis, &base.vm);
 #endif
 		}
 
@@ -569,24 +558,14 @@ lion_count_groups_copy_ext(Relation heap, Snapshot snapshot, int ngroups,
 	{
 		lion_recheck_flush(&gcx[g]);
 		counts[g] = gcx[g].count + gcx[g].recheck_count;
-		if (BufferIsValid(gcx[g].vmbuf))
-			ReleaseBuffer(gcx[g].vmbuf);
+		lion_vm_pins_release(&gcx[g].vm);
 		if (stats != NULL)
 			lion_count_stats_add(stats, &gcx[g].stats);
 	}
 	if (stats != NULL)
 		lion_count_stats_add(stats, &base.stats);
 
-	if (BufferIsValid(base.vmbuf))
-	{
-		if (cache != NULL && !BufferIsValid(cache->vmbuf))
-		{
-			cache->vmbuf = base.vmbuf;
-			cache->vmrelid = RelationGetRelid(heap);
-		}
-		else
-			ReleaseBuffer(base.vmbuf);
-	}
+	lion_vis_cache_keep_vm(cache, heap, &base.vm);
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
