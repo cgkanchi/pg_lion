@@ -4862,6 +4862,14 @@ algebra get as real containers, and it is unchanged by the stream format.)
   beyond the last item simply starts a new segment when the preceding one is full. A full segment
   all of whose pairs share one ckey cannot be split in half; that state is unreachable under the
   policy, and the insert promotes the ckey to a container instead of failing.
+  An insert decodes a segment it adds to once: `lion_sparse_probe()` gives, from one pass over the
+  stream, whether the pair is there, how many pairs its ckey has, the last ckey, the size with the
+  pair in and where in the stream it goes, and `lion_sparse_insert_probed()` inserts from that. A
+  segment is decoded again only when it changes shape: when the pair promotes its ckey to a
+  container, or the segment is full and splits. In an INLINE payload the walk still fetches and
+  checks every item, as the rewrite copies them all, but decodes none and compares only their first
+  ckeys: the last item whose first ckey is at or below the ckey and the item after it are the only
+  possible targets, and only they are probed.
   A key's first TID is a one-pair segment (9 to 11 bytes: the header and its lo), not a one-member
   ARRAY container (10), and every pair after it two or three bytes instead of ten for a container.
   A container built by promoting a ckey out of a segment gets one `lion_container_optimize()` call,
