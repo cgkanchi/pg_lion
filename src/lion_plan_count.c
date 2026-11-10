@@ -11,6 +11,8 @@
  */
 #include "postgres.h"
 
+#include "optimizer/restrictinfo.h"
+
 #include "lion_customscan.h"
 #include "lion_plan_private.h"
 
@@ -1213,13 +1215,20 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 	 * else is known.  Any number of them may name one column: they are
 	 * ANDed into one range, and they are gathered per column here.  A
 	 * strict comparison is never true of NULL, so the column is non-NULL
-	 * in every row counted.
+	 * in every row counted.  A bound made from the restriction rather than
+	 * written in it - one of `col LIKE 'p%'`'s two (lion_like_as_and()) -
+	 * is gathered as a RestrictInfo of its own, so that the column's
+	 * selectivity and its range's bounds are the range's, not the LIKE's
+	 * twice over.
 	 */
 	if (leaf.kind == LION_CLAUSE_RANGE)
 	{
 		int			pos = list_length(cx->whereattnos);
 		int			r = 0;
 		ListCell   *lr;
+
+		if (rinfo != NULL && clause != (Node *) rinfo->clause)
+			rinfo = make_simple_restrictinfo(root, (Expr *) clause);
 
 		foreach(lr, cx->rangevars)
 		{

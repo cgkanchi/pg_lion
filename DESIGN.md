@@ -3564,7 +3564,9 @@ with its int4 literal, which compares the numbers, so that the literal as the el
 same test, and one the element's type cannot hold is declined. A literal c is a literal
 containment, answered exactly (§17); a value the executor has once per scan - a generic plan's `$1
 = ANY (tags)` - is the run-time `tags @> ARRAY[$1]` of §17, "A query known only at run time",
-answered from a superset and rechecked. A NULL selects nothing either way.
+answered from a superset and rechecked, but only where it is of the element's own type, the one
+array its value is put in: a `text` `$1` against a varchar[] column, or an int4 one against
+bigint[], keeps the ordinary plan. A NULL selects nothing either way.
 
 **`col IS NOT DISTINCT FROM c`** (`lion_not_distinct_as_eq()`), which the planner keeps as a NOT
 over a DistinctExpr, for a constant c. Where col is NULL it is false and `col = c` NULL; everywhere
