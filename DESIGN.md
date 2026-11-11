@@ -7313,18 +7313,19 @@ MaxScore alone reads every member: the block bounds below are for that case.
 bounds each lexeme by the chunk it is in, not by its lexeme-wide maximum (block-max indexes, Ding
 and Suel, here with MaxScore's essential split rather than WAND's pivot).
 
-- **The header** (`lion_positions.h`).  A position chunk's payload opens with its member bytes,
-  the last member's code as an offset from its header block's base (`LION_POS_LAST_UNKNOWN` for a
-  chunk with no member, or one whose last member is 2^32 codes or more past it), and four impact
-  pairs of bytes, (tf - 1, length code): 22 bytes where it was 10.  Every member is dominated by
-  a pair, its tf at most the pair's and its row's length at least the length the pair's code
-  stands for.  A term's score rises with tf and falls with the length for every `k1` of at least
-  0 and `b` from 0 to 1, so the best of the pairs bounds every row of the chunk whatever the
-  query's parameters - they are only known when it runs.  The length code is logarithmic,
+- **The header** (`lion_positions.h`).  After the 8-byte container header, a position chunk's
+  payload opens with a uint16 count of its member bytes, then the last member's code as a uint32
+  offset from its header block's base (`LION_POS_LAST_UNKNOWN` for a chunk with no member, or one
+  whose last member is 2^32 codes or more past it), then four impact pairs of bytes, (tf - 1,
+  length code); the members follow at byte 22, where they were at byte 10.  Every member is
+  dominated by a pair, its tf at most the pair's and its row's length at least the length the
+  pair's code stands for.  A term's score rises with tf and falls with the length for every `k1` of
+  at least 0 and `b` from 0 to 1, so the best of the pairs bounds every row of the chunk whatever
+  the query's parameters - they are only known when it runs.  The length code is logarithmic,
   sixteen steps an octave and rounded down (`lion_pos_len_code()`): codes 0 to 207 cover 0 to
-  65,535, each at most a sixteenth below the length.  The pairs are a Pareto front, tf
-  descending and length descending; a fifth is merged with its neighbour into the pair that
-  dominates both, the two neighbours whose merge costs least in length codes.
+  65,535, each at most a sixteenth below the length.  The pairs are a Pareto front, tf descending
+  and length descending; a fifth is merged with its neighbour into the pair that dominates both,
+  the two neighbours whose merge costs least in length codes.
 - **Where the lengths come from.** The extraction knows a row's length, which it files under the
   empty key ("Ranking" above), and sets it on every key of the row (`LionKeyPositions.dl`). The
   build's spool carries it as one more uint16 after a member's positions, so a run that spills
