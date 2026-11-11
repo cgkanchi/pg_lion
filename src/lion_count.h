@@ -2265,6 +2265,10 @@ extern void lion_ordjoin_init(void);
 /* get_relation_stats_hook; called from _PG_init. */
 extern void lion_selfuncs_init(void);
 
+/* lion_plan_lateral.c: a grouped subquery joined in, tried as LATERAL (§56) */
+extern PGDLLIMPORT bool lion_enable_lateral_counts;
+extern void lion_lateral_init(void);
+
 /*
  * The INLINE limit lion index idx's entries were written under, from its meta
  * page (DESIGN.md §10, "Planner integration").

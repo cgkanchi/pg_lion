@@ -814,6 +814,13 @@ _PG_init(void)
 	lion_selfuncs_init();
 
 	/*
+	 * A grouped subquery joined on its grouping column, planned again as a
+	 * LATERAL subquery whose count a lion index answers per outer row
+	 * (DESIGN.md §56): its GUC and the planner hook.
+	 */
+	lion_lateral_init();
+
+	/*
 	 * lionvec (DESIGN.md §44): its tables, its popcount kernel, its
 	 * settings and its reloption kind.  The AM itself is created by the
 	 * pg_lion_vector extension, where pgvector is installed.

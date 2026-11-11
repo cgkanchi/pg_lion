@@ -239,7 +239,8 @@ database's files from the OS cache and starts it - before each timed run.
     src/lion_slice_decode.c a sliced column's aggregates for a batch of groups, decoded key by key
     src/lion_customscan.h   the LionCount custom scan's private header, shared by its planner half:
     src/lion_plan_*.c       create_upper_paths_hook -> CustomPath/CustomScan "LionCount"; set_join_pathlist_hook
-                            -> "LionSemiJoin"/"LionAntiJoin"; index matching, partitions, the cost model
+                            -> "LionSemiJoin"/"LionAntiJoin"; index matching, partitions, the cost model;
+                            lion_plan_lateral.c's planner_hook plans a grouped subquery joined in as LATERAL
     src/lion_exec_*.c       and its executor half: begin, locating the WHERE sets, counting, the FK-side
                             join, the run and parallel DSM, EXPLAIN
     src/lion_costs.[ch]     the cost model's constants as planner settings (pg_lion.*_cost)

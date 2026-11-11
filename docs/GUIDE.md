@@ -348,6 +348,14 @@ value as it would a customer's key, and counts what `o.status IN ('open', 'held'
 listed twice is counted twice, as the join pairs it with each order twice (DESIGN.md §27, "A VALUES
 list as the dimension").
 
+A grouped subquery joined to the rows it is counted for - `SELECT cu.id, s.n FROM customers cu
+JOIN (SELECT customer_id, count(*) AS n FROM orders WHERE status = 'open' GROUP BY customer_id) s
+ON s.customer_id = cu.id WHERE cu.country = 'NZ'` - is planned a second time with the join clause
+moved into the subquery, as `JOIN LATERAL (... WHERE customer_id = cu.id ...)` reads, a `LionCount`
+of one customer's orders for each customer the outer side keeps, and the cheaper plan is kept
+(`pg_lion.enable_lateral_counts`, DESIGN.md §56). For 4,262 outer rows over two million fact rows
+that took 54 ms against 258 for the subquery grouped first.
+
 A `LEFT JOIN` from the dimension keeps every customer, one with no order counted 0: `SELECT
 cu.country, count(o.id) FROM customers cu LEFT JOIN orders o ON o.customer_id = cu.id AND o.status =
 'open' GROUP BY cu.country` is pushed down as the JOIN is, each customer emitted with its count
