@@ -709,6 +709,24 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_CLAUSE_SLICED		0x200
 
 /*
+ * ... and an ARRAY clause whose list is the KEYS that pass a test of its
+ * column (DESIGN.md §10, "A test of each key"): its expression is no array but
+ * the WHERE clause itself, `upper(status) = 'PAID'`, `country ILIKE 'c1%'`,
+ * which the executor evaluates once for each key of the column some visible
+ * row holds, at the start of each relation's turn, and the keys that pass are
+ * the list, located as any other is (lion_keytest_values()).
+ */
+#define LION_CLAUSE_KEYTEST		0x400
+
+/*
+ * ... for a column of no more keys than this share of its rows: the walk
+ * tests every key, and past that a residual clause's test of the rows the
+ * other clauses select, or the ordinary plan's of every row, is the better
+ * bet (lion_keytest_leaf()).
+ */
+#define LION_KEYTEST_MAX_KEY_SHARE	0.01
+
+/*
  * A RANGE clause is neither: it is not a source of the count at all, but a
  * bound on the entry walk that drives it (DESIGN.md §28), so it is never
  * located, never merged and never priced as a lookup.  A RANGESRC clause is a
@@ -1666,6 +1684,11 @@ typedef struct LionVColScope
  * LION_CELLPRED_SUM kind: weighted sums (DESIGN.md §10, "Weighted sums"),
  * which an older build would have read as malformed.
  *
+ * Shape 35 moved no member but let an ARRAY clause carry LION_CLAUSE_KEYTEST
+ * in CLAUSEKINDS, its expression the WHERE clause rather than an array
+ * (DESIGN.md §10, "A test of each key"), which an older build would have
+ * read as an unknown kind.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1678,7 +1701,7 @@ typedef struct LionVColScope
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424922
+#define LION_PRIV_MAGIC		0x52424923
 #define LION_PRIV_NMEMBERS	27
 
 /*
@@ -1705,6 +1728,7 @@ typedef struct LionClauseState
 	int			kind;			/* LION_CLAUSE_* */
 	bool		walk;			/* RANGESRC: LION_CLAUSE_WALK */
 	bool		sliced;			/* RANGESRC: LION_CLAUSE_SLICED */
+	bool		keytest;		/* ARRAY: LION_CLAUSE_KEYTEST */
 	Oid			idxoid;
 	Oid			opno;			/* the clause's operator (0 for a null test) */
 	AttrNumber	attno;			/* the HEAP column (the parent's, with §16's
@@ -1742,6 +1766,22 @@ typedef struct LionClauseState
 	 */
 	Tuplestorestate *valstore;
 	TupleDesc	valstoredesc;
+
+	/*
+	 * LION_CLAUSE_KEYTEST (DESIGN.md §10, "A test of each key"): valexpr is
+	 * the WHERE clause, keyqual its ExprState over keyslot, which holds a key
+	 * at keypos - the column's place in custom_scan_tlist - and nothing else.
+	 * The list of the keys that pass is made in keycxt at the start of each
+	 * relation's turn (lion_keytest_values()), an array in val held whole,
+	 * and keystested and keyspassed count them for EXPLAIN ANALYZE.
+	 */
+	ExprState  *keyqual;
+	TupleTableSlot *keyslot;
+	AttrNumber	keypos;
+	Oid			keytype;		/* the keys' type, the list's element type */
+	MemoryContext keycxt;
+	int64		keystested;
+	int64		keyspassed;
 
 	StrategyNumber strategy;	/* LION_CLAUSE_MULTI: 2, 3 or 5 */
 
@@ -2718,6 +2758,7 @@ typedef struct LionCountPrivClause
 	int			filter;			/* FILTERS: 0, or its filtered count's */
 	bool		walk;			/* RANGESRC: LION_CLAUSE_WALK */
 	bool		sliced;			/* RANGESRC: LION_CLAUSE_SLICED */
+	bool		keytest;		/* ARRAY: LION_CLAUSE_KEYTEST */
 } LionCountPrivClause;
 
 /* One live leaf partition (DESIGN.md §16): an OidList of PARTS */
@@ -3149,6 +3190,8 @@ typedef struct LionScanWorkerSums
 	int64		decodepasses;
 	int64		decoderowsup;
 	LionDecodeStats decode;
+	int64		keystested;
+	int64		keyspassed;
 } LionScanWorkerSums;
 
 typedef struct LionCountScanState
@@ -3541,6 +3584,8 @@ typedef struct LionCountScanState
 	List	   *residexprs;		/* ... the clauses, for EXPLAIN */
 	TupleTableSlot *residslot;
 	ExprContext *residecxt;
+	ExprContext *keyecxt;		/* the tests of each key's (DESIGN.md §10,
+								 * "A test of each key"), or NULL */
 	int			nresidcol;
 	int		   *residslotcol;
 	AttrNumber *residattno;		/* the PARENT's numbering (DESIGN.md §16) */
@@ -4206,6 +4251,10 @@ typedef struct LionClauseInfo
 								 * (§35, "Complements in an OR") */
 	bool		positions;		/* a superset only the stored positions of
 								 * the index can decide (LionLeafInfo) */
+	bool		keytest;		/* ARRAY: the keys that pass the clause
+								 * (LionLeafInfo), so the index has to hold
+								 * the rows' own values
+								 * (lion_index_can_emit_value()) */
 	int			rinfono;		/* the restriction it came from, its position
 								 * in the relation's baserestrictinfo; -1 for
 								 * the FK-side join's key, which is none, and
@@ -4300,6 +4349,9 @@ typedef struct LionDriveInfo
  * sought there too - what every participant pays whole (whole) - the WHERE's
  * lookups, and the ranges taken as sources it collects - and the pages the
  * count reads (pages), which decide its workers.
+ *
+ * Both make the tests of each key (§10, "A test of each key") whole in every
+ * participant, before its first range (keys, in whole too).
  */
 typedef struct LionRangeCost
 {
@@ -4307,6 +4359,7 @@ typedef struct LionRangeCost
 	Cost		perrange;
 	Cost		countrange;
 	Cost		whole;
+	Cost		keys;
 	double		pages;
 	double		reads;			/* every page the count reads: its directory
 								 * leaves, posting pages and heap recheck, for
@@ -4340,6 +4393,10 @@ typedef struct LionLeafInfo
 								 * posting sets only bound, which an index
 								 * that stores positions decides instead of
 								 * the heap (lion_query_posexact()) */
+	bool		keytest;		/* ARRAY: the keys of var that pass val,
+								 * which is the clause itself
+								 * (lion_keytest_leaf(), DESIGN.md §10, "A
+								 * test of each key") */
 } LionLeafInfo;
 
 
@@ -4380,6 +4437,10 @@ extern Node *lion_multikey_any_as_or(Node *clause);
 extern bool lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 							  bool allow_negated, bool allow_range,
 							  bool allow_recheck, LionLeafInfo *out);
+extern double lion_keytest_keys(PlannerInfo *root, Var *var,
+								bool *isdefault);
+extern bool lion_keytest_leaf(PlannerInfo *root, Node *clause, Index rti,
+							  LionLeafInfo *out);
 extern void lion_append_clause(const LionLeafInfo *leaf, Node *clause,
 							   bool inor, List **whereattnos,
 							   List **clauseinfos, List **whereclauses,

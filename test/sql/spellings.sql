@@ -270,11 +270,15 @@ SELECT q, sp_q(q) FROM (VALUES
 	('SELECT count(*) FROM sp WHERE s LIKE ''a'' || chr(55295) || ''%'''),
 	('SELECT count(*) FROM sp WHERE s LIKE ''pá%''')
 ) v(q);
--- a character with no successor is the ordinary plan's
+-- a character with no successor is no range (with the keys' tests off, which
+-- answer what no range does: where_keytest.sql)
+SET pg_lion.enable_key_tests = off;
 SELECT sp_q('SELECT count(*) FROM sp WHERE s LIKE ''a'' || chr(1114111) || ''%''');
+RESET pg_lion.enable_key_tests;
 \endif
--- the ordinary plan's: a wildcard before the end, NOT LIKE, ILIKE, and a
--- pattern known only at run time
+-- no range either: a wildcard before the end, NOT LIKE, ILIKE, and a pattern
+-- known only at run time
+SET pg_lion.enable_key_tests = off;
 SELECT q, sp_q(q) FROM (VALUES
 	('SELECT count(*) FROM sp WHERE s LIKE ''p_id'''),
 	('SELECT count(*) FROM sp WHERE s LIKE ''pa%d'''),
@@ -283,6 +287,7 @@ SELECT q, sp_q(q) FROM (VALUES
 	('SELECT count(*) FROM sp WHERE s ILIKE ''pa%'''),
 	('SELECT count(*) FROM sp WHERE s LIKE (SELECT ''pa%'')')
 ) v(q);
+RESET pg_lion.enable_key_tests;
 
 -- ---- over a partitioned table, whose bounds may imply or refute them ----
 CREATE TABLE spp (id int, s text COLLATE "C", n int, tags text[])

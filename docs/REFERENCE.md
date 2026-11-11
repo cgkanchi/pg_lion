@@ -882,6 +882,23 @@ working around a bad choice:
   answers - `payload LIKE 'ab%'`, `id > 1000`, `length(s) = 64` - beside ones that do, testing it on
   the heap row of each row the others select (DESIGN.md §10, "Residual clauses"), over one table or
   each partition of a partitioned one (§16). Off, such a count goes to the ordinary plan.
+- `pg_lion.enable_key_tests`: let the count pushdown answer a `WHERE` clause of one Lion-indexed
+  column of few distinct values that no index answers as it stands - `lower(status) = 'paid'`,
+  `country ILIKE 'c1%'`, `country ~ '^c[12]$'`, `kind % 5 = 0` - by testing each of the column's
+  keys once and counting the keys that pass as an `IN` list (DESIGN.md §10, "A test of each key").
+  The column's statistics have to put its distinct values at 1% of the table's rows or fewer, and
+  its index has to store the rows' exact values (as for `enable_expr_groups`). The clause has to be
+  immutable, read no other column, be NULL or false where the column is NULL, and call only
+  functions that cannot fail on a value: leakproof ones, text's `lower()`, `upper()`, `initcap()`,
+  lengths, trims, `left()`, `right()`, `substr()` and `||`, `LIKE`, `ILIKE` and regular
+  expressions against a constant or a parameter, and an integer division or remainder by a
+  constant. Taken in a count, a `GROUP BY` and a `count(DISTINCT)`, over one table or a
+  partitioned one; not in a `FILTER`, a count by cells, a join or the top k. EXPLAIN prints the
+  clause itself among the `Lion Indexes`, and ANALYZE counts `Keys Tested` and `Keys Passed`. Off,
+  such a clause is residual (above) or the query goes to the ordinary plan:
+
+      Custom Scan (LionCount)
+        Lion Indexes: t_c ((c ~~* 'C1%'::text)), t_s (s = 's3'::text)
 - `pg_lion.enable_count_anti`: let the count pushdown answer `SELECT count(*) FROM t WHERE ... AND
   NOT EXISTS (SELECT 1 FROM s WHERE s.a = t.k ...)` over a small inner side as the count of the
   `WHERE` less the rows some inner row matches: the node runs the inner side as its child, looks

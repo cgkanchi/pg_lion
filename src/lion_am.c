@@ -649,6 +649,20 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	/*
+	 * DESIGN.md §10, "A test of each key": whether a WHERE clause of one
+	 * column no posting set answers may be counted as the list of the
+	 * column's keys that pass it.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_key_tests",
+							 "Lets the count pushdown answer a WHERE clause of one lion-indexed column, such as upper(col) = 'X' or col ILIKE 'x%', by testing each of the column's keys once.",
+							 "Off, such a clause is tested on each row, by the ordinary plan or as a residual clause.",
+							 &lion_enable_key_tests,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomIntVariable("pg_lion.count_cells_max",
 							"The most cells a count by cells may have: the product of each predicate column's outcomes.",
 							"A plan with more is left to the ordinary plan.",

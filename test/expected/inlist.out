@@ -600,17 +600,27 @@ SELECT lion_incmp(format('SELECT a, count(*) FROM lion_in WHERE a = ANY (''%s'':
 (1 row)
 
 RESET work_mem;
--- the longest list pushed down, 100,000 values, and one more declined
+-- the longest list pushed down, 100,000 values, and one more declined -
+-- unless the column's keys are tested against it instead (DESIGN.md §10, "A
+-- test of each key"), which a's few keys allow
 SELECT lion_incmp(format('SELECT count(*) FROM lion_in WHERE a = ANY (''%s''::int[])', lion_inlist(0, 99999, 1000000)));
      lion_incmp      
 ---------------------
  pushed down, 1 rows
 (1 row)
 
+SET pg_lion.enable_key_tests = off;
 SELECT lion_incmp(format('SELECT count(*) FROM lion_in WHERE a = ANY (''%s''::int[])', lion_inlist(0, 100000, 1000000)));
      lion_incmp     
 --------------------
  index scan, 1 rows
+(1 row)
+
+RESET pg_lion.enable_key_tests;
+SELECT lion_incmp(format('SELECT count(*) FROM lion_in WHERE a = ANY (''%s''::int[])', lion_inlist(0, 100000, 1000000)));
+     lion_incmp      
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 /*
