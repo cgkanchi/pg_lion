@@ -420,7 +420,7 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * summaries (DESIGN.md §32), stored positions (§17), SLICE entries (§51) -
  * the meta page's words below say, not the version.
  */
-#define LION_VERSION			1
+#define LION_VERSION			2
 
 typedef struct LionMetaPageData
 {
@@ -1305,9 +1305,10 @@ lion_index_row_column(const LionIndexState *ix)
  *	LION_QMODE_LOSSY	at least the rows the query selects, and perhaps
  *					more: the key tree selects a SUPERSET, which the caller
  *					rechecks (lion_extract_query_superset() only: a phrase
- *					as the AND of its lexemes, `a & !b` as `a`)
+ *					as the AND of its lexemes, `a & !b:A` as `a`)
  *	LION_QMODE_ALL	every indexed row, with recheck (`tags @> '{}'`, `<@`,
- *					a tsquery with NOT/phrase/prefix/weights, a NULL key)
+ *					a tsquery with a bare NOT, a phrase, a prefix or a
+ *					weight, a NULL key)
  */
 typedef enum LionQueryMode
 {
@@ -1334,7 +1335,8 @@ typedef enum LionKeyNodeKind
 	LION_KN_ANDNOT				/* its first child's members less every other
 								 * child's: `col IS NOT NULL` beside other
 								 * quals, the column's NULL entry subtracted
-								 * (DESIGN.md §14, §29.2); the scans' only */
+								 * (DESIGN.md §14, §29.2), and a tsquery's
+								 * `a & !b` (§17) */
 } LionKeyNodeKind;
 
 /*
@@ -1399,6 +1401,13 @@ extern uint16 lion_array_empty_flag(Datum value);
 typedef struct LionKeyPositions
 {
 	uint16		npos;
+
+	/*
+	 * The row's length, the empty key's one position (DESIGN.md §17,
+	 * "Ranking"), which lion_extract_value_pos() sets on every key of the row
+	 * for the chunks' impacts (lion_positions.h): 0 where it is not known.
+	 */
+	uint16		dl;
 	const uint16 *pos;
 } LionKeyPositions;
 
@@ -2457,6 +2466,11 @@ struct RelOptInfo;
 extern double lion_index_slice_pages(Relation index, double heap_pages,
 									 double tuples);
 extern void lion_leave_out_slice_pages(struct RelOptInfo *rel);
+/* day filters as ranges of the column (lion_plan_dayrange.c, DESIGN.md §54) */
+struct PlannerInfo;
+extern bool lion_enable_date_ranges;	/* GUC pg_lion.enable_date_ranges */
+extern void lion_rewrite_day_filters(struct PlannerInfo *root,
+									 struct RelOptInfo *rel);
 /* the entries a lion path's lookups hand their answer out by (lion_amcost.c) */
 extern double lion_cost_path_entries(struct PlannerInfo *root,
 									 struct IndexPath *path);
@@ -2669,6 +2683,8 @@ extern void lion_meta_record_ndistinct(Page metapage,
 extern void lion_meta_write_ndistinct(Relation index,
 									  const LionMetaNdistinct *nd);
 extern bool lion_read_meta_ndistinct(Relation index, LionMetaNdistinct *nd);
+extern bool lion_read_meta_counts(Relation index, LionMetaNdistinct *nd,
+								  uint32 *inline_limit);
 
 /*
  * The end of an ambulkdelete call (DESIGN.md §37): add one to the meta page's
@@ -3054,6 +3070,9 @@ extern LionPosCursor *lion_poscursor_open(Relation index, LionState *col,
 extern const LionPosMember *lion_poscursor_next(Relation index,
 												LionPosCursor *cur,
 												uint64 code);
+extern const LionContainer *lion_poscursor_chunk(Relation index,
+												 LionPosCursor *cur,
+												 uint64 code, uint64 *id);
 extern void lion_poscursor_close(LionPosCursor *cur);
 
 extern LionPosFilter *lion_posfilter_begin(Relation index, LionState *col,

@@ -1764,10 +1764,10 @@ SELECT lion_rc('SELECT k, count(*) FROM lion_rpt WHERE k > 90 GROUP BY k');
  pushed down, 9 rows
 (1 row)
 
-SELECT lion_rc('SELECT count(DISTINCT k) FROM lion_rpt WHERE k < 30');         -- declined (§26)
-         lion_rc         
--------------------------
- not pushed down, 1 rows
+SELECT lion_rc('SELECT count(DISTINCT k) FROM lion_rpt WHERE k < 30');         -- GROUP BY k (§10)
+       lion_rc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_rq('SELECT id FROM lion_rpt WHERE k BETWEEN 30 AND 33');

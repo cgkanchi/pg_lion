@@ -289,8 +289,16 @@ lion_postree_put(Relation index, Relation heaprel, uint32 hash,
 		LionContainer *c = lion_page_poschunk_fetch(index, BufferGetPage(tbuf),
 													tblk, toff);
 
+		/*
+		 * A chunk is split once it would pass LION_POS_TREE_BYTES of
+		 * members, so that its impacts bound few rows - but one of fewer
+		 * than two members cannot be, and takes what it needs.
+		 */
 		memcpy(work, c, lion_poschunk_size(c));
-		if (lion_poschunk_insert(work, LION_CONTAINER_MAX_SIZE, m, &replaced))
+		if (lion_poschunk_insert(work, LION_POS_HDRSZ + LION_POS_TREE_BYTES,
+								 m, &replaced) ||
+			(c->cardinality < 2 &&
+			 lion_poschunk_insert(work, LION_CONTAINER_MAX_SIZE, m, &replaced)))
 			lion_tree_put_items_locked(index, heaprel, tbuf, &tree, toff, true,
 									   &work, 1, true);
 		else
@@ -444,6 +452,8 @@ pos_stress_member(LionPosMember *m, uint64 code, uint32 version,
 
 	m->code = code;
 	m->npos = (uint16) npos;
+	/* a row length now and then unknown, else at least the member's tf */
+	m->dl = (shape == 50) ? 0 : (uint16) (Max(npos, 1) + (s >> 16) % 500);
 	for (i = 0; i < npos; i++)
 	{
 		int			room = (LION_POS_LIMIT - 1 - (int) (npos - 1 - i)) - prev;

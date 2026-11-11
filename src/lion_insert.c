@@ -77,6 +77,7 @@
 
 #include "lion.h"
 #include "lion_compat.h"
+#include "lion_defer.h"
 
 static void lion_insert_new_entry(Relation index, Relation heaprel,
 								 LionState *state, Buffer *leafbuf,
@@ -106,11 +107,11 @@ static int	lion_container_inplace_check(Relation index, Buffer buf,
 static void lion_container_inplace_apply(LionWalState *xstate, Buffer buf,
 										 OffsetNumber off, uint16 lo);
 static int	lion_segment_inplace_check(Relation index, Buffer buf,
-									   OffsetNumber off, uint32 ckey,
-									   uint16 lo);
+									   OffsetNumber off,
+									   const LionSparseProbe *pr);
 static void lion_segment_inplace_apply(LionWalState *xstate, Buffer buf,
 									   OffsetNumber off, uint32 ckey,
-									   uint16 lo);
+									   uint16 lo, const LionSparseProbe *pr);
 static Buffer lion_insert_lock_chain_page(Relation index, Relation heaprel,
 										  BlockNumber entryblk, uint32 hash,
 										  BlockNumber head, BlockNumber tail,
@@ -123,12 +124,14 @@ static bool lion_insert_chain_leaf(Relation index, Relation heaprel, Buffer buf,
 static bool lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 									   Buffer entrybuf, OffsetNumber entryoff,
 									   LionEntryTuple *entry, Size entrysize,
-									   uint32 ckey, uint16 lo, bool *done);
+									   uint32 ckey, uint16 lo,
+									   const LionSparseProbe *pr, bool *done);
 static void lion_insert_segment(Relation index, Relation heaprel, Buffer buf,
 							   OffsetNumber off,
 							   bool replace, Buffer entrybuf,
 							   OffsetNumber entryoff, LionEntryTuple *entry,
-							   uint32 ckey, uint16 lo);
+							   uint32 ckey, uint16 lo,
+							   const LionSparseProbe *pr);
 
 /*
  * Scratch buffers and result of adding one pair to a sparse segment.
@@ -170,18 +173,28 @@ lion_segwork_buf(LionContainer **p)
 	return *p;
 }
 
-/* Is this item a segment that has room for (ckey, lo)? */
+/*
+ * Is this item a segment that has room for (ckey, lo)?  If so *pr is its
+ * probe for the pair (lion_sparse_probe()), which the insert that follows
+ * takes over instead of decoding the segment again.
+ */
 static bool
-lion_segment_has_room(const LionContainer *item, uint32 ckey, uint16 lo)
+lion_segment_has_room(const LionContainer *item, uint32 ckey, uint16 lo,
+					  LionSparseProbe *pr)
 {
-	return item->type == LION_CT_SPARSE &&
-		lion_sparse_insert_size(item, ckey, lo) != 0;
+	if (item->type != LION_CT_SPARSE)
+		return false;
+	lion_sparse_probe(item, ckey, lo, pr);
+	return pr->found || lion_sparse_probe_fits(pr);
 }
 
 /*
  * Add (ckey, lo) to the segment in w->seg and build the items that must take
  * its place, leaving them in w->items[0 .. w->nitems).  Returns false when
- * the pair was already there, in which case nothing has to be written.
+ * the pair was already there, in which case nothing has to be written.  pr is
+ * the probe of w->seg for the pair (lion_sparse_probe()): all this asks of
+ * the segment - is the pair there, how many pairs has its ckey, does it fit -
+ * comes from that one decode, and so does the insert itself.
  *
  * The threshold test comes first, on purpose: promoting the ckey to a
  * container *shrinks* the segment, so a segment that is at its maximum needs
@@ -189,17 +202,19 @@ lion_segment_has_room(const LionContainer *item, uint32 ckey, uint16 lo)
  * need more than LION_MAX_PUT_ITEMS items.
  */
 static bool
-lion_segment_add(LionSegWork *w, uint32 ckey, uint16 lo)
+lion_segment_add(LionSegWork *w, uint32 ckey, uint16 lo,
+				 const LionSparseProbe *pr)
 {
 	uint32		cnt;
 
 	Assert(w->seg->type == LION_CT_SPARSE);
+	Assert(pr->code == lion_make_code(ckey, lo));
 	w->nitems = 0;
 
-	if (lion_sparse_contains(w->seg, ckey, lo))
+	if (pr->found)
 		return false;			/* already indexed */
 
-	cnt = lion_sparse_count(w->seg, ckey);
+	cnt = pr->ckey_pairs;
 
 	if (cnt + 1 >= LION_SPARSE_THRESHOLD)
 	{
@@ -225,8 +240,10 @@ lion_segment_add(LionSegWork *w, uint32 ckey, uint16 lo)
 		if (w->right->cardinality > 0)
 			w->items[w->nitems++] = w->right;
 	}
-	else if (lion_sparse_insert(w->seg, ckey, lo, NULL))
+	else if (lion_sparse_probe_fits(pr))
 	{
+		if (!lion_sparse_insert_probed(w->seg, pr, NULL))
+			elog(ERROR, "lion index: sparse segment refused a pair its probe said fits");
 		w->items[w->nitems++] = w->seg;
 	}
 	else if (lion_sparse_split_half(w->seg, lion_segwork_buf(&w->left),
@@ -279,7 +296,9 @@ lion_segment_add(LionSegWork *w, uint32 ckey, uint16 lo)
 
 /*
  * Add (ckey, lo) through the sparse segment at (buf, off), or -- with replace
- * false -- as a brand new one-pair segment inserted at off.
+ * false -- as a brand new one-pair segment inserted at off.  pr, if not NULL,
+ * is the probe of that segment for the pair (lion_sparse_probe()), taken
+ * under the same lock.
  *
  * buf is the container page and entrybuf the entry's bucket page, both held
  * EXCLUSIVE by the caller and still locked on return; entry is the caller's
@@ -290,10 +309,12 @@ static void
 lion_insert_segment(Relation index, Relation heaprel, Buffer buf,
 				   OffsetNumber off, bool replace,
 				   Buffer entrybuf, OffsetNumber entryoff,
-				   LionEntryTuple *entry, uint32 ckey, uint16 lo)
+				   LionEntryTuple *entry, uint32 ckey, uint16 lo,
+				   const LionSparseProbe *pr)
 {
 	Page		page = BufferGetPage(buf);
 	LionSegWork	w;
+	LionSparseProbe probe;
 
 	lion_segwork_init(&w);
 
@@ -311,7 +332,13 @@ lion_insert_segment(Relation index, Relation heaprel, Buffer buf,
 			elog(ERROR, "lion index: item %u on block %u is not a sparse segment",
 				 off, BufferGetBlockNumber(buf));
 
-		if (!lion_segment_add(&w, ckey, lo))
+		/* the probe of the page item is the probe of its copy */
+		if (pr == NULL)
+		{
+			lion_sparse_probe(w.seg, ckey, lo, &probe);
+			pr = &probe;
+		}
+		if (!lion_segment_add(&w, ckey, lo, pr))
 			return;				/* already indexed: nothing changes */
 	}
 	else
@@ -367,130 +394,152 @@ lion_put_singleton(char *dst, uint32 ckey, uint16 lo)
  * Returns the length of the new payload, or 0 if the member was already
  * there, in which case out is undefined.  *ndelta receives the change in the
  * number of items, which is -0 .. +2.
+ *
+ * Which item takes the pair is decided from the items' first ckeys, which
+ * are in their headers: the items are ordered by first ckey and their ranges
+ * do not overlap, so the only item that can cover the ckey is the last one
+ * whose first ckey is at or below it - the candidate - and the gap the ckey
+ * falls in otherwise lies between the candidate and the item after it.  Only
+ * those two can be the target, and a segment among them is decoded once
+ * (lion_sparse_probe()), which answers whether it covers the ckey, whether it
+ * has room and where the pair goes; the items around the target are copied
+ * as bytes, back to back as they were.
  */
 static Size
 lion_inline_add(Relation index, BlockNumber blk, OffsetNumber eoff,
 				const char *payload, Size paylen, uint32 ckey, uint16 lo,
 				char *out, int *ndelta)
 {
-	LionContainer *cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	union
+	{
+		LionContainer c;
+		uint64		force_align;
+		char		data[LION_CONTAINER_MAX_SIZE];
+	}			walkbuf;
+	LionContainer *cbuf = &walkbuf.c;
+	LionContainer *item;
 	LionSegWork	w;
+	LionSparseProbe probe;
 	Size		off;
-	Size		used = 0;
+	Size		ioff;			/* byte offset of the item being walked */
 	Size		csize;
-	int			n = 0;
-	int			target = -1;	/* item to replace */
-	int			insertpos = -1; /* item to insert a new segment before */
-	int			previdx = -1;
-	bool		prev_ok = false;
+	Size		end;			/* the end of the last item: slack follows */
+	Size		candoff = 0;
+	Size		nextoff = 0;
+	Size		toff = 0;		/* the target's bytes, or the new segment's place */
+	Size		tend = 0;
+	Size		used;
+	bool		cand = false;	/* the last item with first ckey <= ckey */
+	bool		next = false;	/* the item after it */
+	bool		target = false;
+	int			i;
 
 	*ndelta = 0;
 	lion_segwork_init(&w);
 
 	/*
-	 * Pass 1: decide which item takes the pair.  The items are ordered by
-	 * first ckey and their ranges do not overlap, so the walk stops either on
-	 * the item that covers the ckey or on the first item beyond it.
+	 * Walk the items once, reading their headers: every item is fetched, as
+	 * the copy of the payload needs every one of them sound
+	 * (lion_inline_fetch()), and the walk finds where they end.
 	 */
 	off = 0;
-	while (lion_inline_fetch(index, blk, eoff, payload, paylen, &off,
-							 cbuf) > 0)
+	for (;;)
 	{
-		if (lion_item_covers(cbuf, ckey))
-		{
-			target = n;
+		ioff = off;
+		if (lion_inline_fetch(index, blk, eoff, payload, paylen, &off,
+							  cbuf) == 0)
 			break;
-		}
-		if (lion_item_first_ckey(cbuf) > ckey)
+		if (next)
+			continue;
+		if (lion_item_first_ckey(cbuf) <= ckey)
 		{
-			/* In the gap: the segment before it, else the one after it. */
-			if (prev_ok)
-				target = previdx;
-			else if (lion_segment_has_room(cbuf, ckey, lo))
-				target = n;
-			else
-				insertpos = n;
-			break;
+			cand = true;
+			candoff = ioff;
 		}
-		prev_ok = lion_segment_has_room(cbuf, ckey, lo);
-		previdx = n;
-		n++;
-	}
-
-	if (target < 0 && insertpos < 0)
-	{
-		/* Past the last item. */
-		if (prev_ok)
-			target = previdx;
 		else
-			insertpos = n;
+		{
+			next = true;
+			nextoff = ioff;
+		}
+	}
+	end = off;
+
+	/* The candidate takes the pair if it covers the ckey, or has room. */
+	item = lion_segwork_buf(&w.seg);
+	if (cand)
+	{
+		off = candoff;
+		csize = lion_inline_fetch(index, blk, eoff, payload, paylen, &off,
+								  item);
+		Assert(csize > 0);
+		if (item->type == LION_CT_SPARSE)
+		{
+			lion_sparse_probe(item, ckey, lo, &probe);
+			target = lion_sparse_probe_covers(item, &probe) ||
+				lion_sparse_probe_fits(&probe);
+		}
+		else
+			target = (item->ckey == ckey);
+		toff = candoff;
+		tend = off;
 	}
 
-	/* Pass 2: copy the payload, replacing or inserting where pass 1 said. */
-	off = 0;
-	n = 0;
-	while ((csize = lion_inline_fetch(index, blk, eoff, payload, paylen,
-									  &off, cbuf)) > 0)
+	/* In the gap after it: the segment after the gap, else a new segment. */
+	if (!target && next)
 	{
-		if (n == insertpos)
-		{
-			used += lion_put_singleton(out + used, ckey, lo);
-			*ndelta = 1;
-			insertpos = -1;
-		}
-
-		if (n == target)
-		{
-			if (cbuf->type == LION_CT_SPARSE)
-			{
-				int			i;
-
-				memcpy(lion_segwork_buf(&w.seg), cbuf, csize);
-				if (!lion_segment_add(&w, ckey, lo))
-				{
-					pfree(cbuf);
-					return 0;	/* already indexed */
-				}
-
-				for (i = 0; i < w.nitems; i++)
-				{
-					Size		isz = lion_item_size(w.items[i]);
-
-					memcpy(out + used, w.items[i], isz);
-					used += isz;
-				}
-				*ndelta = w.nitems - 1;
-				n++;
-				continue;
-			}
-
-			/*
-			 * A container with this very ckey, written back as the smallest
-			 * that holds it, as the build writes it (DESIGN.md §38).
-			 */
-			Assert(cbuf->ckey == ckey);
-			if (!lion_container_add(cbuf, lo))
-			{
-				pfree(cbuf);
-				return 0;		/* already indexed */
-			}
-			lion_container_optimize(cbuf);
-			csize = lion_container_size(cbuf);
-		}
-
-		memcpy(out + used, cbuf, csize);
-		used += csize;
-		n++;
+		off = nextoff;
+		csize = lion_inline_fetch(index, blk, eoff, payload, paylen, &off,
+								  item);
+		Assert(csize > 0);
+		target = lion_segment_has_room(item, ckey, lo, &probe);
+		toff = nextoff;
+		tend = target ? off : nextoff;
 	}
+	else if (!target)
+		toff = tend = end;		/* past the last item, or the payload is empty */
 
-	if (insertpos >= 0)
+	/* The items before the target, as they are. */
+	memcpy(out, payload, toff);
+	used = toff;
+
+	if (!target)
 	{
-		/* The payload was empty, or the new segment goes at the end. */
 		used += lion_put_singleton(out + used, ckey, lo);
 		*ndelta = 1;
 	}
+	else if (item->type == LION_CT_SPARSE)
+	{
+		if (!lion_segment_add(&w, ckey, lo, &probe))
+			return 0;			/* already indexed */
 
-	pfree(cbuf);
+		for (i = 0; i < w.nitems; i++)
+		{
+			Size		isz = lion_item_size(w.items[i]);
+
+			memcpy(out + used, w.items[i], isz);
+			used += isz;
+		}
+		*ndelta = w.nitems - 1;
+	}
+	else
+	{
+		/*
+		 * A container with this very ckey, written back as the smallest that
+		 * holds it, as the build writes it (DESIGN.md §38).
+		 */
+		Assert(item->ckey == ckey);
+		if (!lion_container_add(item, lo))
+			return 0;			/* already indexed */
+		lion_container_optimize(item);
+		csize = lion_container_size(item);
+		memcpy(out + used, item, csize);
+		used += csize;
+	}
+
+	/* The items after it, as they are. */
+	memcpy(out + used, payload + tend, end - tend);
+	used += end - tend;
+
 	return used;
 }
 
@@ -1016,17 +1065,18 @@ lion_container_inplace_apply(LionWalState *xstate, Buffer buf,
  * its own, which turns one item into up to three and belongs to
  * lion_insert_segment().  Unlike a container, a segment covers a RANGE of
  * container keys, and the pair may extend it, so the page bounds are
- * recomputed.
+ * recomputed.  pr is the segment's probe for the pair (lion_chain_target()).
  */
 static bool
 lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 						   Buffer entrybuf, OffsetNumber entryoff,
 						   LionEntryTuple *entry, Size entrysize,
-						   uint32 ckey, uint16 lo, bool *done)
+						   uint32 ckey, uint16 lo,
+						   const LionSparseProbe *pr, bool *done)
 {
 	LionWalState *xstate;
 
-	switch (lion_segment_inplace_check(index, buf, off, ckey, lo))
+	switch (lion_segment_inplace_check(index, buf, off, pr))
 	{
 		case LION_INPLACE_NO:
 			return false;
@@ -1039,7 +1089,7 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 	*done = true;
 
 	xstate = lion_wal_begin(index);
-	lion_segment_inplace_apply(xstate, buf, off, ckey, lo);
+	lion_segment_inplace_apply(xstate, buf, off, ckey, lo, pr);
 
 	lion_entry_set_ntids(entry, lion_entry_ntids(entry) + 1);
 
@@ -1052,10 +1102,13 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 	return true;
 }
 
-/* The first half of lion_insert_segment_inplace(), as for a container. */
+/*
+ * The first half of lion_insert_segment_inplace(), as for a container, from
+ * the segment's probe for the pair (lion_sparse_probe()).
+ */
 static int
 lion_segment_inplace_check(Relation index, Buffer buf, OffsetNumber off,
-						   uint32 ckey, uint16 lo)
+						   const LionSparseProbe *pr)
 {
 	Page		page = BufferGetPage(buf);
 	ItemId		iid = PageGetItemId(page, off);
@@ -1065,15 +1118,15 @@ lion_segment_inplace_check(Relation index, Buffer buf, OffsetNumber off,
 
 	Assert(onpage->type == LION_CT_SPARSE);
 
-	need = lion_sparse_insert_size(onpage, ckey, lo);
+	need = lion_sparse_probe_insert_size(onpage, pr);
 	if (need == 0)
 		return LION_INPLACE_NO;	/* would have to split */
-	if (lion_sparse_count(onpage, ckey) + 1 >= LION_SPARSE_THRESHOLD)
+	if (pr->ckey_pairs + 1 >= LION_SPARSE_THRESHOLD)
 		return LION_INPLACE_NO;	/* would have to promote the container key */
 	if (alloc < need)
 		return LION_INPLACE_NO;	/* no slack inside the item */
 
-	if (lion_sparse_contains(onpage, ckey, lo))
+	if (pr->found)
 		return LION_INPLACE_DUP;
 
 	/* As for a container (lion_container_inplace_check()). */
@@ -1082,17 +1135,23 @@ lion_segment_inplace_check(Relation index, Buffer buf, OffsetNumber off,
 	return LION_INPLACE_YES;
 }
 
-/* The second half: the pair in, inside the record, and the page's bounds. */
+/*
+ * The second half: the pair in, inside the record, and the page's bounds.
+ * pr is the segment's probe for the pair from the first half, taken under
+ * the same lock, whose bytes the page image the record registers has too.
+ */
 static void
 lion_segment_inplace_apply(LionWalState *xstate, Buffer buf, OffsetNumber off,
-						   uint32 ckey, uint16 lo)
+						   uint32 ckey, uint16 lo, const LionSparseProbe *pr)
 {
 	Page		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 	ItemId		iid = PageGetItemId(p, off);
 	LionContainer *s = (LionContainer *) PageGetItem(p, iid);
 	bool		dup = false;
+	bool		ok;
 
-	if (!lion_sparse_insert(s, ckey, lo, &dup) || dup)
+	ok = lion_sparse_insert_probed(s, pr, &dup);
+	if (!ok || dup)
 		elog(ERROR, "lion index: sparse segment %u on block %u changed under an exclusive lock",
 			 off, BufferGetBlockNumber(buf));
 
@@ -1210,6 +1269,9 @@ lion_insert_lock_chain_page(Relation index, Relation heaprel,
  *	LION_TARGET_NEW			none: the pair becomes a new one-pair segment,
  *							inserted at *off.
  *
+ * For LION_TARGET_SEGMENT *pr is the segment's probe for the pair
+ * (lion_sparse_probe()), the one decode of it the insert needs.
+ *
  * Every item looked at here has been through lion_page_item_fetch(), so the
  * in-place paths may take the item at *off as it stands.  One decision for
  * lion_insert_chain_leaf() and for the slices' batched in-place adds
@@ -1222,7 +1284,7 @@ lion_insert_lock_chain_page(Relation index, Relation heaprel,
 
 static int
 lion_chain_target(Relation index, Buffer buf, uint32 ckey, uint16 lo,
-				  OffsetNumber *offp)
+				  OffsetNumber *offp, LionSparseProbe *pr)
 {
 	Page		cpage = BufferGetPage(buf);
 	BlockNumber blk = BufferGetBlockNumber(buf);
@@ -1234,21 +1296,27 @@ lion_chain_target(Relation index, Buffer buf, uint32 ckey, uint16 lo,
 	*offp = off;
 
 	if (found)
-		return lion_page_item_fetch(index, cpage, blk, off)->type ==
-			LION_CT_SPARSE ? LION_TARGET_SEGMENT : LION_TARGET_CONTAINER;
+	{
+		LionContainer *item = lion_page_item_fetch(index, cpage, blk, off);
+
+		if (item->type != LION_CT_SPARSE)
+			return LION_TARGET_CONTAINER;
+		lion_sparse_probe(item, ckey, lo, pr);
+		return LION_TARGET_SEGMENT;
+	}
 
 	maxoff = PageGetMaxOffsetNumber(cpage);
 	if (off > FirstOffsetNumber &&
 		lion_segment_has_room(lion_page_item_fetch(index, cpage, blk,
 												   OffsetNumberPrev(off)),
-							  ckey, lo))
+							  ckey, lo, pr))
 	{
 		*offp = OffsetNumberPrev(off);
 		return LION_TARGET_SEGMENT;
 	}
 	if (off <= maxoff &&
 		lion_segment_has_room(lion_page_item_fetch(index, cpage, blk, off),
-							  ckey, lo))
+							  ckey, lo, pr))
 		return LION_TARGET_SEGMENT;
 
 	return LION_TARGET_NEW;
@@ -1274,8 +1342,9 @@ lion_insert_chain_leaf(Relation index, Relation heaprel, Buffer buf,
 {
 	OffsetNumber off;
 	int			delta;
+	LionSparseProbe probe;
 
-	switch (lion_chain_target(index, buf, ckey, lo, &off))
+	switch (lion_chain_target(index, buf, ckey, lo, &off, &probe))
 	{
 		case LION_TARGET_SEGMENT:
 			{
@@ -1283,19 +1352,19 @@ lion_insert_chain_leaf(Relation index, Relation heaprel, Buffer buf,
 
 				if (lion_insert_segment_inplace(index, buf, off, entrybuf,
 												entryoff, ecopy, esize, ckey,
-												lo, &done))
+												lo, &probe, &done))
 					return true;
 				if (!mayput)
 					return false;
 				lion_insert_segment(index, heaprel, buf, off, true, entrybuf,
-								   entryoff, ecopy, ckey, lo);
+								   entryoff, ecopy, ckey, lo, &probe);
 				return true;
 			}
 		case LION_TARGET_NEW:
 			if (!mayput)
 				return false;
 			lion_insert_segment(index, heaprel, buf, off, false, entrybuf,
-							   entryoff, ecopy, ckey, lo);
+							   entryoff, ecopy, ckey, lo, NULL);
 			return true;
 		default:
 			break;
@@ -2058,6 +2127,8 @@ typedef struct LionSliceAdd
 								 * InvalidBuffer, an INLINE slice */
 	OffsetNumber off;			/* the item that takes the member */
 	bool		segment;		/* a sparse segment, else a container */
+	LionSparseProbe probe;		/* a segment: its probe for the pair, taken
+								 * under the lock buf stays in */
 	OffsetNumber entryoff;		/* the slice's entry on the batch's leaf */
 	LionEntryTuple *ecopy;		/* an INLINE slice: the entry as it is to be,
 								 * its payload grown and its count raised;
@@ -2130,6 +2201,7 @@ lion_slice_batch_add(Relation index, LionSliceBatch *b, Buffer leafbuf,
 	Buffer		buf;
 	Page		cpage;
 	OffsetNumber off;
+	LionSparseProbe probe;
 	int			target;
 	int			verdict;
 	int			i;
@@ -2175,11 +2247,11 @@ lion_slice_batch_add(Relation index, LionSliceBatch *b, Buffer leafbuf,
 		return LION_SLICE_ORDINARY;
 	}
 
-	target = lion_chain_target(index, buf, ckey, lo, &off);
+	target = lion_chain_target(index, buf, ckey, lo, &off, &probe);
 	if (target == LION_TARGET_CONTAINER)
 		verdict = lion_container_inplace_check(index, buf, off, lo);
 	else if (target == LION_TARGET_SEGMENT)
-		verdict = lion_segment_inplace_check(index, buf, off, ckey, lo);
+		verdict = lion_segment_inplace_check(index, buf, off, &probe);
 	else
 		verdict = LION_INPLACE_NO;
 
@@ -2199,6 +2271,8 @@ lion_slice_batch_add(Relation index, LionSliceBatch *b, Buffer leafbuf,
 	a->buf = buf;
 	a->off = off;
 	a->segment = (target == LION_TARGET_SEGMENT);
+	if (a->segment)
+		a->probe = probe;
 	a->entryoff = entryoff;
 	a->ecopy = NULL;
 	a->esize = 0;
@@ -2342,7 +2416,8 @@ lion_slice_batch_write(Relation index, Buffer leafbuf, LionSliceBatch *b)
 		if (!BufferIsValid(a->buf))
 			continue;
 		if (a->segment)
-			lion_segment_inplace_apply(xstate, a->buf, a->off, b->ckey, b->lo);
+			lion_segment_inplace_apply(xstate, a->buf, a->off, b->ckey, b->lo,
+									   &a->probe);
 		else
 			lion_container_inplace_apply(xstate, a->buf, a->off, b->lo);
 	}
@@ -2515,6 +2590,282 @@ lion_slice_insert(Relation index, Relation heaprel, LionState *state,
 }
 
 /*
+ * The first block of the statement's insert context (lioninsert()): what a
+ * row allocates, with room to spare, so that no row needs a second block.
+ */
+#define LION_INSERT_CONTEXT_SIZE	(64 * 1024)
+
+/* ---------------------------------------------------------------------
+ * Batches (DESIGN.md §55)
+ * --------------------------------------------------------------------- */
+
+/*
+ * Rows of one key, held to under one hold of its directory leaf: enough that
+ * the handoffs of the leaf stop mattering, few enough that a writer of
+ * another key on the leaf - or VACUUM - waits for well under a millisecond.
+ */
+#define LION_APPLY_HOLD		256
+
+/* The directory's order of entry kinds (DESIGN.md §21): reserved, then values */
+static inline int
+lion_insert_row_kind(const LionInsertRow *row)
+{
+	return (row->flag != 0) ? lion_reserved_kind(row->flag) : LION_KIND_VALUE;
+}
+
+/*
+ * Do a and b go to the same entry, by the bytes of their keys?  Two keys
+ * that are equal but not byte for byte - which a collation or a type may
+ * make - only make two groups, each of which finds the entry the other
+ * found.  The order is a cheap one, for grouping: columns, kinds, bucket
+ * hashes, key bytes.
+ */
+static int
+lion_insert_row_keycmp(LionIndexState *ix, const LionInsertRow *a,
+					   const LionInsertRow *b)
+{
+	LionState  *state;
+
+	if (a->col != b->col)
+		return (a->col < b->col) ? -1 : 1;
+	if (a->flag != b->flag)
+		return (lion_insert_row_kind(a) < lion_insert_row_kind(b)) ? -1 : 1;
+	if (a->hash != b->hash)
+		return (a->hash < b->hash) ? -1 : 1;
+	if (a->flag != 0)
+		return 0;
+
+	state = &ix->cols[a->col];
+	if (state->typbyval)
+		return (a->key < b->key) ? -1 : (a->key > b->key) ? 1 : 0;
+	if (state->typlen > 0)
+		return memcmp(DatumGetPointer(a->key), DatumGetPointer(b->key),
+					  state->typlen);
+	if (state->typlen == -1)
+	{
+		Size		la = VARSIZE_ANY(DatumGetPointer(a->key));
+		Size		lb = VARSIZE_ANY(DatumGetPointer(b->key));
+
+		if (la != lb)
+			return (la < lb) ? -1 : 1;
+		return memcmp(DatumGetPointer(a->key), DatumGetPointer(b->key), la);
+	}
+	return strcmp(DatumGetCString(a->key), DatumGetCString(b->key));
+}
+
+/* ... and then by TID, so a key's posting set is walked once, in order */
+static int
+lion_insert_row_cmp(const void *pa, const void *pb, void *arg)
+{
+	const LionInsertRow *a = (const LionInsertRow *) pa;
+	const LionInsertRow *b = (const LionInsertRow *) pb;
+	int			c = lion_insert_row_keycmp((LionIndexState *) arg, a, b);
+
+	if (c != 0)
+		return c;
+	return (a->code < b->code) ? -1 : (a->code > b->code) ? 1 : 0;
+}
+
+/* One key's rows of a batch: rows[start .. start + n) */
+typedef struct LionInsertGroup
+{
+	int			start;
+	int			n;
+} LionInsertGroup;
+
+typedef struct LionInsertGroupSort
+{
+	LionIndexState *ix;
+	LionInsertRow *rows;
+} LionInsertGroupSort;
+
+/*
+ * The groups in the directory's own order (lion_cmp_prefix()): column, kind,
+ * an ordered column's comparison, bucket hash, then the bytes.  Keys that
+ * go into the directory in its order land on the leaf the one before them
+ * left off at, and fill leaves the way an ascending run of inserts does,
+ * rather than splitting them all down the middle.
+ *
+ * The comparison is the column's proc 4, as the descent's is - never a sort
+ * operator, which an index whose catalog has changed since its build may no
+ * longer have although its directory is ordered (lion_fill_column_state()).
+ */
+static int
+lion_insert_group_cmp(const void *pa, const void *pb, void *arg)
+{
+	LionInsertGroupSort *gs = (LionInsertGroupSort *) arg;
+	const LionInsertRow *a = &gs->rows[((const LionInsertGroup *) pa)->start];
+	const LionInsertRow *b = &gs->rows[((const LionInsertGroup *) pb)->start];
+	LionState  *state = &gs->ix->cols[a->col];
+
+	if (a->col == b->col && a->flag == 0 && b->flag == 0 && state->ordered)
+	{
+		int32		c = DatumGetInt32(FunctionCall2Coll(&state->cmpproc,
+														state->collation,
+														a->key, b->key));
+
+		if (c != 0)
+			return c < 0 ? -1 : 1;
+	}
+	return lion_insert_row_keycmp(gs->ix, a, b);
+}
+
+/*
+ * Write a batch of buffered rows (lion_defer.c), reordering rows[] in place.
+ *
+ * Each key's rows are what lion_insert_one() would do for them one at a
+ * time, with the descents shared: a CHAIN entry - the posting set of a key of
+ * many rows - takes up to LION_APPLY_HOLD of them under one hold of its leaf,
+ * the entry rewritten in place at its size by each (lion_insert_chain()), so
+ * its offset stays good.  A new entry, or an INLINE one, takes one row per
+ * descent, as either may move the entry; an INLINE entry that spills becomes
+ * a CHAIN one and takes the rest in holds.  The keys go in directory order,
+ * their rows in TID order.
+ *
+ * The rows are untouched but for their order, so a write that fails can be
+ * redone whole: a row already in is a no-op the second time.
+ */
+void
+lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
+				  int nrows)
+{
+	LionIndexState *ix = lion_get_index_state(index);
+	LionInsertGroup *groups;
+	LionInsertGroupSort gs;
+	MemoryContext cxt;
+	MemoryContext holdcxt;
+	MemoryContext oldcxt;
+	int			ngroups = 0;
+	int			g;
+	int			i;
+
+	if (nrows == 0)
+		return;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"lion index insert batch",
+								ALLOCSET_DEFAULT_SIZES);
+	holdcxt = AllocSetContextCreate(cxt,
+									"lion index insert batch hold",
+									LION_INSERT_CONTEXT_SIZE,
+									LION_INSERT_CONTEXT_SIZE,
+									ALLOCSET_DEFAULT_MAXSIZE);
+	oldcxt = MemoryContextSwitchTo(cxt);
+
+	/* the keys' rows together, in TID order, by a cheap comparison ... */
+	qsort_arg(rows, nrows, sizeof(LionInsertRow), lion_insert_row_cmp, ix);
+
+	groups = (LionInsertGroup *) palloc(sizeof(LionInsertGroup) * nrows);
+	for (i = 0; i < nrows; i++)
+	{
+		if (i == 0 || lion_insert_row_keycmp(ix, &rows[i - 1], &rows[i]) != 0)
+		{
+			groups[ngroups].start = i;
+			groups[ngroups++].n = 0;
+		}
+		groups[ngroups - 1].n++;
+	}
+
+	/* ... and the keys in the directory's order, by its own */
+	gs.ix = ix;
+	gs.rows = rows;
+	if (ngroups > 1)
+		qsort_arg(groups, ngroups, sizeof(LionInsertGroup),
+				  lion_insert_group_cmp, &gs);
+
+	MemoryContextSwitchTo(holdcxt);
+
+	for (g = 0; g < ngroups; g++)
+	{
+		LionInsertRow *grows = &rows[groups[g].start];
+		LionState  *state = &ix->cols[grows[0].col];
+		uint16		flag = grows[0].flag;
+		int			end = groups[g].n;
+
+		i = 0;
+		while (i < end)
+		{
+			LionSearchKey sk;
+			Buffer		leafbuf;
+			OffsetNumber entryoff;
+			bool		movedright;
+			bool		found;
+
+			if (flag != 0)
+				lion_search_key_init(state, &sk, lion_reserved_kind(flag),
+									 (Datum) 0, grows[i].hash);
+			else
+				lion_search_key_init(state, &sk, LION_KIND_VALUE,
+									 grows[i].key, grows[i].hash);
+
+			found = lion_dir_find(index, heaprel, state->ix, &sk,
+								  BUFFER_LOCK_EXCLUSIVE, true, &leafbuf,
+								  &entryoff, &movedright);
+			lion_writer_check(index, leafbuf, entryoff, found);
+
+			if (!found)
+			{
+				lion_insert_new_entry(index, heaprel, state, &leafbuf,
+									  entryoff, movedright, grows[i].key, flag,
+									  grows[i].hash,
+									  lion_code_ckey(grows[i].code),
+									  lion_code_lo(grows[i].code), NULL);
+				i++;
+			}
+			else if ((lion_page_entry(BufferGetPage(leafbuf),
+									  entryoff)->flags & LION_ENTRY_INLINE) != 0)
+			{
+				lion_insert_inline(index, heaprel, state, leafbuf, entryoff,
+								   lion_code_ckey(grows[i].code),
+								   lion_code_lo(grows[i].code), NULL);
+				i++;
+			}
+			else
+			{
+				int			stop = Min(end, i + LION_APPLY_HOLD);
+
+				for (; i < stop; i++)
+					lion_insert_chain(index, heaprel, leafbuf, entryoff,
+									  lion_code_ckey(grows[i].code),
+									  lion_code_lo(grows[i].code), NULL);
+			}
+
+			UnlockReleaseBuffer(leafbuf);
+			MemoryContextReset(holdcxt);
+
+			/*
+			 * Test hook: between two holds, with nothing held;
+			 * test/isolation/insert_batch_race.spec has other writers and
+			 * VACUUM take the leaf here.
+			 */
+			LION_INJECTION_POINT("lion-insert-batch-hold");
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
+}
+
+
+/*
+ * What lioninsert() keeps for a statement, in the IndexInfo's ii_AmCache:
+ * the context its rows are inserted in, and how many rows it has had.
+ */
+typedef struct LionInsertCache
+{
+	MemoryContext cxt;
+	uint64		nrows;
+} LionInsertCache;
+
+/* Does lioninsert() buffer this column's keys of the row? */
+static inline bool
+lion_column_batched(bool batch, LionState *state)
+{
+	return batch && !state->positions && !state->summarized && !state->sliced;
+}
+
+/*
  * aminsert
  *
  * checkUnique is irrelevant (amcanunique is false) and indexUnchanged is
@@ -2534,6 +2885,14 @@ lion_slice_insert(Relation index, Relation heaprel, LionState *state,
  * per column - each under its own column's entry, on its own directory leaf -
  * and the same visibility argument covers them.  A NULL in one column says
  * nothing about the others.
+ *
+ * After the statement's first row, a column's (key, TID) pairs are buffered
+ * rather than written, when lion_defer_allowed() says the statement may and
+ * the column stores nothing beside its keys' posting sets - no positions,
+ * summaries or slices: the buffer is written sorted by key at the end of the
+ * statement, or before anything reads the index (DESIGN.md §55,
+ * lion_defer.c).  The visibility argument is the same once more: no snapshot
+ * that can see the row exists before the statement is done.
  */
 bool
 lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
@@ -2541,8 +2900,11 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		  IndexInfo *indexInfo)
 {
 	LionIndexState *ix;
+	LionInsertCache *cache = NULL;
 	MemoryContext insertcxt;
 	MemoryContext oldcxt;
+	LionDefer  *defer = NULL;
+	bool		batch = false;
 	uint64		code;
 	uint32		ckey;
 	uint16		lo;
@@ -2552,9 +2914,40 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 
 	ix = lion_get_index_state(index);
 
-	insertcxt = AllocSetContextCreate(CurrentMemoryContext,
-									  "lion index insert",
-									  ALLOCSET_DEFAULT_SIZES);
+	/*
+	 * The row is inserted in a context of its own, reset when it is done.
+	 * The context is the statement's: it is kept in the IndexInfo the
+	 * executor holds for the index (ii_AmCache, under ii_Context), so a
+	 * statement of many rows makes it once.  Its first block takes what one
+	 * row allocates - a few work buffers of LION_CONTAINER_MAX_SIZE, which
+	 * the allocator rounds up to 8 kB each - and is kept by every reset, so
+	 * a row allocates nothing from malloc.  A caller without an IndexInfo
+	 * gets a context for the row alone, and no batch.
+	 */
+	if (indexInfo != NULL && indexInfo->ii_Context != NULL)
+	{
+		if (indexInfo->ii_AmCache == NULL)
+		{
+			cache = (LionInsertCache *)
+				MemoryContextAllocZero(indexInfo->ii_Context,
+									   sizeof(LionInsertCache));
+			cache->cxt = AllocSetContextCreate(indexInfo->ii_Context,
+											   "lion index insert",
+											   LION_INSERT_CONTEXT_SIZE,
+											   LION_INSERT_CONTEXT_SIZE,
+											   ALLOCSET_DEFAULT_MAXSIZE);
+			indexInfo->ii_AmCache = cache;
+		}
+		cache = (LionInsertCache *) indexInfo->ii_AmCache;
+		insertcxt = cache->cxt;
+
+		/* one row is no batch: the statement's first goes straight in */
+		batch = (cache->nrows++ > 0) && lion_defer_allowed(indexInfo);
+	}
+	else
+		insertcxt = AllocSetContextCreate(CurrentMemoryContext,
+										  "lion index insert",
+										  ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(insertcxt);
 
 	code = lion_tid_to_code(ht_ctid);
@@ -2567,6 +2960,14 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		Datum		key;
 
 		/*
+		 * Buffered, or written now: a column whose inserts write more than
+		 * its key's entry - positions, a summary, slices - is always written
+		 * now.
+		 */
+		if (lion_column_batched(batch, state) && defer == NULL)
+			defer = lion_defer_get(index, heapRel);
+
+		/*
 		 * A NULL value belongs to that column's reserved NULL entry, which is
 		 * found by its flag rather than by its (absent) key (DESIGN.md §14).
 		 * A multi-key opclass that extracts nothing from a non-NULL value
@@ -2574,8 +2975,14 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		 * way (DESIGN.md §17).
 		 */
 		if (isnull[c])
-			lion_insert_one(index, heapRel, state, (Datum) 0,
-						   LION_ENTRY_NULLKEY, ckey, lo, NULL);
+		{
+			if (lion_column_batched(batch, state))
+				lion_defer_add(defer, index, heapRel, state, c, (Datum) 0,
+							   LION_ENTRY_NULLKEY, code);
+			else
+				lion_insert_one(index, heapRel, state, (Datum) 0,
+							   LION_ENTRY_NULLKEY, ckey, lo, NULL);
+		}
 		else if (state->multikey)
 		{
 			Datum	   *keys;
@@ -2598,16 +3005,28 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 			for (i = 0; i < nkeys; i++)
 				keys[i] = lion_key_prepare(state, keys[i], heapRel, ht_ctid);
 
-			if (nkeys == 0)
-				lion_insert_one(index, heapRel, state, (Datum) 0, nokey,
-							   ckey, lo, NULL);
-			for (i = 0; i < nkeys; i++)
+			if (lion_column_batched(batch, state))
 			{
-				if (pm != NULL)
-					lion_posmember_from_key(pm, code, &kpos[i]);
-				lion_insert_one(index, heapRel, state, keys[i], 0, ckey, lo,
-							   pm);
-				CHECK_FOR_INTERRUPTS();
+				if (nkeys == 0)
+					lion_defer_add(defer, index, heapRel, state, c, (Datum) 0,
+								   nokey, code);
+				for (i = 0; i < nkeys; i++)
+					lion_defer_add(defer, index, heapRel, state, c, keys[i], 0,
+								   code);
+			}
+			else
+			{
+				if (nkeys == 0)
+					lion_insert_one(index, heapRel, state, (Datum) 0, nokey,
+								   ckey, lo, NULL);
+				for (i = 0; i < nkeys; i++)
+				{
+					if (pm != NULL)
+						lion_posmember_from_key(pm, code, &kpos[i]);
+					lion_insert_one(index, heapRel, state, keys[i], 0, ckey,
+								   lo, pm);
+					CHECK_FOR_INTERRUPTS();
+				}
 			}
 		}
 		else
@@ -2615,7 +3034,10 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 			/* stored as it is, or compressed when long (DESIGN.md §4) */
 			key = lion_key_prepare(state, values[c], heapRel, ht_ctid);
 
-			lion_insert_one(index, heapRel, state, key, 0, ckey, lo, NULL);
+			if (lion_column_batched(batch, state))
+				lion_defer_add(defer, index, heapRel, state, c, key, 0, code);
+			else
+				lion_insert_one(index, heapRel, state, key, 0, ckey, lo, NULL);
 
 			/*
 			 * ... and in its bucket's summary (DESIGN.md §32), which is a
@@ -2643,7 +3065,10 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 	}
 
 	MemoryContextSwitchTo(oldcxt);
-	MemoryContextDelete(insertcxt);
+	if (cache != NULL)
+		MemoryContextReset(insertcxt);
+	else
+		MemoryContextDelete(insertcxt);
 
 	/* No uniqueness check was performed. */
 	return false;

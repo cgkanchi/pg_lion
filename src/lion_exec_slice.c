@@ -444,9 +444,12 @@ done:
 		index_close(idx, AccessShareLock);
 }
 
-/* Every column's answers, and so every aggregate's: see the callers. */
+/*
+ * The answers of every column counted in run `run`, and so every aggregate's
+ * (those of the other runs as their columns last were): see the callers.
+ */
 static void
-lion_slice_columns(LionCountScanState *st, int ngset,
+lion_slice_columns(LionCountScanState *st, int run, int ngset,
 				   LionPostingSet *const *gsets)
 {
 	LionSliceState *ss = lion_st_slice(st);
@@ -460,6 +463,8 @@ lion_slice_columns(LionCountScanState *st, int ngset,
 	oldcxt = MemoryContextSwitchTo(runcxt);
 	for (c = 0; c < ss->ncol; c++)
 	{
+		if (ss->col[c].run != run)
+			continue;
 		CHECK_FOR_INTERRUPTS();
 		lion_slice_column(st, &ss->col[c], ngset, gsets);
 	}
@@ -468,25 +473,51 @@ lion_slice_columns(LionCountScanState *st, int ngset,
 	lion_slice_results(st);
 }
 
+/* Is any column counted in run `run` (§52, "Filtered aggregates")? */
+static bool
+lion_slice_has_run(LionSliceState *ss, int run)
+{
+	int			c;
+
+	for (c = 0; c < ss->ncol; c++)
+	{
+		if (ss->col[c].run == run)
+			return true;
+	}
+	return false;
+}
+
 /*
  * The one row's answers, for the WHERE located now (lion_locate_where()) -
  * before the node hands up its row, while the WHERE's sets still hold their
- * pins.
+ * pins.  Beside filtered counts (DESIGN.md §10) it is run `run`'s WHERE,
+ * and the answers are those of the columns counted in that run (§52,
+ * "Filtered aggregates"): the runs come in order, run 0 first.
  */
 void
-lion_slice_run(LionCountScanState *st)
+lion_slice_run(LionCountScanState *st, int run)
 {
 	LionSliceState *ss = lion_st_slice(st);
+	int			c;
 
 	Assert(ss != NULL && st->located);
-	MemoryContextReset(ss->cxt);
+	if (run == 0)
+		MemoryContextReset(ss->cxt);
+	if (!lion_slice_has_run(ss, run))
+		return;
 	if (st->wheremissing)
 	{
-		lion_slice_none(st);
+		/* no row: the run's columns' counts 0, their other answers NULL */
+		for (c = 0; c < ss->ncol; c++)
+		{
+			if (ss->col[c].run == run)
+				ss->col[c].count = 0;
+		}
+		lion_slice_results(st);
 		return;
 	}
 	ss->runs++;
-	lion_slice_columns(st, 0, NULL);
+	lion_slice_columns(st, run, 0, NULL);
 }
 
 /*
@@ -532,10 +563,11 @@ lion_slice_parts_begin(LionCountScanState *st)
 
 /*
  * The answers of the partition whose turn it is, its WHERE located now
- * (lion_locate_where()) and its sets still pinned, added to the totals.
+ * (lion_locate_where()) and its sets still pinned, added to the totals: of
+ * the columns counted in run `run`, as lion_slice_run() takes them.
  */
 void
-lion_slice_part(LionCountScanState *st)
+lion_slice_part(LionCountScanState *st, int run)
 {
 	LionSliceState *ss = lion_st_slice(st);
 	MemoryContext runcxt;
@@ -543,7 +575,7 @@ lion_slice_part(LionCountScanState *st)
 	int			c;
 
 	Assert(ss != NULL && ss->parts && st->located);
-	if (st->wheremissing)
+	if (st->wheremissing || !lion_slice_has_run(ss, run))
 		return;
 	runcxt = AllocSetContextCreate(CurrentMemoryContext,
 								   "LionCount slice aggregates run",
@@ -553,6 +585,8 @@ lion_slice_part(LionCountScanState *st)
 	{
 		LionSCol   *col = &ss->col[c];
 
+		if (col->run != run)
+			continue;
 		CHECK_FOR_INTERRUPTS();
 		if (col->idx == NULL)
 			elog(ERROR, "LionCount: a partition without the index of a sliced column");
@@ -612,7 +646,9 @@ lion_slice_parts_end(LionCountScanState *st)
  * group's set, located by the walk with its pin, or a pair's two (§20) - that
  * the WHERE keeps.  Called once the group's count has found it a row, and
  * before its sets are released; the answers are the next row's, until the
- * next call.
+ * next call.  Beside filtered counts the groups are walked run after run
+ * (§10), and a group's row of run r answers the columns counted in run r
+ * alone: the others' are NULL there (lion_slice_partial_null()).
  */
 void
 lion_slice_group(LionCountScanState *st, int ngset,
@@ -624,7 +660,25 @@ lion_slice_group(LionCountScanState *st, int ngset,
 	MemoryContextReset(ss->cxt);
 	ss->runs++;
 	ss->groups++;
-	lion_slice_columns(st, ngset, gsets);
+	lion_slice_columns(st, st->currun, ngset, gsets);
+}
+
+/*
+ * Is aggregate a's value NULL in the row going up, as a partial row of
+ * another run than its column's (DESIGN.md §52, "Partial rows")?  The groups
+ * beside filtered counts are walked run after run, each run's rows partial
+ * ones a Finalize Agg adds up, and the aggregate's partial state is NULL in
+ * a row of a run it is not counted in: core's combine functions skip it, as
+ * they skip a partial aggregate over no row.  The one row has every run's
+ * answers (st->runsready).
+ */
+bool
+lion_slice_partial_null(LionCountScanState *st, const LionSAgg *a)
+{
+	LionSliceState *ss = lion_st_slice(st);
+
+	return st->nrun > 1 && !st->runsready &&
+		ss->col[a->col].run != st->currun;
 }
 
 /*

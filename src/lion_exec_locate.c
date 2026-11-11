@@ -2645,6 +2645,13 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 					a = &ss->agg[LION_TL_SAGG_NO(kind)];
 					slot->tts_values[i] = a->result;
 					slot->tts_isnull[i] = a->resnull;
+
+					/* ... in its own run's partial rows alone (§52) */
+					if (lion_slice_partial_null(st, a))
+					{
+						slot->tts_values[i] = (Datum) 0;
+						slot->tts_isnull[i] = true;
+					}
 					break;
 				}
 				if (LION_TL_IS_WKEY(kind) || LION_TL_IS_RESID(kind) ||

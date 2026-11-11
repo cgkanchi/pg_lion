@@ -76,6 +76,7 @@
 
 #include "lion.h"
 #include "lion_count.h"
+#include "lion_defer.h"
 
 /*
  * Per key column: the probe resolved for the last scan key type seen on that
@@ -320,6 +321,9 @@ lionbeginscan(Relation r, int nkeys, int norderbys)
 {
 	IndexScanDesc scan;
 	LionScanOpaque so;
+
+	/* rows this backend has buffered for the index go in first (§55) */
+	lion_defer_flush_index(r);
 
 	scan = RelationGetIndexScan(r, nkeys, norderbys);
 

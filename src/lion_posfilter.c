@@ -78,6 +78,7 @@ typedef struct LionPosCursor
 
 	/* the leaf being read, a private copy, and its chunks */
 	char	   *leaf;			/* BLCKSZ bytes, position trees only */
+	uint32		leafgen;		/* leaves taken so far (lion_poscursor_chunk()) */
 	BlockNumber leafblk;
 	BlockNumber rightlink;
 	bool		rightmost;
@@ -177,6 +178,7 @@ lion_poscursor_take_leaf(Relation index, LionPosCursor *cur, Buffer buf)
 	}
 	memcpy(cur->leaf, page, BLCKSZ);
 	cur->leafblk = BufferGetBlockNumber(buf);
+	cur->leafgen++;
 	UnlockReleaseBuffer(buf);
 
 	page = (Page) cur->leaf;
@@ -266,6 +268,19 @@ lion_poscursor_rewind(LionPosCursor *cur)
 }
 
 /*
+ * Does the chunk end below code, by the last code its header records
+ * (lion_positions.h)?  Then it is stepped over undecoded, whatever the next
+ * chunk's header is.
+ */
+static inline bool
+lion_poscursor_chunk_below(const LionContainer *c, uint64 code)
+{
+	uint64		last;
+
+	return lion_poschunk_last(c, &last) && last < code;
+}
+
+/*
  * Move the cursor to the first member at or after code, and say whether that
  * member is code's.  Codes only ever grow from one seek to the next, until
  * the cursor is rewound.
@@ -302,8 +317,10 @@ lion_poscursor_seek(Relation index, LionPosCursor *cur, uint64 code)
 		 * rows of every part of the heap, as a count per key of a join or
 		 * per group takes them.
 		 */
-		if (cur->itvalid && cur->chunkno + 1 < cur->nchunks &&
-			cur->chunks[cur->chunkno + 1]->ckey < block)
+		if (cur->itvalid &&
+			((cur->chunkno + 1 < cur->nchunks &&
+			  cur->chunks[cur->chunkno + 1]->ckey < block) ||
+			 lion_poscursor_chunk_below(cur->chunks[cur->chunkno], code)))
 		{
 			cur->itvalid = false;
 			cur->chunkno++;
@@ -336,8 +353,9 @@ lion_poscursor_seek(Relation index, LionPosCursor *cur, uint64 code)
 		{
 			if (cur->chunks[cur->chunkno]->ckey > block)
 				return false;
-			if (cur->chunkno + 1 < cur->nchunks &&
-				cur->chunks[cur->chunkno + 1]->ckey < block)
+			if ((cur->chunkno + 1 < cur->nchunks &&
+				 cur->chunks[cur->chunkno + 1]->ckey < block) ||
+				lion_poscursor_chunk_below(cur->chunks[cur->chunkno], code))
 			{
 				cur->chunkno++;
 				continue;
@@ -860,6 +878,65 @@ lion_poscursor_next(Relation index, LionPosCursor *cur, uint64 code)
 		Assert(!cur->itvalid && cur->chunkno < cur->nchunks);
 		code = Max(code + 1,
 				   lion_pos_block_base(cur->chunks[cur->chunkno]->ckey));
+	}
+}
+
+/*
+ * The chunk the first member at or after code is in, or one that may hold
+ * it, found without decoding a member: the first chunk whose last member is
+ * at or above code by its header (lion_poschunk_last()), or, where the
+ * header does not record it, by the next chunk's header block - which may
+ * be a chunk with no member at or after code.  NULL when the key has no
+ * chunk left.  The chunk is valid until the cursor next moves; *id is the
+ * same for as long as the cursor stays in it, and differs for every other
+ * chunk the cursor stands in.  A member read before stays read when the
+ * chunk is the one it is in.  Codes only grow from one call to the next,
+ * this one's and lion_poscursor_next()'s alike.
+ */
+const LionContainer *
+lion_poscursor_chunk(Relation index, LionPosCursor *cur, uint64 code,
+					 uint64 *id)
+{
+	uint32		block = lion_pos_block(code);
+
+	if (cur->done)
+		return NULL;
+	if (cur->inl == NULL && !BlockNumberIsValid(cur->leafblk))
+	{
+		if (!lion_poscursor_descend(index, cur, block))
+		{
+			cur->done = true;
+			return NULL;
+		}
+	}
+	for (;;)
+	{
+		while (cur->chunkno < cur->nchunks)
+		{
+			const LionContainer *c = cur->chunks[cur->chunkno];
+			uint64		last;
+			bool		below;
+
+			if (lion_poschunk_last(c, &last))
+				below = last < code;
+			else
+				below = cur->chunkno + 1 < cur->nchunks &&
+					cur->chunks[cur->chunkno + 1]->ckey < block;
+			if (!below)
+			{
+				*id = ((uint64) cur->leafgen << 16) | (uint64) cur->chunkno;
+				return c;
+			}
+			cur->chunkno++;
+			cur->itvalid = false;
+			cur->mvalid = false;
+		}
+		if (cur->inl != NULL || !lion_poscursor_next_leaf(index, cur, block))
+		{
+			cur->done = true;
+			return NULL;
+		}
+		CHECK_FOR_INTERRUPTS();
 	}
 }
 

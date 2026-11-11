@@ -79,12 +79,16 @@ under a `Finalize HashAggregate`; DESIGN.md §34). On 5M rows it took 77 ms for 
 and 179 ms for 100,000, where a HashAggregate over the table took 900 ms and 1.9 s. A range in the
 `WHERE` (`... WHERE amount < 500 GROUP BY a, b, c`) is collected with the rest of the filter, into
 a temporary file when it is larger than the memory: a quarter of 5M rows grouped by three columns
-took 153 ms against 361.
+took 153 ms against 361. A partitioned table is decoded a partition at a time, each from its own
+indexes, when every partition has a Lion index on every grouping column.
 
 `GROUP BY g ORDER BY count(*) DESC LIMIT k` counts only the groups that can be among the first `k`
 (`Top K` in EXPLAIN; DESIGN.md §36): each key's entry records how many rows it holds, which bounds
 its group's count, so the largest entries are counted first and the rest never once they cannot
-catch up - ten groups of 3.4 million on ClickBench's `UserID`. Expressions of the grouping column
+catch up - ten groups of 3.4 million on ClickBench's `UserID`. A `WHERE` on another column cuts
+the counts below their bounds: where the keys hold about the same number of rows, the largest
+counts then never pass the bounds left, every group is counted after all, and the planner prices
+it so - usually picking a hash aggregate instead. Expressions of the grouping column
 (`GROUP BY ip, ip - 1`) split no group and are computed from it.
 
 These forms are answered as the counts they stand for (DESIGN.md §10, "Shapes rewritten to the
@@ -124,7 +128,9 @@ node's counts"):
   country, device`: the node counts the `GROUP BY` with `event_type` added, and PostgreSQL's
   aggregate counts each group's distinct values over those combinations (DESIGN.md §10,
   "DISTINCT aggregates over a finer grouping"). On 5M rows, two grouping columns of 20 and 2
-  values and a distinct column of 200 took 92 ms where the ordinary plan took 3.3 s.
+  values and a distinct column of 200 took 92 ms where the ordinary plan took 3.3 s. Without a
+  `GROUP BY` the same is done where the single `count(DISTINCT col)` above does not apply: two
+  `DISTINCT` aggregates, or a partitioned table.
 
 Clauses that exclude rows are counted by subtracting what they reject: `col <> v`, `col IS NOT
 NULL`, `col IS DISTINCT FROM v` (which, unlike `<>`, keeps the rows where `col` is NULL), and `NOT
@@ -138,7 +144,20 @@ is a `NOT` of a query whose index sets only bound its rows (an empty array, a NU
 phrase). On five million rows `count(*) WHERE n IS DISTINCT FROM 17` took 1.6 ms against 380 for
 the sequential scan.
 
-A `WHERE` clause no Lion index answers - `payload LIKE 'ab%'`, `id > 1000` on a column without
+Three other spellings of those clauses are counted as the clause they select the same rows as
+(DESIGN.md §10, "Other spellings of answered clauses"), and EXPLAIN prints that clause: `'x' = ANY
+(tags)` as `tags @> '{x}'` (on `text`, `varchar` and integer arrays, `1 = ANY (bigint_ids)`
+included, and with a prepared statement's `$1` too when it has the element's type: a `bigint` `$1`
+for `bigint_ids`, not an `int`), `col IS NOT DISTINCT FROM 'v'` as `col = 'v'`, and `col LIKE 'ab%'`
+as `col >= 'ab' AND col < 'ac'`. The `LIKE` needs a column whose collation orders strings as bytes
+(`"C"`, `"POSIX"`, `pg_c_utf8`, or the database's default where that is C); under any other
+collation it is a residual clause (below), as is a `LIKE` with a wildcard before the end (`'a_c'`,
+`'a%c'`), `ILIKE` and `NOT LIKE`. A pattern with no wildcard is an equality under any deterministic
+collation. On two million rows `count(*) WHERE 't1' = ANY (tags)` took 3.2 ms against 343 before
+(108x), `status IS NOT DISTINCT FROM 'paid'` 7.2 ms against 179 (25x), and `status LIKE 'pa%'` 8.2
+ms against 118 (14x).
+
+A `WHERE` clause no Lion index answers - `payload LIKE '%ab%'`, `id > 1000` on a column without
 one, `length(name) = 3` - does not send the count to the ordinary plan when the other clauses do
 select rows: the node counts those rows and tests the clause on each of them in the heap
 (`Residual Filter` in EXPLAIN; DESIGN.md §10, "Residual clauses"). It does the work of a bitmap
@@ -189,8 +208,13 @@ price is an insert into each set bit's set on every write of the column: an `INS
 into a sliced `int4` and a sliced `int8` column took 4.6 times as long as without slices with
 `pg_lion` preloaded and about 11 times without it (DESIGN.md §51, "Insert cost, revisited"). Over a
 partitioned table whose every partition has its own sliced index, the aggregates without a `GROUP
-BY` are answered too, each partition from its own slices (DESIGN.md §52.13); a percentile, a join
-and a partitioned table's `GROUP BY` are not answered from the slices yet; `SELECT * FROM
+BY` are answered too, each partition from its own slices (DESIGN.md §52.13), and so are its
+groups but for `avg` and an `int8` `sum` (§52.15). An aggregate with a `FILTER` the count pushdown
+takes - `sum(amount) FILTER (WHERE device = 'ios')`, or a range on a sliced column - is answered
+over its filter's rows the same way (§52.14). Under a `GROUP BY`, any `FILTER` sends the groups up
+as partial rows, as over partitions, so there too `avg` and an `int8` `sum` are not answered from
+the slices (§52.15). A percentile and a join are not answered from the
+slices yet; `SELECT * FROM
 lion_index_slice_agg('events_amount', 'country = ''JP''')` answers the same aggregates for a filter
 given as text.
 
@@ -224,7 +248,7 @@ bounds rule out and, in the arm it keeps, the `kind = ...` they imply, so the pa
 counts `tags && '{x}'` alone (`Refuted by Partition Bounds` in `EXPLAIN`).
 
 A clause no partition's Lion index answers and the bounds do not decide - `ts >= '2026-10-19' AND
-ts < '2026-10-26'` over monthly partitions, `payload LIKE 'ab%'` - is tested on each partition's
+ts < '2026-10-26'` over monthly partitions, `payload LIKE '%ab%'` - is tested on each partition's
 rows as it is over one table (`Residual Filter`; DESIGN.md §16, "Residual clauses over a
 partitioned table"): the partitions whose bounds imply it test none of theirs, so the months inside
 the range are counted from their indexes alone and only the two at its ends read their heaps
@@ -317,6 +341,12 @@ SELECT count(*) AS customers, sum(LEAST(n, 3)) AS capped FROM n;
 `GROUP BY o.customer_id` needs both key columns of one type, compared with that type's own `=`,
 whose equal values are always spelled alike: integers, text under a deterministic collation, or
 uuid, for example, but not numeric, where 1.0 and 1.00 are equal.
+
+The dimension may be a `VALUES` list as well as a table: `SELECT count(*) FROM orders o JOIN
+(VALUES ('open'), ('held')) v(s) ON v.s = o.status WHERE o.region = 'eu'` looks up each listed
+value as it would a customer's key, and counts what `o.status IN ('open', 'held')` counts. A value
+listed twice is counted twice, as the join pairs it with each order twice (DESIGN.md §27, "A VALUES
+list as the dimension").
 
 A `LEFT JOIN` from the dimension keeps every customer, one with no order counted 0: `SELECT
 cu.country, count(o.id) FROM customers cu LEFT JOIN orders o ON o.customer_id = cu.id AND o.status =

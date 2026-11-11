@@ -315,6 +315,14 @@ SELECT * FROM lca_val('SELECT r.z, count(*) FROM lca_rows r WHERE r.x < 5 AND NO
 SELECT lca('SELECT r.z, count(*) FROM lca_rows r WHERE r.z = 99 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.z');
 -- the HAVING sees the counts less the rows subtracted
 SELECT lca('SELECT r.z, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0) GROUP BY r.z HAVING count(*) > 2650');
+-- groups nothing counts are counted too, not tested for a row: the anti join
+-- subtracts from each group's count, and the group of z = 99 still drops out
+SELECT lca('SELECT r.z FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.z');
+SELECT lca('SELECT DISTINCT r.g FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+SELECT lca('SELECT r.g, r.y FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.g, r.y');
+SELECT lca('SELECT r.z FROM lca_rows r WHERE r.z = 99 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.z');
+SELECT * FROM lca_explain('SELECT r.z FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.z') AS ln
+	WHERE ln ~ 'Join Type|Group Strategy';
 
 -- ---------- 4. the B-tree ----------
 -- none on the column: core's plan
@@ -939,6 +947,8 @@ SELECT lca_counters('SELECT count(*) FROM lca_big r WHERE r.g = 7 AND NOT EXISTS
 SELECT lca_spilled('SELECT r.g, count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a < 9000) GROUP BY r.g');
 SELECT lca('SELECT r.g, count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a < 9000) GROUP BY r.g');
 SELECT * FROM lca_val('SELECT count(*), sum(n), min(n), max(n) FROM (SELECT r.g, count(*) AS n FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a < 9000) GROUP BY r.g) q');
+-- ... and with nothing counting the groups
+SELECT lca('SELECT r.g FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a < 9000) GROUP BY r.g');
 -- ... with a WHERE, by two columns, by a column with NULLs and by a text
 SELECT lca('SELECT r.g, count(*) FROM lca_big r WHERE r.x IN (1, 4, 6) AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a < 9000) GROUP BY r.g');
 SELECT lca('SELECT r.g, r.x, count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a % 3 <> 0) GROUP BY r.g, r.x');

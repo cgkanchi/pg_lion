@@ -29,23 +29,23 @@ CREATE FUNCTION lion_debug_postree_stress(idx regclass, nops int,
 	LANGUAGE C STRICT;
 -- runs of one block across leaves, ckey 0's first block among them
 SELECT lion_debug_postree_stress('postree_i', 8000, 100, 4, 40);
-            lion_debug_postree_stress             
---------------------------------------------------
- members 5602, replaced 2398, leaves 98, height 2
+             lion_debug_postree_stress             
+---------------------------------------------------
+ members 5602, replaced 2398, leaves 124, height 2
 (1 row)
 
 -- members of up to 256 positions: few to a chunk, chunks split often
 SELECT lion_debug_postree_stress('postree_i', 3000, 256, 5, 40);
-            lion_debug_postree_stress            
--------------------------------------------------
- members 2391, replaced 609, leaves 93, height 2
+            lion_debug_postree_stress             
+--------------------------------------------------
+ members 2391, replaced 609, leaves 121, height 2
 (1 row)
 
 -- three levels: internal pages split and the internal root is pushed down
 SELECT lion_debug_postree_stress('postree_i', 40000, 256, 6, 0);
               lion_debug_postree_stress              
 -----------------------------------------------------
- members 36017, replaced 3983, leaves 1421, height 3
+ members 36017, replaced 3983, leaves 1826, height 3
 (1 row)
 
 -- an empty tree, and one member

@@ -13,13 +13,16 @@
 
 #include "catalog/namespace.h"
 #include "catalog/pg_collation.h"
+#include "catalog/pg_opfamily.h"
 #include "catalog/pg_type.h"
+#include "mb/pg_wchar.h"
 #include "nodes/miscnodes.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
 #include "utils/json.h"
 #include "utils/lsyscache.h"
+#include "utils/pg_locale.h"
 
 #include "lion_customscan.h"
 
@@ -1425,6 +1428,7 @@ lion_or_dnf(Node *node, int *nleaves)
 	BoolExpr   *orform = lion_boolean_not_test(node);
 	Node	   *anyform = lion_multikey_any_as_or(node);
 	List	   *allform;
+	List	   *likeform;
 	List	   *result;
 	double		total;
 	ListCell   *lc;
@@ -1442,6 +1446,14 @@ lion_or_dnf(Node *node, int *nleaves)
 	 */
 	else if ((allform = lion_all_as_and(node)) != NIL)
 		node = (Node *) makeBoolExpr(AND_EXPR, allform, -1);
+
+	/*
+	 * `col LIKE 'p%'` is `col >= 'p' AND col < q` (lion_like_as_and()), two
+	 * ranges of the arm; `col LIKE 'p'` and `col LIKE '%'` one clause each.
+	 */
+	else if ((likeform = lion_like_as_and(node)) != NIL)
+		node = list_length(likeform) == 1 ? (Node *) linitial(likeform) :
+			(Node *) makeBoolExpr(AND_EXPR, likeform, -1);
 
 	if (IsA(node, BoolExpr) && ((BoolExpr *) node)->boolop == OR_EXPR)
 	{
@@ -1627,6 +1639,419 @@ lion_jsonb_field_eq(Node *clause)
 }
 
 /*
+ * The integer constant c as a value of the integer type typid, in *value;
+ * false when either is no int2, int4 or int8, or c is out of typid's range.
+ */
+static bool
+lion_int_as_type(Const *c, Oid typid, Datum *value)
+{
+	int64		v;
+
+	switch (c->consttype)
+	{
+		case INT2OID:
+			v = DatumGetInt16(c->constvalue);
+			break;
+		case INT4OID:
+			v = DatumGetInt32(c->constvalue);
+			break;
+		case INT8OID:
+			v = DatumGetInt64(c->constvalue);
+			break;
+		default:
+			return false;
+	}
+	switch (typid)
+	{
+		case INT2OID:
+			if (v < PG_INT16_MIN || v > PG_INT16_MAX)
+				return false;
+			*value = Int16GetDatum((int16) v);
+			return true;
+		case INT4OID:
+			if (v < PG_INT32_MIN || v > PG_INT32_MAX)
+				return false;
+			*value = Int32GetDatum((int32) v);
+			return true;
+		case INT8OID:
+			*value = Int64GetDatum(v);
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * `c = ANY (tags)` - the array column on the right of the ANY, which no index
+ * matches - as the `tags @> ARRAY[c]` it is the same test as (DESIGN.md §10,
+ * "Other spellings of answered clauses"), or NULL when clause is not one or
+ * the two could differ.  The ANY is true where some element equals c, NULL
+ * where none does and one is NULL, and NULL for a NULL array; the containment
+ * is true where some element equals c - compared by the element type's
+ * default equality under the clause's collation, array_contain_compare()'s
+ * test - and false or NULL everywhere else.  So the two are true of the same
+ * rows - NULL counting as false, as in a WHERE, a FILTER or an OR's arm - when
+ * the ANY's operator is that equality, or the integer family's across two
+ * widths with a constant c (lion_int_as_type()).  They are not the same value: under a
+ * NOT they differ wherever an element is NULL, which is why the rewrite is no
+ * leaf of one (lion_analyze_leaf()).
+ *
+ * c is a constant - the containment's literal, which the posting sets answer
+ * exactly (lion_multikey_query_is_exact()) - or a value the executor has once
+ * per scan, a generic plan's `$1 = ANY (tags)`, which becomes the run-time
+ * `tags @> ARRAY[$1]` of DESIGN.md §17, "A query known only at run time".  A
+ * constant of another type the element's own is binary-coercible from
+ * (text against a varchar[] column) is the element's value as it is; the
+ * array is built of the column's element type, which array_contains()
+ * insists on.
+ */
+static Node *
+lion_any_column_as_contains(Node *clause)
+{
+	ScalarArrayOpExpr *saop;
+	Node	   *scalar;
+	Node	   *arr;
+	Oid			arrtype;
+	Oid			elemtype;
+	Oid			scalartype;
+	TypeCacheEntry *tce;
+	Node	   *query;
+
+	if (clause == NULL || !IsA(clause, ScalarArrayOpExpr))
+		return NULL;
+	saop = (ScalarArrayOpExpr *) clause;
+	if (!saop->useOr || list_length(saop->args) != 2)
+		return NULL;
+	scalar = lion_strip((Node *) linitial(saop->args));
+	arr = lion_strip((Node *) lsecond(saop->args));
+
+	/*
+	 * A varchar[] column compared as text[] arrives as an ArrayCoerceExpr
+	 * whose element coercion is a relabel alone: the column's own array.
+	 */
+	if (arr != NULL && IsA(arr, ArrayCoerceExpr))
+	{
+		ArrayCoerceExpr *ace = (ArrayCoerceExpr *) arr;
+		Node	   *elem = lion_strip((Node *) ace->elemexpr);
+
+		if (elem == NULL || !IsA(elem, CaseTestExpr))
+			return NULL;
+		arr = lion_strip((Node *) ace->arg);
+	}
+	if (scalar == NULL || arr == NULL || !IsA(arr, Var) ||
+		!lion_is_value_expr(scalar, false))
+		return NULL;
+
+	arrtype = exprType(arr);
+	elemtype = get_element_type(arrtype);
+	if (!OidIsValid(elemtype))
+		return NULL;
+	tce = lookup_type_cache(elemtype, TYPECACHE_EQ_OPR | TYPECACHE_BTREE_OPFAMILY);
+	if (!OidIsValid(tce->eq_opr))
+		return NULL;
+
+	scalartype = exprType(scalar);
+	if (IsA(scalar, Const))
+	{
+		Const	   *c = (Const *) scalar;
+		Datum		value = c->constvalue;
+		int16		typlen;
+		bool		typbyval;
+		char		typalign;
+		ArrayType  *a;
+
+		if (c->constisnull)
+			return NULL;
+		if (tce->eq_opr == saop->opno)
+		{
+			if (scalartype != elemtype &&
+				!IsBinaryCoercible(scalartype, elemtype))
+				return NULL;
+		}
+		else if (!lion_int_as_type(c, elemtype, &value) ||
+				 tce->btree_opf != INTEGER_BTREE_FAM_OID ||
+				 get_op_opfamily_strategy(saop->opno, INTEGER_BTREE_FAM_OID) !=
+				 BTEqualStrategyNumber)
+		{
+			/*
+			 * Not the element's equality, unless it is the integer family's
+			 * across two widths - `1 = ANY (ids)` of a bigint[] column, whose
+			 * literal is an int4 - which compares the values as numbers, so
+			 * that the literal as the element's type is the same test.  One
+			 * the element's type cannot hold equals no element.
+			 */
+			return NULL;
+		}
+		get_typlenbyvalalign(elemtype, &typlen, &typbyval, &typalign);
+		a = construct_array(&value, 1, elemtype, typlen, typbyval, typalign);
+		query = (Node *) makeConst(arrtype, -1, get_typcollation(arrtype), -1,
+								   PointerGetDatum(a), false, false);
+	}
+	else
+	{
+		ArrayExpr  *ae;
+
+		if (tce->eq_opr != saop->opno || scalartype != elemtype)
+			return NULL;
+		ae = makeNode(ArrayExpr);
+		ae->array_typeid = arrtype;
+		ae->array_collid = get_typcollation(arrtype);
+		ae->element_typeid = elemtype;
+		ae->elements = list_make1(copyObject(scalar));
+		ae->multidims = false;
+		ae->location = -1;
+		query = (Node *) ae;
+	}
+
+	return (Node *) make_opclause(OID_ARRAY_CONTAINS_OP, BOOLOID, false,
+								  (Expr *) copyObject(arr), (Expr *) query,
+								  InvalidOid, saop->inputcollid);
+}
+
+/*
+ * `col IS NOT DISTINCT FROM c` - the planner's NOT over a DistinctExpr, which
+ * no NOT is taken over - as the `col = c` it is the same test as for a
+ * constant c that is not NULL, and as `col IS NULL` for a NULL one (DESIGN.md
+ * §10, "Other spellings of answered clauses"); NULL for every other clause.
+ * Where col is NULL the first is false and `=` NULL; everywhere else both are
+ * the equality.  So they are true of the same rows, though not the same
+ * value, as for lion_any_column_as_contains().  A value known only at run
+ * time is not taken: a parameter that comes out NULL makes the clause `col IS
+ * NULL`, where `col = $1` selects nothing.
+ */
+static Node *
+lion_not_distinct_as_eq(Node *clause)
+{
+	BoolExpr   *notexpr;
+	DistinctExpr *de;
+	Node	   *left;
+	Node	   *right;
+	Node	   *col;
+	Const	   *val;
+
+	if (clause == NULL || !IsA(clause, BoolExpr))
+		return NULL;
+	notexpr = (BoolExpr *) clause;
+	if (notexpr->boolop != NOT_EXPR || list_length(notexpr->args) != 1 ||
+		!IsA(linitial(notexpr->args), DistinctExpr))
+		return NULL;
+	de = (DistinctExpr *) linitial(notexpr->args);
+	if (list_length(de->args) != 2)
+		return NULL;
+	left = lion_strip((Node *) linitial(de->args));
+	right = lion_strip((Node *) lsecond(de->args));
+	if (left == NULL || right == NULL)
+		return NULL;
+	if (IsA(left, Var) && IsA(right, Const))
+	{
+		col = (Node *) linitial(de->args);
+		val = (Const *) right;
+	}
+	else if (IsA(left, Const) && IsA(right, Var))
+	{
+		col = (Node *) lsecond(de->args);
+		val = (Const *) left;
+	}
+	else
+		return NULL;
+
+	if (val->constisnull)
+	{
+		NullTest   *nt = makeNode(NullTest);
+
+		nt->arg = (Expr *) copyObject(col);
+		nt->nulltesttype = IS_NULL;
+		nt->argisrow = false;
+		nt->location = -1;
+		return (Node *) nt;
+	}
+	return (Node *) make_opclause(de->opno, BOOLOID, false,
+								  (Expr *) copyObject(linitial(de->args)),
+								  (Expr *) copyObject(lsecond(de->args)),
+								  InvalidOid, de->inputcollid);
+}
+
+/* Does collation compare text as bytes, memcmp() and then length? */
+static bool
+lion_collation_is_c(Oid collation)
+{
+	if (!OidIsValid(collation))
+		return false;
+#if PG_VERSION_NUM >= 180000
+	return pg_newlocale_from_collation(collation)->collate_is_c;
+#else
+	return lc_collate_is_c(collation);
+#endif
+}
+
+/*
+ * The least string above every string that begins with the len bytes of
+ * prefix, in byte order, or NULL when there is none this checks is a string
+ * of the database's encoding.  Under UTF-8, whose byte order is code point
+ * order, it is prefix with its last character replaced by the next code
+ * point (past the surrogates, which no string holds): a string at or above
+ * prefix and below that begins with prefix's other characters and then a
+ * character at least the last and below the next, which is the last.  In
+ * another encoding it is prefix with its last byte one higher, the least
+ * byte string above every string with prefix's bytes, taken only when it is
+ * itself a string of the encoding.
+ */
+static text *
+lion_like_prefix_upper(const char *prefix, int len)
+{
+	char	   *hi;
+	int			hilen;
+
+	Assert(len > 0);
+	if (GetDatabaseEncoding() == PG_UTF8)
+	{
+		const char *p = prefix;
+		const char *last = prefix;
+		pg_wchar	cp;
+
+		while (p < prefix + len)
+		{
+			last = p;
+			p += pg_utf_mblen((const unsigned char *) p);
+		}
+		if (p != prefix + len)
+			return NULL;
+		cp = utf8_to_unicode((const unsigned char *) last);
+		if (cp >= 0x10FFFF)
+			return NULL;		/* the last code point, or no character */
+		cp++;
+		if (cp >= 0xD800 && cp <= 0xDFFF)
+			cp = 0xE000;
+		hi = palloc(len + MAX_MULTIBYTE_CHAR_LEN);
+		memcpy(hi, prefix, last - prefix);
+		unicode_to_utf8(cp, (unsigned char *) hi + (last - prefix));
+		hilen = (last - prefix) +
+			pg_utf_mblen((const unsigned char *) hi + (last - prefix));
+	}
+	else
+	{
+		if ((unsigned char) prefix[len - 1] == 0xFF)
+			return NULL;
+		hi = palloc(len);
+		memcpy(hi, prefix, len);
+		hi[len - 1] = (char) ((unsigned char) hi[len - 1] + 1);
+		hilen = len;
+		if (!pg_verifymbstr(hi, hilen, true))
+			return NULL;
+	}
+	return cstring_to_text_with_len(hi, hilen);
+}
+
+/*
+ * `col LIKE 'p%'` as the conjunction of clauses the posting sets answer that
+ * is the same test (DESIGN.md §10, "Other spellings of answered clauses"), or
+ * NIL when clause is not one or the two could differ.  Under a deterministic
+ * collation LIKE matches the characters themselves, so a pattern with no
+ * wildcard is `col = 'p'` (equality under any deterministic collation compares
+ * the bytes), one of `%`s alone is `col IS NOT NULL`, and a prefix p and then
+ * `%`s alone is the strings that begin with p: `col >= 'p' AND col < q`, q
+ * the least string above them (lion_like_prefix_upper()), where the column's
+ * collation orders strings as bytes.  That is the range core derives for a
+ * B-tree (like_support.c), there checked again by the LIKE as a filter; here
+ * it is exact, and the LIKE is not tested again.  Each clause compares the
+ * column as the LIKE does, relabels and all, under the column's own
+ * collation, which a lion index on the column was built under.
+ *
+ * A pattern that ends in the escape character - an error LIKE raises on the
+ * rows it gets that far into - and one with anything after its first
+ * wildcard but `%` (`p_`, `p%q`), which no range is, are left to the
+ * ordinary plan, as is a pattern known only at run time.
+ */
+List *
+lion_like_as_and(Node *clause)
+{
+	OpExpr	   *op;
+	Node	   *left;
+	Node	   *var;
+	Node	   *right;
+	Const	   *patt;
+	Oid			coll;
+	char	   *p;
+	char	   *prefix;
+	int			len;
+	int			pos;
+	int			plen = 0;
+	text	   *hi;
+
+	if (clause == NULL || !IsA(clause, OpExpr))
+		return NIL;
+	op = (OpExpr *) clause;
+	if (list_length(op->args) != 2)
+		return NIL;
+	set_opfuncid(op);
+	if (op->opfuncid != F_TEXTLIKE)
+		return NIL;
+	left = (Node *) linitial(op->args);
+	var = lion_strip(left);
+	right = lion_strip((Node *) lsecond(op->args));
+	if (var == NULL || !IsA(var, Var) || right == NULL || !IsA(right, Const) ||
+		((Const *) right)->constisnull)
+		return NIL;
+	patt = (Const *) right;
+	coll = ((Var *) var)->varcollid;
+	if (!OidIsValid(op->inputcollid) ||
+		!get_collation_isdeterministic(op->inputcollid) ||
+		!OidIsValid(coll) || !get_collation_isdeterministic(coll))
+		return NIL;
+
+	p = TextDatumGetCString(patt->constvalue);
+	len = strlen(p);
+	prefix = palloc(len + 1);
+	for (pos = 0; pos < len; pos++)
+	{
+		if (p[pos] == '%' || p[pos] == '_')
+			break;
+		if (p[pos] == '\\' && ++pos >= len)
+			return NIL;			/* LIKE's error */
+		prefix[plen++] = p[pos];
+	}
+
+	if (pos == len)
+		return list_make1(make_opclause(TextEqualOperator, BOOLOID, false,
+										(Expr *) copyObject(left),
+										(Expr *) makeConst(TEXTOID, -1, patt->constcollid, -1,
+														   PointerGetDatum(cstring_to_text_with_len(prefix, plen)),
+														   false, false),
+										InvalidOid, coll));
+	for (; pos < len; pos++)
+	{
+		if (p[pos] != '%')
+			return NIL;
+	}
+	if (plen == 0)
+	{
+		NullTest   *nt = makeNode(NullTest);
+
+		nt->arg = (Expr *) copyObject(left);
+		nt->nulltesttype = IS_NOT_NULL;
+		nt->argisrow = false;
+		nt->location = -1;
+		return list_make1(nt);
+	}
+
+	if (!lion_collation_is_c(coll) ||
+		(hi = lion_like_prefix_upper(prefix, plen)) == NULL)
+		return NIL;
+	return list_make2(make_opclause(TextGreaterEqualOperator, BOOLOID, false,
+									(Expr *) copyObject(left),
+									(Expr *) makeConst(TEXTOID, -1, patt->constcollid, -1,
+													   PointerGetDatum(cstring_to_text_with_len(prefix, plen)),
+													   false, false),
+									InvalidOid, coll),
+					  make_opclause(TextLessOperator, BOOLOID, false,
+									(Expr *) copyObject(left),
+									(Expr *) makeConst(TEXTOID, -1, patt->constcollid, -1,
+													   PointerGetDatum(hi),
+													   false, false),
+									InvalidOid, coll));
+}
+
+/*
  * Is this clause one the posting sets can answer, and on a plain column of
  * rti?  Fills *out and returns true, or returns false and leaves the caller
  * to decline the whole query.
@@ -1683,6 +2108,30 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 		if (out->kind != LION_CLAUSE_MULTI || out->costclause != NULL)
 			return false;
 		out->costclause = rewritten;
+		return true;
+	}
+	if ((rewritten = lion_any_column_as_contains(clause)) != NULL ||
+		(rewritten = lion_not_distinct_as_eq(clause)) != NULL)
+	{
+		/*
+		 * `c = ANY (tags)` and `col IS NOT DISTINCT FROM c` (DESIGN.md §10,
+		 * "Other spellings of answered clauses"): the containment or the
+		 * equality they are true of the same rows as, analysed as one, whose
+		 * clause the cost model, the plan and a partition's bounds see in its
+		 * place.  Where that analysis made a clause of its own for the cost
+		 * model (`tags IS NOT DISTINCT FROM '{}'`, the `tags = '{}'` of §17),
+		 * the leaf is that analysis's, which is also the clause's.  The NOT
+		 * branch below declines a leaf with a costclause, so none of them is
+		 * negated, where the two forms differ.
+		 */
+		if (!lion_analyze_leaf(root, rewritten, rti, allow_negated,
+							   allow_range, allow_recheck, out))
+			return false;
+		if (out->costclause == NULL)
+		{
+			out->costclause = rewritten;
+			out->costexact = true;
+		}
 		return true;
 	}
 	if (lion_nonempty_leaf(clause, out))
@@ -2596,26 +3045,42 @@ lion_rel_has_sliced_index(RelOptInfo *rel)
  * Is agg an aggregate a bit-sliced column's slices answer (DESIGN.md §52) -
  * and which?  count, sum, avg, min or max of a bare column of relation rti
  * (a RelabelType over it allowed, which a domain's column brings), with no
- * DISTINCT, ORDER BY or FILTER: count(x) of any type, sum and avg of an
- * int2, int4 or int8 - sum and avg of a date, time or timestamp are no SQL
- * aggregates - and min and max of each type of the allowlist
- * (lion_slice_type_nbits()), each answered as core's aggregate of that type
- * answers it.  *attno is the column, and *argtype the type the aggregate
- * takes it as - which the slices have to be of - or InvalidOid for count(x),
- * which takes any.  Whether it is sliced is the caller's to ask.  Without
- * 128-bit integers sum and avg are not taken.
+ * DISTINCT or ORDER BY: count(x) of any type, sum and avg of an int2, int4
+ * or int8 - sum and avg of a date, time or timestamp are no SQL aggregates -
+ * and min and max of each type of the allowlist (lion_slice_type_nbits()),
+ * each answered as core's aggregate of that type answers it.  *attno is the
+ * column, and *argtype the type the aggregate takes it as - which the slices
+ * have to be of - or InvalidOid for count(x), which takes any.  Whether it
+ * is sliced is the caller's to ask.  Without 128-bit integers sum and avg
+ * are not taken.
+ *
+ * A FILTER is taken where the caller asks for it (filter not NULL): *filter
+ * is then the condition, or NULL for none, and the aggregate is the same one
+ * over the rows the condition is true of (§52, "Filtered aggregates").
+ *
+ * A partial aggregate (AGGSPLIT_INITIAL_SERIAL) is taken where its partial
+ * state is the value the slices answer, which a node emitting partial rows
+ * puts there as it is (§52, "Partial rows"): count, sum of an int2 or int4
+ * (an int8 either way), min and max - not avg, nor sum of an int8, whose
+ * states are a count beside a sum.
  */
 int
-lion_sagg_classify(Aggref *agg, Index rti, AttrNumber *attno, Oid *argtype)
+lion_sagg_classify(Aggref *agg, Index rti, AttrNumber *attno, Oid *argtype,
+				   Node **filter)
 {
 	Node	   *arg;
 	Var		   *v;
 	int			kind;
 	Oid			type = InvalidOid;
 
+	if (filter != NULL)
+		*filter = (Node *) agg->aggfilter;
 	if (agg->aggdistinct != NIL || agg->aggorder != NIL ||
-		agg->aggfilter != NULL || agg->agglevelsup != 0 || agg->aggstar ||
-		agg->aggkind != AGGKIND_NORMAL || agg->aggsplit != AGGSPLIT_SIMPLE ||
+		(agg->aggfilter != NULL && filter == NULL) ||
+		agg->agglevelsup != 0 || agg->aggstar ||
+		agg->aggkind != AGGKIND_NORMAL ||
+		(agg->aggsplit != AGGSPLIT_SIMPLE &&
+		 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL) ||
 		list_length(agg->args) != 1)
 		return LION_SAGG_NONE;
 	arg = (Node *) ((TargetEntry *) linitial(agg->args))->expr;
@@ -2698,6 +3163,8 @@ lion_sagg_classify(Aggref *agg, Index rti, AttrNumber *attno, Oid *argtype)
 		default:
 			return LION_SAGG_NONE;
 	}
+	if (agg->aggsplit != AGGSPLIT_SIMPLE && !LION_SAGG_IS_PARTIAL_OK(kind))
+		return LION_SAGG_NONE;
 	*attno = v->varattno;
 	*argtype = type;
 	return kind;

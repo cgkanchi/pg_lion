@@ -1619,8 +1619,9 @@ lion_null_entry_pages(double members, double containers, double others)
  * NULL entry's pages from the column's null fraction, in the form it takes
  * (lion_null_entry_pages()), and the walk's from its ndistinct entries of
  * the other rows: a descent to the column's first leaf, an entry small
- * enough to be INLINE (LION_DEFAULT_INLINE_LIMIT) its bytes of the leaves
- * and any other its pages, a page at least - once per window
+ * enough to be INLINE (under the index's own inline_limit,
+ * lion_index_inline_limit()) its bytes of the leaves and any other its
+ * pages, a page at least - once per window
  * (lion_walk_window()) of as many container keys as the NULL entry has, as
  * the executor counts them.  The walk is priced as those pages read in order
  * and a descent an entry.
@@ -1670,7 +1671,7 @@ lion_cost_notnull(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 													lion_containers_for(heap_pages,
 																		perentry));
 		double		walk = 1.0 + entries *
-			((entrypages * BLCKSZ <= (double) LION_DEFAULT_INLINE_LIMIT) ?
+			((entrypages * BLCKSZ <= lion_index_inline_limit(root, idx)) ?
 			 entrypages : Max(1.0, entrypages));
 		double		windows = Max(1.0, ceil(sc.containers /
 										  (double) lion_walk_window()));
@@ -4279,11 +4280,28 @@ lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
 	 * ... and each count's own set-up and tear-down (a memory context,
 	 * the sources' cursors, the visibility-map state): a distinct
 	 * walk's test prices it (LION_DISTINCT_TEST_COST, below), a range's
-	 * walk its entry (LION_RANGE_ENTRY_COST).
+	 * walk its entry (LION_RANGE_ENTRY_COST).  A count of the walk one
+	 * entry at a time - no copy of the WHERE to count the groups against
+	 * together, nor the top k's candidates, each looked up - of an entry
+	 * small enough to be INLINE reads no posting page and sets no cursor
+	 * up over one, and its leaf is read once with the entries beside it
+	 * (lion_group_walk_fill(); the sum over every entry of §14, priced as
+	 * this walk, has always read it so): LION_INLINE_ENTRY_COUNT_COST,
+	 * judged by its set's bytes against the grouping index's own inline_limit
+	 * (lion_index_inline_limit()), as lion_cost_notnull() judges an entry's.
 	 */
 	if (c->distinct == LION_DISTINCT_NONE && c->rangevar == NULL)
-		c->merge_cpu += c->walked * (c->groupdrive ? LION_LIST_GROUP_COST :
-									 LION_ENTRY_COUNT_COST);
+	{
+		Cost		entry = LION_ENTRY_COUNT_COST;
+
+		if (c->groupdrive)
+			entry = LION_LIST_GROUP_COST;
+		else if (!c->whereonce && c->topk <= 0.0 &&
+				 lion_set_pages_for(gm, keys[c->nsrc]) * BLCKSZ <=
+				 lion_index_inline_limit(c->root, c->groupidx))
+			entry = LION_INLINE_ENTRY_COUNT_COST;
+		c->merge_cpu += c->walked * entry;
+	}
 }
 
 /*
@@ -5882,6 +5900,13 @@ lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
  * that copy C0 = E ∧ WHERE in one walk of its container keys, and a descent
  * for each extreme asked.  Added to the count of the WHERE the path prices
  * (cpath) when the target list has counts too, and in its place when not.
+ * whererows[c] are the rows of column c's WHERE - the WHERE's, or with a
+ * filter's run (§52, "Filtered aggregates") the WHERE's and the filter's
+ * together - and runs[c] the run it is counted in (NULL: all in run 0);
+ * the columns of one run share its collection.  With filters' runs, each
+ * run's collection is priced from that run's count, runwhere[r], and the
+ * node counts only the runs runcounted[] says the target list takes the
+ * count of: the price is theirs, and the slices'.
  *
  *	- the collection: the WHERE's merge - what the count of it is priced at,
  *	  half of it again beside the count, whose pages it reads again cached -
@@ -5940,12 +5965,14 @@ lion_slice_read_cost(PlannerInfo *root, IndexOptInfo *idx, double keys,
 
 void
 lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
-					 List *idxs, List *cols, List *wants, double whererows,
-					 bool haswhere, bool counts, double ngroups, int batch,
-					 Cost rangecollect)
+					 List *idxs, List *cols, List *wants,
+					 const double *whererows, const int *runs,
+					 const Cost *runwhere, const bool *runcounted,
+					 int nrun, bool haswhere, bool counts, double ngroups,
+					 int batch, Cost rangecollect)
 {
 	Cost		where = cpath->path.total_cost;
-	Cost		run = counts ? where : 0.0;
+	Cost		run = 0.0;
 	double		units = Max(ngroups, 1.0);
 	double		outrows = cpath->path.rows;
 	double		heap_pages = Max((double) rel->pages, 1.0);
@@ -5957,13 +5984,30 @@ lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 	ListCell   *l1;
 	ListCell   *l2;
 	ListCell   *l3;
-	bool		collected = false;
+	Bitmapset  *collected = NULL;	/* the runs whose WHERE is collected */
+	int			i = 0;
+	int			r;
+
+	/* the counts the target list takes */
+	if (runwhere == NULL)
+		run = counts ? where : 0.0;
+	else
+	{
+		for (r = 0; r < nrun; r++)
+			run += runcounted[r] ? runwhere[r] : 0.0;
+	}
 
 	forthree(l1, idxs, l2, cols, l3, wants)
 	{
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(l1);
 		AttrNumber	col = (AttrNumber) lfirst_int(l2);
 		int			want = lfirst_int(l3);
+		double		colrows = whererows[i];
+		int			colrun = (runs != NULL) ? runs[i] : 0;
+		bool		runcollected = bms_is_member(colrun, collected);
+		Cost		colwhere = (runwhere != NULL) ? runwhere[colrun] : where;
+		bool		colcounts = (runwhere != NULL) ? runcounted[colrun] :
+			counts;
 		LionSliceShape shape;
 		Relation	index;
 		double		erows;
@@ -5993,8 +6037,9 @@ lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 
 		/* C0 = E ∧ WHERE: the WHERE's share of E's rows, and their keys */
 		erows = Max(shape.rows[nbits], 1.0);
-		crows = haswhere ? erows * Min(Max(whererows, 1.0) / tuples, 1.0) :
-			erows;
+		i++;
+		crows = (haswhere || colrun > 0) ?
+			erows * Min(Max(colrows, 1.0) / tuples, 1.0) : erows;
 		ckeys = Max(nkeys * (1.0 - exp(-crows / nkeys)), 1.0);
 
 		/*
@@ -6006,13 +6051,14 @@ lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 		 * the collection of a range of a column in no heap order from its
 		 * summaries at a fifth of its time).
 		 */
-		if (haswhere)
-			run += (counts || collected ? 0.5 : 1.0) * where +
-				ckeys * LION_PROBE_COST + (collected ? 0.0 : rangecollect);
+		if (haswhere || colrun > 0)
+			run += (colcounts || runcollected ? 0.5 : 1.0) * colwhere +
+				ckeys * LION_PROBE_COST +
+				(bms_is_empty(collected) ? rangecollect : 0.0);
 		else
 			run += Min(shape.items[nbits], nkeys) * LION_CONTAINER_COST;
 		run += ckeys * LION_FKJOIN_COPY_CONTAINER_COST;
-		collected = true;
+		collected = bms_add_member(collected, colrun);
 
 		/*
 		 * The decode route (DESIGN.md §52): a walk of C0's keys a batch of
@@ -6147,13 +6193,11 @@ lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
  * The rows are partial counts, one per combination with rows, which the
  * Finalize Agg above adds up; all of them come out once the pass has run.
  */
-void
-lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
-					  List *whereclauses, List *wherekinds, List *ors,
-					  int ncol, const double *groupest, double numgroups,
-					  double outrows)
+static Cost
+lion_cost_decode_rel(PlannerInfo *root, LionCountTarget *t,
+					 List *whereclauses, List *wherekinds, List *ors,
+					 int ncol, const double *groupest)
 {
-	LionCountTarget *t = (LionCountTarget *) linitial(targets);
 	RelOptInfo *rel = t->rel;
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		nkeys = Max(ceil(heap_pages / LION_BLOCKS_PER_CONTAINER), 1.0);
@@ -6172,7 +6216,6 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	List	   *tors;
 	int			c;
 
-	Assert(list_length(targets) == 1 && ncol >= 2);
 	lion_target_lists(t, whereclauses, wherekinds, ors, &tidx, &tcol,
 					  &tclauses, &tkinds, &tors, NULL);
 
@@ -6232,6 +6275,40 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	else
 		run += whererows * (LION_DECODE_HASH_ROW_COST +
 							(ncol - 1) * LION_DECODE_ROW_COL_COST);
+	return run;
+}
+
+/*
+ * ... over one table, or over each partition of one in its turn (§16, "The
+ * decoded walk over partitions"): the sum of each partition's walk as one
+ * table's, every column's values the partition's own estimate of them.
+ */
+void
+lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
+					  List *whereclauses, List *wherekinds, List *ors,
+					  int ncol, const double *groupest, double numgroups,
+					  double outrows)
+{
+	Cost		run = 0;
+	ListCell   *lc;
+
+	Assert(targets != NIL && ncol >= 2);
+	foreach(lc, targets)
+	{
+		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+		double		tgroupest[LION_MAX_GROUPCOLS];
+		int			c;
+
+		for (c = 0; c < ncol; c++)
+			tgroupest[c] = (list_length(targets) > 1 &&
+							t->drivevar[c] != NULL) ?
+				estimate_num_groups(root,
+									list_make1(lion_vcol_unvar((Node *) t->drivevar[c])),
+									Max(t->rel->rows, 1.0), NULL, NULL) :
+				groupest[c];
+		run += lion_cost_decode_rel(root, t, whereclauses, wherekinds, ors,
+									ncol, tgroupest);
+	}
 
 	cpath->path.rows = outrows;
 #if PG_VERSION_NUM >= 180000
@@ -6873,21 +6950,85 @@ lion_tsquery_operand_free(OpExpr *lop)
 }
 
 /*
+ * Is the tsquery rooted at items[i] one whose rows the posting sets give
+ * exactly, as lion_tsquery_tree() decides it: plain lexemes - a prefix as
+ * the OR of lexemes the executor expands it into - under ANDs and ORs, and
+ * an AND of x and !y for two such?  The shape alone: an ambiguous long
+ * lexeme anywhere in the query, which makes the whole extraction a superset,
+ * is lion_tsquery_ambiguous()'s; and a prefix past the expansion cap, which
+ * the executor leaves every row, is taken as expanded, as this estimate
+ * takes every prefix, since how many lexemes it covers is not known here.
+ */
+static bool
+lion_tsquery_exact_shape(QueryItem *items, int32 size, int32 i)
+{
+	QueryItem  *item;
+	uint32		left;
+	bool		rneg;
+	bool		lneg;
+
+	check_stack_depth();
+
+	if (i < 0 || i >= size)
+		return false;
+	item = &items[i];
+	if (item->type == QI_VAL)
+		return item->qoperand.weight == 0;
+	if (item->type != QI_OPR ||
+		(item->qoperator.oper != OP_AND && item->qoperator.oper != OP_OR))
+		return false;
+	left = item->qoperator.left;
+	if (left < 2 || left >= (uint32) (size - i))
+		return false;
+	rneg = items[i + 1].type == QI_OPR && items[i + 1].qoperator.oper == OP_NOT;
+	lneg = items[i + (int32) left].type == QI_OPR &&
+		items[i + (int32) left].qoperator.oper == OP_NOT;
+	if (item->qoperator.oper == OP_OR ? (rneg || lneg) : (rneg && lneg))
+		return false;
+	return lion_tsquery_exact_shape(items, size, i + 1 + (rneg ? 1 : 0)) &&
+		lion_tsquery_exact_shape(items, size,
+								 i + (int32) left + (lneg ? 1 : 0));
+}
+
+/*
+ * Does the tsquery hold a lexeme lion_tsvector_extract_query() files under an
+ * ambiguous key - one of LION_LEXEME_KEY_MAX bytes or more, not a prefix
+ * (DESIGN.md §17, "Long lexemes")?  Its extraction is then not the plain
+ * one, and lion_tsquery_superset() takes no NOT away anywhere in it.
+ */
+static bool
+lion_tsquery_ambiguous(QueryItem *items, int32 size)
+{
+	int32		i;
+
+	for (i = 0; i < size; i++)
+	{
+		if (items[i].type == QI_VAL && !items[i].qoperand.prefix &&
+			items[i].qoperand.length >= LION_LEXEME_KEY_MAX)
+			return true;
+	}
+	return false;
+}
+
+/*
  * The share of the rows the tsquery rooted at items[i] matches, from its
  * operands' shares lexsel[itemlex[...]], combined as core combines them
  * (tsquery_opr_selec()): an AND and a phrase their product, an OR as
  * independent, a NOT the complement.  Or, superset, the share of the rows
  * of the boolean tree over its lexemes the posting sets answer, which
  * lion_tsquery_superset() makes of it: a phrase its operands' AND, a weight
- * the lexeme at any weight, a NOT every row - and an AND with it the other
- * side, an OR with it every row.  *every says that the tree is every row.
- * The bounds of an operator's left operand are the ones that function
- * checks; what it would refuse is every row here.
+ * the lexeme at any weight, `x & !y` x's tree less y's rows where y is exact
+ * (lion_tsquery_exact_shape()) and nosub is false - it is true inside a
+ * phrase and for a query lion_tsquery_ambiguous() finds - any other NOT
+ * every row - and an AND with it the other side, an OR with it every row.
+ * *every says that the tree is every row.  The bounds of an operator's left
+ * operand are the ones that function checks; what it would refuse is every
+ * row here.
  */
 static Selectivity
 lion_tsquery_walk_sel(QueryItem *items, int32 size, int32 i,
 					  const int *itemlex, const double *lexsel, bool superset,
-					  bool *every)
+					  bool nosub, bool *every)
 {
 	QueryItem  *item;
 	Selectivity s1;
@@ -6922,7 +7063,7 @@ lion_tsquery_walk_sel(QueryItem *items, int32 size, int32 i,
 				return 1.0;
 			}
 			s1 = lion_tsquery_walk_sel(items, size, i + 1, itemlex, lexsel,
-									   false, &every1);
+									   false, false, &every1);
 			return every1 ? 0.0 : 1.0 - s1;
 
 		case OP_AND:
@@ -6934,10 +7075,42 @@ lion_tsquery_walk_sel(QueryItem *items, int32 size, int32 i,
 				*every = true;
 				return 1.0;
 			}
+			if (superset && !nosub && item->qoperator.oper == OP_AND)
+			{
+				QueryItem  *r = &items[i + 1];
+				QueryItem  *l = &items[i + (int32) left];
+				bool		rneg = r->type == QI_OPR && r->qoperator.oper == OP_NOT;
+				bool		lneg = l->type == QI_OPR && l->qoperator.oper == OP_NOT;
+				int32		negi = rneg ? i + 2 : i + (int32) left + 1;
+
+				if (rneg != lneg &&
+					lion_tsquery_exact_shape(items, size, negi))
+				{
+					/* the other side's tree less the negated rows */
+					s1 = lion_tsquery_walk_sel(items, size,
+											   rneg ? i + (int32) left : i + 1,
+											   itemlex, lexsel, true, false,
+											   &every1);
+					s2 = lion_tsquery_walk_sel(items, size, negi, itemlex,
+											   lexsel, false, false, &every2);
+					if (every1)
+					{
+						*every = true;
+						return 1.0;
+					}
+					return s1 * (every2 ? 0.0 : 1.0 - s2);
+				}
+			}
 			s1 = lion_tsquery_walk_sel(items, size, i + 1, itemlex, lexsel,
-									   superset, &every1);
+									   superset,
+									   nosub ||
+									   item->qoperator.oper == OP_PHRASE,
+									   &every1);
 			s2 = lion_tsquery_walk_sel(items, size, i + (int32) left,
-									   itemlex, lexsel, superset, &every2);
+									   itemlex, lexsel, superset,
+									   nosub ||
+									   item->qoperator.oper == OP_PHRASE,
+									   &every2);
 			if (item->qoperator.oper == OP_OR)
 			{
 				if (every1 || every2)
@@ -7211,8 +7384,9 @@ lion_tsquery_pos_shape_of(PlannerInfo *root, RelOptInfo *rel,
 	pfree(firstof);
 
 	full = lion_tsquery_walk_sel(items, tsq->size, 0, itemlex, shares, false,
-								 &every);
+								 false, &every);
 	super = lion_tsquery_walk_sel(items, tsq->size, 0, itemlex, shares, true,
+								  lion_tsquery_ambiguous(items, tsq->size),
 								  &every);
 	if (every)
 		super = 1.0;

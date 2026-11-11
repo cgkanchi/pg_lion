@@ -292,6 +292,14 @@
 #define LION_SAGG_MAXKIND	LION_SAGG_MAX
 
 /*
+ * ... whose partial aggregate's state is that value, which a node emitting
+ * partial rows emits as it is (DESIGN.md §52, "Partial rows")
+ */
+#define LION_SAGG_IS_PARTIAL_OK(kind) \
+	((kind) == LION_SAGG_COUNT || (kind) == LION_SAGG_SUM || \
+	 (kind) == LION_SAGG_MIN || (kind) == LION_SAGG_MAX)
+
+/*
  * What a sliced column's aggregates ask of its slices (DESIGN.md §52): every
  * bit slice's count, for a sum or an average; each descent; E's count alone
  * is what count(x) and every other needs.
@@ -819,6 +827,24 @@ typedef struct LionVColScope
 #define LION_LIST_GROUP_COST	(lion_list_group_cost * cpu_tuple_cost)
 
 /*
+ * ... and of each count of the walk one entry at a time
+ * (lion_group_walk_fill(): no copy of the WHERE counted against) of an entry
+ * small enough to be INLINE: its payload is on the leaf, read once with the
+ * leaf's other entries (DESIGN.md §28, "A walk that returns rows"), so the
+ * count has no posting page to read, nor a cursor over one to set up.
+ * Measured on the release build of PostgreSQL 18 over 2M- and 5M-row tables,
+ * whole-table GROUP BYs of 489k to 5M groups of 1 to 5 rows: 0.27 to 0.5 us
+ * a group over and above the merge, 14 to 25 cpu_tuple_cost at the 500 units
+ * a millisecond of §10's reference.  Until 2026-11-10 such a walk read the
+ * leaf again for every group, and LION_ENTRY_COUNT_COST was what it cost.
+ * The sum over every entry of a column (`k IS NOT NULL` alone, §14), priced
+ * as the same walk, always read each leaf once: 0.22 us an entry all told
+ * over 2M INLINE entries of a row each, 11 cpu_tuple_cost, so it is charged
+ * this too.
+ */
+#define LION_INLINE_ENTRY_COUNT_COST	(lion_inline_entry_count_cost * cpu_tuple_cost)
+
+/*
  * ... and each set of a WHERE source that is a union (an IN list, an OR
  * across columns), which every count of a GROUP BY builds again: its cursor
  * set up and positioned over the set's copy, and its merge (DESIGN.md §15,
@@ -1269,6 +1295,11 @@ typedef struct LionVColScope
 										 * decoded a batch of groups at a
 										 * time (DESIGN.md §52, "The decode
 										 * route") */
+#define LION_FLAG_EXISTS		0x100	/* nothing reads the groups'
+										 * counts: each group, pair or
+										 * folded group is a test for one
+										 * visible row (DESIGN.md §10,
+										 * "Groups nothing counts") */
 
 /*
  * What the planner decided, in a form the executor can be handed through
@@ -1872,6 +1903,14 @@ typedef struct LionPartState
 	Oid		   *sliceidxoid;
 	AttrNumber *sliceidxcol;
 	Relation   *sliceidx;
+
+	/*
+	 * The decoded walk (DESIGN.md §16, "The decoded walk over partitions"):
+	 * this partition's index of each of its columns, open from Begin to End
+	 * as its other indexes are.
+	 */
+	Oid			groupnidxoid[LION_MAX_GROUPCOLS];
+	Relation	groupnidx[LION_MAX_GROUPCOLS];
 } LionPartState;
 
 /*
@@ -2200,6 +2239,8 @@ typedef struct LionSCol
 	AttrNumber	attno;			/* the heap column */
 	Oid			idxoid;
 	AttrNumber	idxcol;			/* its key column in idxoid */
+	int			run;			/* the run it is counted in: 0, or a filter's
+								 * (§52, "Filtered aggregates") */
 	int			want;			/* LION_SWANT_*: what its aggregates ask */
 	Oid			typid;			/* the type it is sliced as */
 	int			nbits;
@@ -2698,6 +2739,12 @@ typedef struct LionCountPrivPart
 								 * sliced column here ... */
 	AttrNumber *sliceidxcol;	/* ... and its key column there; NULL
 								 * without sliced columns */
+	Oid			groupnidxoid[LION_MAX_GROUPCOLS];	/* GROUPN: the index of
+													 * each column of the
+													 * decoded walk here
+													 * (DESIGN.md §16, "The
+													 * decoded walk over
+													 * partitions") */
 } LionCountPrivPart;
 
 /* The FK-side join (DESIGN.md §27): JOIN */
@@ -2774,6 +2821,9 @@ typedef struct LionCountPrivSCol
 	AttrNumber	attno;			/* the heap column */
 	Oid			idxoid;			/* the lion index whose slices it reads */
 	AttrNumber	idxcol;			/* ... the column's key column there */
+	int			run;			/* the run whose rows it is counted over: 0
+								 * the WHERE's, f filter f's (§52,
+								 * "Filtered aggregates") */
 } LionCountPrivSCol;
 
 /* ... and one of those aggregates, from SLICES' fourth list (PLAN stage) */
@@ -3397,6 +3447,13 @@ typedef struct LionCountScanState
 	int			gbpos;
 	int64		groupbatches;
 	int64		groupsbatched;
+
+	/*
+	 * The tests for a visible row made in place of the groups' counts when
+	 * nothing reads those (LION_FLAG_EXISTS; DESIGN.md §10, "Groups nothing
+	 * counts"), which EXPLAIN ANALYZE reports.
+	 */
+	int64		grouptests;
 
 	/*
 	 * The top k of a GROUP BY ordered by its count (DESIGN.md §36), or NULL
@@ -4300,7 +4357,7 @@ extern bool lion_contains_param(Node *expr);
 extern int	lion_wagg_classify(Aggref *agg, Index rti, AttrNumber *attno,
 							   int *argwidth);
 extern int	lion_sagg_classify(Aggref *agg, Index rti, AttrNumber *attno,
-							   Oid *argtype);
+							   Oid *argtype, Node **filter);
 extern IndexOptInfo *lion_range_sliced_index(RelOptInfo *rel, AttrNumber attno,
 											 AttrNumber *colp, Oid *typid);
 extern bool lion_rel_has_sliced_index(RelOptInfo *rel);
@@ -4318,6 +4375,7 @@ extern LionQueryMode lion_multikey_literal_mode(IndexOptInfo *idx,
 extern BoolExpr *lion_boolean_not_test(Node *clause);
 extern List *lion_or_arms(Node *clause);
 extern List *lion_all_as_and(Node *clause);
+extern List *lion_like_as_and(Node *clause);
 extern Node *lion_multikey_any_as_or(Node *clause);
 extern bool lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 							  bool allow_negated, bool allow_range,
@@ -4628,7 +4686,9 @@ extern void lion_target_lists(const LionCountTarget *t, List *whereclauses,
 							  List **tors, int *joinclause);
 extern void lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath,
 								 RelOptInfo *rel, List *idxs, List *cols,
-								 List *wants, double whererows,
+								 List *wants, const double *whererows,
+								 const int *runs, const Cost *runwhere,
+								 const bool *runcounted, int nrun,
 								 bool haswhere, bool counts, double ngroups,
 								 int batch, Cost rangecollect);
 extern void lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath,
@@ -4792,6 +4852,13 @@ extern void lion_try_distinct_agg_path(PlannerInfo *root,
 									   RelOptInfo *output_rel,
 									   GroupPathExtraData *extra);
 
+/* lion_window.c */
+extern void lion_try_window_count_path(PlannerInfo *root,
+									   RelOptInfo *input_rel,
+									   RelOptInfo *window_rel);
+extern const CustomPathMethods lion_window_count_path_methods;
+extern const CustomScanMethods lion_window_count_scan_methods;
+
 /* lion_plan_hooks.c */
 extern Plan *lion_plan_join_agg_path(PlannerInfo *root, RelOptInfo *rel,
 									 CustomPath *best_path, List *tlist,
@@ -4869,9 +4936,11 @@ extern TupleTableSlot *lion_next_group_any(LionCountScanState *st,
 										   bool *exhausted);
 
 /* lion_exec_slice.c: the aggregates of sliced columns (DESIGN.md §52) */
-extern void lion_slice_run(LionCountScanState *st);
+extern void lion_slice_run(LionCountScanState *st, int run);
 extern void lion_slice_parts_begin(LionCountScanState *st);
-extern void lion_slice_part(LionCountScanState *st);
+extern void lion_slice_part(LionCountScanState *st, int run);
+extern bool lion_slice_partial_null(LionCountScanState *st,
+									const struct LionSAgg *a);
 extern void lion_slice_parts_end(LionCountScanState *st);
 extern void lion_slice_none(LionCountScanState *st);
 extern void lion_slice_group(LionCountScanState *st, int ngset,
