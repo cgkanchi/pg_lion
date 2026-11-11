@@ -46,8 +46,6 @@
  *	  under this row's key;
  *	- for the first row of a statement, so that a one-row statement costs
  *	  what it did;
- *	- for a column with summaries, whose inserts write more than the key's
- *	  entry and its slices;
  *	- in the rest of the transaction that loads the library, when it is not
  *	  preloaded (lion_defer_init()).
  *
@@ -311,8 +309,9 @@ lion_defer_row_pos(const LionState *state, const LionInsertRow *row)
 /*
  * Buffer one (key, TID) pair of column col (0-based), whose state is state:
  * key as lion_key_prepare() made it, for flag 0, with the row's positions pm
- * for a column that stores them (NULL otherwise); or a reserved entry's flag;
- * or LION_ENTRY_SLICE, with the slice's position as key.
+ * for a column that stores them (NULL otherwise); or LION_ENTRY_SUMMARY, with
+ * the key, for the row's summary; or a reserved entry's flag; or
+ * LION_ENTRY_SLICE, with the slice's position as key.
  */
 void
 lion_defer_add(LionDefer *d, Relation index, Relation heap, LionState *state,
@@ -344,9 +343,10 @@ lion_defer_add(LionDefer *d, Relation index, Relation heap, LionState *state,
 		d->maxrows = newmax;
 	}
 
-	if (flag == 0)
+	if (flag == 0 || flag == LION_ENTRY_SUMMARY)
 	{
-		hash = lion_hash_key(state, key);
+		/* a summary's row: its key, which finds the bucket (DESIGN.md §32) */
+		hash = (flag == 0) ? lion_hash_key(state, key) : LION_SUMMARY_HASH;
 		if (!state->typbyval)
 		{
 			Size		len = lion_defer_key_len(state, key);

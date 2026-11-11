@@ -456,6 +456,40 @@ SELECT lb_cmp('lb_pos', $$d @@ 'w23 <-> p1101'$$);
 SELECT lb_cmp('lb_pos', $$d @@ 'common <-> m5'$$);
 
 -- ---------------------------------------------------------------------
+-- A column with summaries (DESIGN.md §32): the batch writes its rows'
+-- summaries after its keys, in key order, a bucket's run at a time.
+-- Ascending keys raise the open bucket's key and close it once it is full,
+-- bucket after bucket; a text column's keys come in no text order; then
+-- rows between the keys there are and below all of them join closed
+-- buckets, past what an INLINE summary holds.  lion_index_verify() compares
+-- every summary with the keys of its bucket, and every TID is in one bucket
+-- of each column (on 16, row by row, the text column makes fewer buckets,
+-- which is not asked).
+-- ---------------------------------------------------------------------
+CREATE TABLE lb_sum (i int4, t int8, v text) WITH (autovacuum_enabled = off);
+CREATE INDEX lb_sum_tv ON lb_sum USING lion (t, v)
+	WITH (summaries = on, slices = on, summary_tids = 64, inline_limit = 256);
+INSERT INTO lb_sum SELECT g, g * 10, 'v' || g FROM generate_series(1, 3000) g;
+SELECT attno, summary_tids, summary_entries > 40 OR (attno = 2 AND batched(1) = 0) AS buckets
+  FROM lion_index_stats('lb_sum_tv') ORDER BY attno;
+SELECT lion_index_verify('lb_sum_tv', true);
+SELECT lb_cmp('lb_sum', 't BETWEEN 1000 AND 20000');
+SELECT lb_cmp('lb_sum', $$v < 'v5'$$);
+
+-- more of them, and rows in the middle and below
+INSERT INTO lb_sum SELECT g, g * 10, 'v' || g FROM generate_series(3001, 4000) g;
+INSERT INTO lb_sum
+SELECT 5000 + g, (g * 7919) % 40000, 'w' || (g * 31) % 997 FROM generate_series(1, 3000) g;
+INSERT INTO lb_sum SELECT 9000 + g, -g, 'a' || g FROM generate_series(1, 500) g;
+SELECT attno, summary_tids FROM lion_index_stats('lb_sum_tv') ORDER BY attno;
+SELECT lion_index_verify('lb_sum_tv', true);
+SELECT lb_cmp('lb_sum', 't BETWEEN 1000 AND 20000');
+SELECT lb_cmp('lb_sum', 't < 500');
+SELECT lb_cmp('lb_sum', 't >= 39990');
+SELECT lb_cmp('lb_sum', $$v < 'v5'$$);
+SELECT lb_cmp('lb_sum', $$v BETWEEN 'a' AND 'b'$$);
+
+-- ---------------------------------------------------------------------
 -- A partitioned table: one buffer per partition's index.
 -- ---------------------------------------------------------------------
 CREATE TABLE lb_part (i int4, k int4) PARTITION BY RANGE (i);
@@ -468,7 +502,7 @@ SELECT lb_cmp('lb_part', 'k = 4');
 
 DROP VIEW lb_pos_compare;
 DROP TABLE lb, lb_mid, lb_log, lb_left, lb_ex, lb_mix, lb_rows, lb_sl, lb_pos,
-	lb_part;
+	lb_sum, lb_part;
 DROP FUNCTION lb_probe(int4), lb_trig(), lb_after(), lb_cmp(text, text), batched(int8),
 	lb_slcmp(regclass, int2), lb_doc(int4),
 	lion_debug_key_positions(regclass, text);

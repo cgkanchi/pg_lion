@@ -21615,7 +21615,8 @@ key-first order is what the reader's argument below uses for the open bucket.
 into a set that is larger and hotter than a key's: the summary of the open bucket takes every
 appended row of a timestamp column. Measured below - before step 4 was one step: an append that
 raised the open bucket's key paid a record for the key, a second descent and a second record for
-the row (2026-09-28).
+the row (2026-09-28). A statement's rows after its first go in as a batch (§55, "A column with
+summaries"), the same steps a bucket's run at a time.
 
 ### VACUUM (lion_vacuum.c)
 
@@ -35316,6 +35317,35 @@ takes the rest as an INLINE one. A 2,000-row `INSERT ... SELECT` of 80-word docu
 20,000-row table took 1,740 ms row by row and takes 565 ms (335 without positions); most of what
 went was the decoding of chunks, which a row's insert did two or three times for its chunk.
 
+**A column with summaries** (§32) is batched too: `lioninsert()` buffers a second pair for each
+non-NULL row, its key flagged `LION_ENTRY_SUMMARY`, which sorts after the column's keys and before
+its slices, so the batch puts a row under its key first, as a row's steps go.
+`lion_summary_insert_rows()` sorts a column's summary pairs by key, then TID (an append's come
+sorted already, which is checked first), and takes them a bucket's run at a time, one descent to
+`(SUMMARY, key)` for the run's first key:
+
+- a closed summary takes every row up to its key, its run in TID order through the steps of a key
+  (`lion_insert_inline_rows()`, `lion_insert_chain_rows()`), looked up again by the run's largest
+  key for each hold (`lion_summary_put_rows()`);
+- the open one takes the rows up to its key, and those above it while it holds fewer than
+  `summary_tids`, counted as they come: its key is raised once, to the largest of them, with that
+  row in (`lion_summary_rekey_insert()`), and the rest of the run goes in after it the same way;
+- a row above a full open bucket closes it (`lion_summary_close_last()`), opening the next with
+  that row, and the rows after it go on from there.
+
+A run's later holds land on the summary they started on: no bucket boundary appears below the open
+bucket's key, and a bucket that holds the run's first rows is not emptied by VACUUM, so the lookup
+by the run's largest key finds it - closed meanwhile, if another writer filled the open bucket and
+went past it. One that finds anything else leaves the rest of the run to `lion_summary_insert()`,
+a row at a time. The buckets the batch makes are not the ones the same rows would make one at a
+time in TID order: the open bucket's key, raised by the largest key of the rows it takes, is not
+raised past it by a row that came earlier in the table, so keys that arrive in no order fill
+bucket after bucket rather than joining one open bucket raised by its first high key. Each bucket
+still holds just the keys in (the key before it, its own key], which is what a count asks.
+A 50,000-row `INSERT ... SELECT` into a million-row table with summaries took 120 ms row by row
+and takes 95 (no summaries: 70) when the keys are appended, and 280 against 155 (no summaries:
+110) for random keys.
+
 A key of many rows - the case that queued - is a CHAIN entry after its first few hundred, so its
 rows go in 256 to a lock handoff and a record to a container; a key of one row costs what it did,
 plus the sort.
@@ -35344,9 +35374,7 @@ covered is this backend reading the index before they are written, and the commi
   `index_insert_cleanup()`. After it, inserts go straight in.
 
 **When nothing is buffered** (`lion_defer_allowed()` and `lioninsert()`): PostgreSQL 16, which has
-no `aminsertcleanup`; the first row of a statement, so a one-row statement costs what it did; a
-column with summaries, whose inserts write more than the key's entry and its slices (the bucket's
-steps would have to be batched as well); the index
+no `aminsertcleanup`; the first row of a statement, so a one-row statement costs what it did; the index
 of an exclusion constraint, whose check scans the index for the rows inserted before in the same
 statement; while an `INSERT ... ON CONFLICT` runs, anywhere in the backend (tracked from
 `ExecutorStart` to `ExecutorEnd` and dropped with the subtransaction it began in); and the rest of
@@ -35404,9 +35432,8 @@ A record to a container rather than to a row, and a new or INLINE entry's rows i
 38% less time on two values and 20% less on 20,000; none on a million values or on statements
 whose keys have a row each.
 
-**Not done.** Columns with summaries are written row by row; batching them needs their own steps
-sorted and held the same way. A positions key's rows that land below what its position tree holds
-(room a VACUUM freed) go into the tree one at a time. A one-row statement gains nothing,
+**Not done.** A positions key's rows that land below what its position tree holds (room a VACUUM
+freed) go into the tree one at a time. A one-row statement gains nothing,
 and many writers inserting one row each still take turns on the leaf (each turn shorter since §21's
 "A leaf already known").
 
@@ -35416,7 +35443,9 @@ records 400 rows of one CHAIN key write counted; a sliced column whose batch mak
 spills them, and an UPDATE that hands a slice its rows out of TID order, against
 `lion_index_slice_agg()`; a column with stored positions whose batch appends to position trees and
 inline chunks, spills INLINE entries, and then merges rows below them in, against the rows'
-tsvectors and phrase queries;
+tsvectors and phrase queries; a column with summaries whose batch raises and closes the open
+bucket bucket after bucket, an unordered text column beside it, and rows between and below the keys
+there are, against `lion_index_verify()`'s comparison of every summary with its bucket's keys;
 a volatile function's query in the INSERT's own select list, BEFORE and AFTER triggers' queries,
 by the count pushdown first; rows left past their statement written by a query of the table, a
 direct reader and the commit, dropped with an aborted savepoint or PL/pgSQL block, written before
@@ -35424,4 +35453,7 @@ TRUNCATE and DROP INDEX; `batch_inserts = off`; ON CONFLICT in the statement and
 an exclusion constraint violated within one statement; columns with summaries, slices and
 positions in one statement; a partitioned table), each against sequential scans and
 `lion_index_verify()`; `test/isolation/insert_batch_race.spec` (a batch parked between two holds
-while another writer fills the same key and VACUUM empties part of it).
+while another writer fills the same key and VACUUM empties part of it) and
+`test/isolation/summary_batch_race.spec` (a summary run parked between two holds while another
+writer closes the bucket it is filling); `test/sql/summary.sql` inserts a row at a time, so that its
+buckets are the same on PostgreSQL 16.

@@ -22,18 +22,20 @@
 /*
  * One (key, TID) pair waiting for its index: the key as lion_key_prepare()
  * made it, copied into the buffer, and the bucket hash the directory files it
- * under; or a reserved entry's flag with key 0 and hash LION_NULLKEY_HASH; or
- * LION_ENTRY_SLICE with the bit slice's position (DESIGN.md §51) as the key
- * and hash 0, which is how a sliced column's row goes into each of its
- * slices.
+ * under; or LION_ENTRY_SUMMARY with the key, copied, and hash
+ * LION_SUMMARY_HASH, which is how a summarized column's row goes into its
+ * bucket's summary (DESIGN.md §32); or a reserved entry's flag with key 0 and
+ * hash LION_NULLKEY_HASH; or LION_ENTRY_SLICE with the bit slice's position
+ * (DESIGN.md §51) as the key and hash 0, which is how a sliced column's row
+ * goes into each of its slices.
  */
 typedef struct LionInsertRow
 {
 	Datum		key;
 	uint64		code;			/* lion_tid_to_code() of the heap TID */
 	uint32		hash;
-	uint16		flag;			/* 0, a reserved entry's flag, or
-								 * LION_ENTRY_SLICE */
+	uint16		flag;			/* 0, LION_ENTRY_SUMMARY, a reserved
+								 * entry's flag, or LION_ENTRY_SLICE */
 	uint16		col;			/* 0-based key column */
 } LionInsertRow;
 
