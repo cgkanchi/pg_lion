@@ -76,6 +76,9 @@ LANGUAGE sql AS $$
 			SELECT first + 7 * i, 8 + i FROM generate_series(1, n - 8) i) s
 $$;
 
+-- VACUUM can only set all-visible once the commit record is on disk, and
+-- lion prices a count over pages that are not
+SET synchronous_commit = on;
 CREATE TABLE events (id int NOT NULL, kind int NOT NULL, owner_id int NOT NULL,
 					 payload text) WITH (autovacuum_enabled = off);
 ALTER TABLE events ALTER kind SET STATISTICS 3;
@@ -197,8 +200,10 @@ SELECT what, s.*
 
 -- ---------- 9. plans ----------
 -- The planner that expected 34 rows of five heavy values reads them through
--- an index scan and groups them; with their 11,250 rows it counts the top k
--- from the index.  (The join of those rows to their owners goes to a hash
+-- an index scan and groups them; with their 11,250 rows it counts every
+-- owner from the index - the owners' counts are too even for a top k to stop
+-- early, so it would count every group anyway (DESIGN.md §36, "The
+-- fallback").  (The join of those rows to their owners goes to a hash
 -- join or to the FK-side join depending on the major, and the two run within
 -- a third of each other; only its answers are checked, below.)
 SET enable_seqscan = off;

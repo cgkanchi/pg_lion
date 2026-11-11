@@ -1872,10 +1872,11 @@ Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *k
    are currently consuming). Advance a set's cursor page only after its containers have been fully
    consumed, and consume means: for the resulting AND container, do the VM checks (step 3) before any
    source page pin is released.
-3. For the result container: for each of the ≤ LION_BLOCKS_PER_CONTAINER heap blocks with members
-   (compute member counts per block via lion_container_range_cardinality over the block's lo range;
-   skip blocks with 0), `visibilitymap_get_status(heap, blk, &vmbuf)`; if all-visible: count +=
-   members, PredicateLockPage; else: append the block's TIDs (lion_code_to_tid) to a recheck list.
+3. For the result container: for each of the ≤ LION_BLOCKS_PER_CONTAINER heap blocks with members,
+   `visibilitymap_get_status(heap, blk, &vmbuf)`; if all-visible: PredicateLockPage; else: append
+   the block's TIDs (lion_code_to_tid) to a recheck list. One pass over the container's members
+   queues those of the blocks that are not all-visible and counts them; the count adds the rest
+   ("The recheck's reads" below).
 4. After the merge completes, recheck: sort the TID list (it is already in TID order if produced in
    ckey order), and for each TID call `table_index_fetch_tuple(fetch, &tid, snap, slot, &call_again,
    &all_dead)` in a loop over call_again (HOT chains); count each visible tuple found. Use
@@ -2053,6 +2054,77 @@ old value; then in READ COMMITTED s1 must see the new value), and an index the c
 not use at all (count_checkxmin.spec: a HOT update before CREATE INDEX makes the build set
 indcheckxmin, and the old REPEATABLE READ reader must get the eligibility error rather than a count
 that is missing the row it still sees).
+
+### The recheck's reads (2026-11-10)
+
+A count over a heap that has lost its visibility map bits spends its time in step 4. On 5M rows of
+a synthetic table (96,192 heap pages, about 52 rows a page), an UPDATE of 1% of the rows clears the
+bit on 52% of the pages, and `count(*) WHERE c2 = 1` goes from 0.6 ms to 120-130 ms with the whole
+heap in shared buffers. By perf, `heap_hot_search_buffer()` was 60% of it, nearly all of that one
+load: the header of the tuple the root line pointer names, which nothing has brought into the CPU's
+cache, so that the rows of a block waited for their misses one after another. The buffer table
+lookup of each page (core's `ReadBuffer()`) was most of the rest, then queueing the rows. Three
+changes, none of which changes what is read or what is counted:
+
+- **The tuple headers are asked for ahead** (`lion_prefetch_heap_tuple()`, lion_count_int.h). With
+  the block share-locked, the recheck reads the line pointer `LION_RECHECK_PREFETCH` (8) rows ahead
+  of the one it resolves - a redirect's target for a pruned chain - and prefetches the header it
+  names, so that a block's misses overlap; the filtered recheck and the visibility cache's page sweep
+  (`lion_vis_fill_page()`) do the same. A prefetch reads nothing and cannot fault, so a line pointer
+  that names nothing usable costs the instruction. It is a macro, as `lion_prefetch_range()` is: GCC
+  deletes a function that only prefetches. Distances of 8 to 32 measured alike, 4 slower.
+- **The blocks come through a read stream** (PostgreSQL 17 on): `lion_recheck_heap_heap()` reads
+  its blocks as `lion_recheck_heap_filtered()` already did and a bitmap heap scan does, batched on
+  18 (`READ_STREAM_USE_BATCHING`, whose callback may neither lock nor read). The callback
+  (`lion_tid_blocks_next()`) skips the blocks the visibility cache already answers, looking each one
+  up ahead of the recheck. The recheck changes the cache meanwhile - it records the blocks it reads
+  and fills their entries - but only the entry of the block in hand, and it empties none; a sorted
+  list names each block once. So a block filled when the callback looks is filled when the recheck
+  gets to it, and one that is not cannot be filled before the recheck reads it: the callback decides
+  every block as the recheck will, and a buffer for another block is an ERROR. A stream
+  is begun for every recheck, however short: 20,000 groups' counts of a few rows each took the same
+  time with one per count as with none. Warm, it changes nothing; read from storage, it is most of
+  the gain below.
+- **A container's members on dirty blocks are queued and counted in one pass**
+  (`lion_count_container_masks()`): they were counted with a range cardinality per dirty block and
+  then queued by a second pass over every member. Appending to the list is inline
+  (`lion_recheck_append()`), with flushes, spills and growth left to `lion_recheck_add_slow()`.
+
+Measured on PostgreSQL 18.7 at its defaults for I/O (`io_method = worker`, 3 I/O workers,
+`effective_io_concurrency = 16`) and with `max_parallel_workers_per_gather = 0` unless the row says
+otherwise. Warm is the heap in shared buffers: medians of 9 runs (25 for the small counts). Cold is
+`debug_io_direct = data` with the heap evicted before each run: medians of 3. Each build ran twice,
+alternating, and the figures average the two medians.
+
+| Query, after the 1% UPDATE | warm before | warm after | cold before | cold after |
+|---|---|---|---|---|
+| `count(*) WHERE c2 = 1` (2.5M rows) | 128 ms | 87 ms (1.45x) | 2,700 ms | 1,050 ms (2.6x) |
+| the same with two parallel workers | 71 ms | 56 ms (1.25x) | | |
+| `count(*)` | 295 ms | 190 ms (1.55x) | 2,660 ms | 1,110 ms (2.4x) |
+| `count(*) WHERE c200 = 17` | 12.7 ms | 9.0 ms (1.4x) | 620 ms | 240 ms (2.6x) |
+| `c20, count(*) WHERE c200 = 17 GROUP BY c20` | 36.4 ms | 32.4 ms (1.1x) | | |
+| `GROUP BY c200` | 515 ms | 400 ms (1.3x) | 3,300 ms | 1,620 ms (2.0x) |
+| `GROUP BY c20` | 400 ms | 310 ms (1.3x) | 3,070 ms | 1,700 ms (1.8x) |
+
+Vacuumed, the plain counts take under a millisecond and nothing above touches them. Core's
+sequential scan answers the same four large queries in 340 to 690 ms warm (150 to 270 ms with two
+workers) and 670 to 990 ms cold (440 to 490 ms with two). So read from storage, a count that must
+recheck half of a table's pages still loses to reading all of them in order: the recheck's reads
+are single blocks, which this disk serves at about 50,000 a second whatever the concurrency (16,
+64 and 256 measured alike, and 3 or 16 I/O workers), while the sequential scan reads 128 kB at a
+time. The planner prices a heap that fits in `effective_cache_size` as cached, as core does
+(`pg_lion.cold_page_cost`, §39). Warm with two workers, core's grouped counts (250 to 270 ms) also
+beat lion's, which run serially, and the planner still picks lion for them.
+
+What is left, by perf on the warm plain count: `heap_hot_search_buffer()` 30% (the misses the
+prefetch does not hide, mostly a page's first rows, whose line pointers are the page's own first
+miss), the buffer table 22% (core's lookup; a stream makes it ahead of time, not cheaper), queueing
+14%. In a grouped count the visibility cache's hash lookups are 18-28%: each group looks up every
+block it has rows on, at scattered places of a table larger than the L2 cache. Prefetching the
+slots a few blocks ahead measured no gain - the stalls moved to the prefetches. A table indexed by
+block number would turn the lookups into a forward walk, but it takes memory per range of blocks
+rather than per entry, which a cache of scattered blocks would pay many times over in its
+`work_mem` budget; it was not done.
 
 
 ### Direct readers (2026-10-08)
@@ -3811,7 +3883,16 @@ grouping column and one distinct column keeps its plan, and a second form of the
 only compete with it. Where §26 declines - two or more grouping columns, two distinct columns, a
 DISTINCT aggregate other than `count`, a partitioned table (whose (g, k) groups the Finalize Agg
 under the node merges, so the distinct counts above it are exact) - or loses to core on price,
-the finer grouping is offered. The cost is core's sort and Agg over the node's path, its
+the finer grouping is offered.
+
+With no GROUP BY (2026-11-10) the query's one group is every row's, and the finer grouping is the
+DISTINCT aggregates' columns alone: `count(DISTINCT c) ... WHERE ...` is `GROUP BY c` counted and
+core's plain Agg over its rows (AGG_PLAIN, one group), sorted by the DISTINCT aggregate's own keys
+where core marked it presorted. §26's walk answers a single count(DISTINCT) of one table and
+keeps it; what is new is the partitioned table, whose distinct counts §26 does not add up, and two
+DISTINCT aggregates of one table, `count(DISTINCT a), count(DISTINCT b)`, which is `GROUP BY a, b`
+counted. Over 2M rows in four partitions, `count(DISTINCT country) ... WHERE status = 'paid'` took
+27 ms against core's 514. The cost is core's sort and Agg over the node's path, its
 aggregate costs computed as for grouping sets, above, and `add_path()` chooses.
 
 A column the finer grouping adds is grouped by its type's default equality, so one value of each
@@ -6442,6 +6523,49 @@ expression on the key against one off it, a volatile function, a subplan, a resi
 more than half the rows to fetch of every partition and of the one sub-partition left to test the
 clause, and the switch; a dirty heap before and after VACUUM; and a LATERAL value in the clause,
 which rescans the node partition by partition.
+
+### The decoded walk over partitions (2026-11-10)
+
+A `GROUP BY` of three or more columns, or of two whose pairs (§20) cost more than one pass over
+the rows, is §34's decoded walk over one table. Over a partitioned table it was
+refused, so `kind, country, count(*) ... WHERE status = 'paid'` got either §20's pairs, priced at
+every pair of every partition, or core's plan. The walk's rows are partial counts already, under
+a Finalize Agg, as a partitioned table's are, so nothing above the node changes: each partition is
+decoded in its turn, from its own index of each column, and its passes' rows go up as that
+partition's partial rows.
+
+- **Plan.** The GROUPN member holds the walk's columns as the parent numbers them and one index
+  per column per relation counted: the table's, or each partition's in PARTS order
+  (`lion_priv_decode_groupn()`). A partitioned plan's own are InvalidOid, as its other indexes
+  are, and each partition's first is the one it walks (`groupidxoid`) with no inner index of a
+  pair, which `lion_count_priv_check()` holds it to. Every partition has a scalar lion index on
+  every column, as `lion_collect_targets()` asks of any driving column; one without leaves the
+  query to core. A count by cells (§10), whose driver is a one-column decoded walk, still counts
+  one table: its dimensions' indexes would be per partition too.
+- **Run.** The partitions' indexes are opened with their other relations (`lion_open_parts()`) and
+  made the walk's for the partition's turn (`lion_open_relation()`), which closes only its own. A
+  turn's walk starts afresh for each run - the WHERE's, then each filtered count's (§10) - and reads
+  the run's WHERE as one table's does (`lion_decode_where()`): a clause the partition's bounds
+  imply is left out, and a partition where a clause has no entry counts nothing. The chunk sizes
+  are the first partition's (`lion_decode_caps()`), which every partition's passes then take.
+- **Price.** Each partition's walk as one table's, every column's values that partition's
+  estimate (`lion_cost_decode_path()`), and the rows each partition's combinations with rows, as
+  the pairs' partial rows are estimated.
+
+A residual clause (§16, "Residual clauses over a partitioned table") is never beside the walk,
+which tests no row, so a query that needs one keeps the pairs or core's plan.
+
+On 2M rows in four monthly partitions: `status, kind, country, count(*)` (5,000 groups) took 36
+ms against core's 515, `kind, country, count(*) ... WHERE status = 'paid'` 21 ms against 210, and
+`kind, count(DISTINCT country) ... WHERE status = 'paid' GROUP BY kind`, the finer grouping of §10
+over it, 24 ms against 444. `test/sql/group_decode.sql` runs the walk over a table partitioned by
+LIST whose last partition numbers its columns differently and has an index per column: three
+columns, a `WHERE`, two columns, a clause the bounds imply, one that prunes, one with no entry in
+some partitions, HAVING, filtered counts with and without a `WHERE`, count(DISTINCT) with and
+without a GROUP BY, and a rescan with a new value, each compared with a sequential scan. All run
+the walk but `count(DISTINCT c), count(*)`, whose finer grouping is the one column c. A range in
+a FILTER and a range on an outer row's value are compared too; neither is decoded, as over one
+table.
 
 ### A parent pruned to one leaf (2026-10-26)
 
@@ -23516,6 +23640,86 @@ The plan carries k, the candidates and the tie rule in a new member of custom_pr
 they must all come out); ANALYZE adds `Top K Entries Walked`, `Top K Groups Counted` and, when it
 happened, `Top K Walked Whole`. `pg_lion.enable_topk` turns it off.
 
+### The fallback (2026-11-10)
+
+`GROUP BY user_id ORDER BY count(*) DESC LIMIT 10` under `WHERE status = 'paid'`, on a synthetic
+table of 2M rows and 200,000 users of about ten rows each, took 505 ms as a top k against 215-299
+ms for core's bitmap heap scan and hash aggregate - and was picked, priced at 1,697 against
+75,622. The candidates' counts were a fifth of their bounds, and the bounds of the entries after
+them nearly as large: the walk ran out of candidates and counted all 199,993 groups, which the
+price left out.
+
+**When it falls back.** The k-th count only grows and the next bound only falls as the walk goes,
+so it runs out exactly when, of all its candidates, fewer than k have a count that reaches the
+bound of the first entry left out (more than it, strictly). Under a WHERE that keeps a share s of
+the rows independently of the group, a candidate of bound b reaches that bound T with the
+binomial chance P(Bin(b, s) >= T), taken as normal with a continuity correction; the number that
+do is a sum of those chances, taken as normal too, and P(fewer than k) is how often the top k
+falls back (`lion_topk_whole_share()`). With nothing in the WHERE but g's own clauses every count
+is taken to be its bound, and only the strict rule to fall back. That is an estimate: an entry
+still holding TIDs of dead or invisible rows counts fewer visible rows than its bound, and a
+non-strict top k can then fall back with no WHERE at all, which the price does not foresee - as
+before this change, it pays for the walk it makes.
+
+**The bounds.** The column's most common values give theirs, largest first, but for those a
+clause on g alone rejects (`lion_topk_freqs()`). Past that list the r-th largest key's rows are
+read where the share (r - 1/2) / n of the keys lie above (`lion_topk_tail_bound()`), never above
+the list's smallest; the candidates there are taken in 32 strata of equal numbers, each at its
+middle one's bound. How many keys there are past the list, their rows and the spread of those are
+what a lion index on the column counted (§33, "The rows of a probed key"): its keys less the
+list's, the rows the list leaves, and the spread sqrt(Σn² / keys - mean²), Σn² counted over
+those keys (`lion_key_tail_counted()`), whatever `pg_lion.enable_skew_estimate` says. Where no index counted
+them, ANALYZE's distinct values less the list's, the rows it leaves them, and the spread of rows
+put in keys at random: the square root of the mean. A clause on g alone keeps the share of the
+keys past the list that its selectivity keeps of their rows.
+
+The shape of that spread decides the answer, since the candidates' bounds and the first one left
+out lie a few standard deviations above the mean. Rows put in keys at random spread as a count
+does, and a normal curve cuts a count's upper tail short: ten rows a key on average, the 75th of
+200,000 keys holds 22, which a normal curve puts at 19.6 - too far below the candidates', so a
+WHERE that keeps 90% was priced to fall back strictly three times in four, where it never did.
+That part of the spread, up to the mean, is read as a gamma variable by Wilson and Hilferty's
+cube-root form, m (1 - 1/9a + z / 3 sqrt(a))^3 with a = m^2 / v, which keeps the count's tail; the
+spread beyond it is the column's skew, with a longer tail still and no negative values, and is
+read as log-normal; a key's bound is the larger of the two. A skewed column with a short list -
+ANALYZE at a statistics target of 10, its tail's spread several times its mean - read as normal
+put the bounds after the k-th far below the real ones, priced its top k to fall back, and planned
+a walk more than ten times slower than the top k it replaced; read as log-normal it keeps the top k.
+
+So a column whose largest entries are about as large as the ones after them falls back under a
+WHERE that takes away more than they differ by, a skewed one only where the WHERE takes away more
+than the bounds fall from the k-th to the first left out - which the candidates, 2k/s of them,
+are sized to cover - and keys of exactly the same rows always fall back under the strict rule.
+On the table above (PostgreSQL 18, warm cache, best of several runs), `WHERE kind < n` keeping
+the share shown, against the plans before this change (with the GROUP BY walk reading each leaf
+once, §28 "One read per leaf"):
+
+| WHERE keeps | falls back, priced | before | now | strictly, priced | before | now |
+| --- | --- | --- | --- | --- | --- | --- |
+| 100% | 0 | top k, 10 counted, 7 ms | the same | 0 | top k, 12 counted, 8 ms | the same |
+| 95% | 2e-25 | top k, 23 counted, 19 ms | the same | 8e-9 | top k, 50 counted, 18 ms | the same |
+| 90% | 5e-7 | top k, 40 counted, 18 ms | the same | 0.04 | top k, 50 counted, 17 ms | the same |
+| 85% | 0.06 | walked whole, 592 ms | the same | 0.86 | walked whole, 599 ms | hash aggregate, 531 ms |
+| 80% | 0.88 | walked whole, 602 ms | hash aggregate, 531 ms | 1 | walked whole, 706 ms | hash aggregate, 523 ms |
+| 70% | 1 | walked whole, 626 ms | hash aggregate, 499 ms | 1 | walked whole, 639 ms | hash aggregate, 531 ms |
+| 50% | 1 | walked whole, 614 ms | hash aggregate, 424 ms | 1 | walked whole, 585 ms | hash aggregate, 445 ms |
+
+The query that lost, under a WHERE keeping a fifth, went from 468 ms to 210 ms. At 85% the top k
+counts 21 for the 10th group against a first bound left out of 22: a near
+thing, priced as unlikely, and planned as before. On a Zipf-like column of 160,714 keys in 2M
+rows, under WHERE clauses keeping 5% or 20% of the rows and under none, and the same with a
+statistics target of 10, every plan is as before.
+
+**The price.** The walk the top k falls back on is the plain GROUP BY's, so it is made a path of
+its own beside the top k (`lion_try_count_path_once()`), priced as any GROUP BY walk is, and the
+top k's price adds that path's, as it went to `add_path()`, times how often the fallback is
+expected - before the first row, like the rest of the top k's. `add_path()` keeps the cheaper of
+the two, and core's plans weigh against both: the query above now plans core's hash aggregate.
+The plain path is made only where the fallback is expected at all, and the spread asked of the
+index only where a candidate or the first entry left out lies past the list. DEBUG2 prints the
+chance (`lion: a top 10 from 101 candidates, under a WHERE that keeps 0.2 of the rows, counts
+every group in 1 of runs`).
+
 ### Expressions of the grouping column
 
 `GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3` was declined: a grouping clause that
@@ -23600,7 +23804,10 @@ group counted, and not without a tie-breaker); `g <> c` and `g IS NOT NULL` taki
 the declines - ascending, ordered by the group, HAVING, DISTINCT, a window function, count(g)
 beside the NULL group, few groups, a generic plan's LIMIT, the setting off; deleted rows still in
 the entries' counts, before and after VACUUM; a rescan under each outer row's WHERE; expressions of
-the grouping column, and the volatile one, the one of another column and the one alone it declines.
+the grouping column, and the volatile one, the one of another column and the one alone it declines;
+the fallback - a column of about equal keys with no WHERE, with ties broken, under a WHERE that
+keeps 95% (the top k) and one that keeps a fifth (the plain walk), keys of exactly the same rows
+under the strict rule (the plain walk), and heavy groups under a WHERE (the top k).
 
 ## 37. Aggregates over the entries of lion columns, weighted by their rows (implemented 2026-09-30)
 

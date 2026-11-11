@@ -1234,7 +1234,7 @@ SELECT slp_q('SELECT sum(b / 2) FROM slp WHERE g = 3');
 SELECT slp_q('SELECT sum(DISTINCT b) FROM slp WHERE g = 3');
         slp_q        
 ---------------------
- no pushdown, 1 rows
+ counts only, 1 rows
 (1 row)
 
 SELECT slp_q('SELECT min(b ORDER BY b) FROM slp WHERE g = 3');

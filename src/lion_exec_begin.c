@@ -518,6 +518,10 @@ lion_open_parts(LionCountScanState *st)
 			part->clauseidx[i] = lion_open_index(part->clauseidxoid[i]);
 		part->fgidx = lion_open_index(part->fgidxoid);
 
+		/* the decoded walk's columns (§16, "The decoded walk over partitions") */
+		for (i = 0; i < st->plan.ngroupn; i++)
+			part->groupnidx[i] = lion_open_index(part->groupnidxoid[i]);
+
 		/* the indexes whose slices answer the aggregates (DESIGN.md §52) */
 		if (st->slice != NULL)
 		{
@@ -552,6 +556,12 @@ lion_close_parts(LionCountScanState *st)
 		if (part->fgidx != NULL)
 			index_close(part->fgidx, AccessShareLock);
 		part->fgidx = NULL;
+		for (i = 0; i < LION_MAX_GROUPCOLS; i++)
+		{
+			if (part->groupnidx[i] != NULL)
+				index_close(part->groupnidx[i], AccessShareLock);
+			part->groupnidx[i] = NULL;
+		}
 		if (part->clauseidx != NULL)
 		{
 			for (i = 0; i < st->nclause; i++)
@@ -659,6 +669,22 @@ lion_open_relation(LionCountScanState *st, int p)
 			st->clause[i].idx = part->clauseidx[i];
 		st->groupidx = part->groupidx;
 		st->groupidx2 = part->groupidx2;
+
+		/*
+		 * ... its own index of each column of the decoded walk (§16, "The
+		 * decoded walk over partitions") ...
+		 */
+		if (st->decode != NULL)
+		{
+			LionDecodeRun *dr = st->decode;
+			int			c;
+
+			for (c = 0; c < dr->ncol; c++)
+			{
+				dr->idx[c] = part->groupnidx[c];
+				dr->idxoid[c] = part->groupnidxoid[c];
+			}
+		}
 
 		/*
 		 * ... and its own index slicing each column the aggregates of
@@ -865,7 +891,7 @@ lion_close_relation(LionCountScanState *st)
 		lion_decode_reset(st);
 		for (c = 0; c < dr->ncol; c++)
 		{
-			if (dr->idx[c] != NULL)
+			if (dr->idx[c] != NULL && own)
 				index_close(dr->idx[c], AccessShareLock);
 			dr->idx[c] = NULL;
 			dr->idxcol[c] = 0;
@@ -1752,6 +1778,10 @@ lion_begin_partitions(LionCountScanState *st, const LionCountPriv *priv)
 			/* ... and its index slicing each sliced column (§52) */
 			st->part[i].sliceidxoid = priv->part[i].sliceidxoid;
 			st->part[i].sliceidxcol = priv->part[i].sliceidxcol;
+
+			/* ... and of each column of the decoded walk (§16) */
+			memcpy(st->part[i].groupnidxoid, priv->part[i].groupnidxoid,
+				   sizeof(st->part[i].groupnidxoid));
 		}
 
 		/*

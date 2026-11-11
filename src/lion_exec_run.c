@@ -94,12 +94,16 @@ lion_run_partition(LionCountScanState *st, int p)
  * The entry walk of a partition's turn, begun once its WHERE is located.  A
  * positive clause with no entry in THIS partition selects nothing here,
  * whatever the others hold, so its entry scan is skipped and no group of it
- * is emitted.
+ * is emitted.  The decoded walk (DESIGN.md §16, "The decoded walk over
+ * partitions") walks its own columns' entries, and starts afresh for each
+ * run: its first call reads the run's WHERE, located just now.
  */
 static void
 lion_partial_walk_begin(LionCountScanState *st)
 {
-	if (!st->wheremissing)
+	if (st->decode != NULL)
+		lion_decode_reset(st);
+	else if (!st->wheremissing)
 	{
 		bool		bounded = lion_plan_flag(st, LION_FLAG_RANGE);
 
@@ -145,7 +149,9 @@ lion_next_partial_group(LionCountScanState *st)
 			lion_partial_walk_begin(st);
 		}
 
-		if (st->scanning)
+		if (st->scanning ||
+			(st->decode != NULL && !st->wheremissing &&
+			 !st->decode->finished))
 		{
 			bool		exhausted;
 			TupleTableSlot *slot = lion_next_group_any(st, &exhausted);
@@ -153,7 +159,8 @@ lion_next_partial_group(LionCountScanState *st)
 			if (!exhausted)
 				return slot;
 
-			lion_entry_scan_end(&st->escan);
+			if (st->scanning)
+				lion_entry_scan_end(&st->escan);
 			st->scanning = false;
 		}
 

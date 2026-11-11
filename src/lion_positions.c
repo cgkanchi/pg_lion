@@ -20,6 +20,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "port/pg_bitutils.h"
+
 #include "lion_positions.h"
 
 typedef enum PosDecode
@@ -83,12 +85,20 @@ pos_base(const LionContainer *c)
 	return lion_pos_block_base(c->ckey);
 }
 
-static PosDecode
+static inline PosDecode
 read_varint(const uint8 **pp, const uint8 *end, uint64 *v)
 {
 	const uint8 *p = *pp;
 	uint64		r = 0;
 	int			i;
+
+	/* most varints of a chunk are one byte: a delta, npos, a position */
+	if (likely(p < end && *p < 0x80))
+	{
+		*v = *p;
+		*pp = p + 1;
+		return POS_OK;
+	}
 
 	for (i = 0; i < LION_POS_VARINT_MAX; i++)
 	{
@@ -172,19 +182,59 @@ decode_member(const uint8 **pp, const uint8 *end, uint64 prev, bool first,
 }
 
 /*
- * Step over one member at *pp without decoding its positions, for the walks
- * that only want codes: its code goes to *code and *pp past it.  Positions
- * are counted by their varints' last bytes, so a damaged member can be
- * stepped over at a boundary decode_member() would refuse; nothing a caller
- * hands out comes from here without going through decode_member() too.
+ * Step over n varints at p, ending no further than end: where the n'th ends,
+ * or NULL when fewer than n end before end.  A varint ends at a byte whose
+ * high bit is clear.  Eight bytes at a time where eight are left - the stop
+ * bytes of a word are its clear high bits - and a byte at a time after.
  */
-static PosDecode
+static inline const uint8 *
+skip_varints(const uint8 *p, const uint8 *end, uint32 n)
+{
+#ifndef WORDS_BIGENDIAN
+	while (n > 0 && end - p >= (ptrdiff_t) sizeof(uint64))
+	{
+		uint64		w;
+		uint64		stops;
+		uint32		k = 0;
+
+		memcpy(&w, p, sizeof(uint64));
+		stops = ~w & UINT64CONST(0x8080808080808080);
+		while (stops != 0 && k + 1 < n)
+		{
+			stops &= stops - 1;
+			k++;
+		}
+		if (stops != 0)
+			return p + (pg_rightmost_one_pos64(stops) >> 3) + 1;
+		n -= k;
+		p += sizeof(uint64);
+	}
+#endif
+	while (n > 0)
+	{
+		if (p >= end)
+			return NULL;
+		if ((*p++ & 0x80) == 0)
+			n--;
+	}
+	return p;
+}
+
+/*
+ * Step over one member at *pp without decoding its positions, for the walks
+ * that only want codes and counts: its code goes to *code, its npos to
+ * *npos, and *pp past it.  Positions are counted by their varints' last
+ * bytes, so a damaged member can be stepped over at a boundary
+ * decode_member() would refuse; what comes from here is a code that ascends
+ * and an npos in range, never a position.
+ */
+static inline PosDecode
 skip_member(const uint8 **pp, const uint8 *end, uint64 prev, bool first,
-			uint64 *code)
+			uint64 *code, uint16 *npos)
 {
 	const uint8 *p = *pp;
 	uint64		delta;
-	uint64		npos;
+	uint64		n;
 	PosDecode	r;
 
 	if (p >= end)
@@ -195,18 +245,14 @@ skip_member(const uint8 **pp, const uint8 *end, uint64 prev, bool first,
 		return POS_ORDER;
 	if (prev + delta > LION_POS_MAX_CODE)
 		return POS_CODE;
-	if ((r = read_varint(&p, end, &npos)) != POS_OK)
+	if ((r = read_varint(&p, end, &n)) != POS_OK)
 		return r;
-	if (npos > LION_POS_MAX_NPOS)
+	if (n > LION_POS_MAX_NPOS)
 		return POS_NPOS;
-	while (npos > 0)
-	{
-		if (p >= end)
-			return POS_TRUNCATED;
-		if ((*p++ & 0x80) == 0)
-			npos--;
-	}
+	if (n > 0 && (p = skip_varints(p, end, (uint32) n)) == NULL)
+		return POS_TRUNCATED;
 	*code = prev + delta;
+	*npos = (uint16) n;
 	*pp = p;
 	return POS_OK;
 }
@@ -308,25 +354,14 @@ lion_poschunk_iter_next(LionPosIter *it, LionPosMember *m)
 bool
 lion_poschunk_iter_next_npos(LionPosIter *it, LionPosMember *m)
 {
-	const uint8 *p = it->p;
-	uint64		npos;
-
 	if (it->left == 0)
 		return false;
-	/* skip_member() checks the member as decode_member() does, bar positions */
-	if (skip_member(&it->p, it->end, it->code, it->first, &m->code) != POS_OK)
+	if (skip_member(&it->p, it->end, it->code, it->first, &m->code,
+					&m->npos) != POS_OK)
 	{
 		it->left = 0;
 		return false;
 	}
-	/* npos is the second varint, already found sound by skip_member() */
-	{
-		uint64		delta;
-
-		(void) read_varint(&p, it->end, &delta);
-		(void) read_varint(&p, it->end, &npos);
-	}
-	m->npos = (uint16) npos;
 	it->code = m->code;
 	it->first = false;
 	it->left--;
@@ -343,8 +378,9 @@ lion_poschunk_find(const LionContainer *c, uint64 code, LionPosMember *m)
 	{
 		const uint8 *at = it.p;
 		uint64		mcode;
+		uint16		npos;
 
-		if (skip_member(&it.p, it.end, it.code, it.first, &mcode) != POS_OK ||
+		if (skip_member(&it.p, it.end, it.code, it.first, &mcode, &npos) != POS_OK ||
 			mcode > code)
 			break;
 		if (mcode == code)
@@ -395,8 +431,9 @@ lion_poschunk_last_code(const LionContainer *c, uint64 *code)
 	while (it.left > 0)
 	{
 		uint64		mcode;
+		uint16		npos;
 
-		if (skip_member(&it.p, it.end, it.code, it.first, &mcode) != POS_OK)
+		if (skip_member(&it.p, it.end, it.code, it.first, &mcode, &npos) != POS_OK)
 			break;
 		*code = it.code = mcode;
 		it.first = false;

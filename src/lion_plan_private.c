@@ -374,9 +374,11 @@ lion_priv_decode_fact_group(List *priv, LionCountPriv *out)
 
 /*
  * The columns of the decoded walk (DESIGN.md §34): an IntList of their
- * attnums and an OidList of their indexes, one to LION_MAX_GROUPCOLS - one
- * only as the driver of a count by cells, which lion_count_priv_check()
- * holds it to.
+ * attnums, one to LION_MAX_GROUPCOLS - one only as the driver of a count by
+ * cells, which lion_count_priv_check() holds it to - and an OidList of their
+ * indexes, one per column per relation counted: the table's, or each
+ * partition's in PARTS' order (§16, "The decoded walk over partitions"),
+ * whose own the parent's are then.
  */
 static void
 lion_priv_decode_groupn(List *priv, LionCountPriv *out)
@@ -384,7 +386,9 @@ lion_priv_decode_groupn(List *priv, LionCountPriv *out)
 	List	   *gn = (List *) list_nth(priv, LION_PRIV_GROUPN);
 	List	   *attnos;
 	List	   *oids;
+	int			nrel = Max(out->npart, 1);
 	int			c;
+	int			i;
 
 	if (gn == NIL)
 		return;
@@ -395,15 +399,25 @@ lion_priv_decode_groupn(List *priv, LionCountPriv *out)
 	attnos = (List *) linitial(gn);
 	oids = (List *) lsecond(gn);
 	if (list_length(attnos) < 1 || list_length(attnos) > LION_MAX_GROUPCOLS ||
-		list_length(oids) != list_length(attnos))
+		list_length(oids) != list_length(attnos) * nrel)
 		elog(ERROR, "LionCount: malformed decoded walk");
 	out->ngroupn = list_length(attnos);
 	for (c = 0; c < out->ngroupn; c++)
 	{
 		out->groupn_attno[c] = (AttrNumber) list_nth_int(attnos, c);
-		out->groupn_idx[c] = list_nth_oid(oids, c);
-		if (out->groupn_attno[c] <= 0 || !OidIsValid(out->groupn_idx[c]))
+		if (out->groupn_attno[c] <= 0)
 			elog(ERROR, "LionCount: malformed decoded walk");
+		for (i = 0; i < nrel; i++)
+		{
+			Oid			idxoid = list_nth_oid(oids, i * out->ngroupn + c);
+
+			if (!OidIsValid(idxoid))
+				elog(ERROR, "LionCount: malformed decoded walk");
+			if (out->npart == 0)
+				out->groupn_idx[c] = idxoid;
+			else
+				out->part[i].groupnidxoid[c] = idxoid;
+		}
 	}
 }
 
@@ -1427,9 +1441,13 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 		List	   *idxoids = NIL;
 
 		for (i = 0; i < p->ngroupn; i++)
-		{
 			attnos = lappend_int(attnos, (int) p->groupn_attno[i]);
-			idxoids = lappend_oid(idxoids, p->groupn_idx[i]);
+		for (j = 0; j < Max(p->npart, 1); j++)
+		{
+			for (i = 0; i < p->ngroupn; i++)
+				idxoids = lappend_oid(idxoids, (p->npart == 0) ?
+									  p->groupn_idx[i] :
+									  p->part[j].groupnidxoid[i]);
 		}
 		m = list_make2(attnos, idxoids);
 	}
@@ -2215,18 +2233,27 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 
 	/*
 	 * The decoded walk (DESIGN.md §34) has its columns, the first the one
-	 * INTS names, and is the GROUP BY of one table alone - two columns or
-	 * more, or the one driving a count by cells.
+	 * INTS names, and is the GROUP BY of one table - two columns or more, or
+	 * the one driving a count by cells - or of each partition of one in its
+	 * turn, two columns or more (§16, "The decoded walk over partitions"),
+	 * each partition's first index the one it walks and no inner one.
 	 */
 	if (decode != (p->ngroupn > 0))
 		elog(ERROR, "LionCount: malformed decoded walk");
 	if (decode &&
 		(p->groupattno != p->groupn_attno[0] || p->groupattno2 != 0 ||
 		 p->distattno != 0 || p->coalconst != NULL || sumall ||
-		 !hasgroupidx || hasrange || p->npart > 0 || p->hasjoin ||
+		 !hasgroupidx || hasrange || p->hasjoin ||
 		 p->groupidxoid != p->groupn_idx[0] ||
-		 (p->ngroupn < 2) != (p->ncelldim > 0)))
+		 (p->ngroupn < 2) != (p->ncelldim > 0) ||
+		 (p->npart > 0 && p->ncelldim > 0)))
 		elog(ERROR, "LionCount: malformed decoded walk");
+	for (i = 0; decode && i < p->npart; i++)
+	{
+		if (p->part[i].groupidxoid != p->part[i].groupnidxoid[0] ||
+			OidIsValid(p->part[i].groupidxoid2))
+			elog(ERROR, "LionCount: malformed decoded walk");
+	}
 
 	/*
 	 * A count by cells (DESIGN.md §10, "Counts by cells") is the decoded walk
