@@ -669,7 +669,8 @@ Lock ordering:
 
 INSERT (`lion_insert.c`: `lioninsert()` calls `lion_insert_one()` once per key column and, for a
 multi-key opclass, once per extracted key; a statement's rows after its first are kept and written
-as a batch, each key's under one hold of its leaf, by the same steps - §55)
+as a batch by the same steps, a CHAIN entry's up to 256 rows per hold of its leaf and a new or
+INLINE entry's one row per hold, with other writers and VACUUM free to run between holds - §55)
 1. Hash the key and build the search key - kind VALUE, or a reserved entry: NULL, or one of the
    key-less entries of §17 (EMPTY, EMPTYDIM, EMPTYINNER, NULLELEMS) (§14, §17). Descend the directory (`lion_dir_find()`) and take the LEAF EXCLUSIVE; a write descent that
    lands on an INCOMPLETE_SPLIT page finishes that split first (§21, the repair rule). The leaf is
@@ -10497,8 +10498,11 @@ hooks - no planner or object-access hook -; a custom WAL resource manager, only 
 calls it: all but one planner hook FIRST, adding their own path after (`lion_create_upper_paths()`,
 `lion_ordered_set_rel_pathlist()`), so whichever extension was loaded before pg_lion has already
 added its paths when pg_lion adds its own; the plain-scan repricing calls it LAST, so that the plain
-paths are repriced before anything compares against them. The executor and utility hooks of §55
-do their writing before calling the previous hook, and their bookkeeping around it. An extension loaded after pg_lion reaches
+paths are repriced before anything compares against them. The `ExecutorStart_hook` and
+`ProcessUtility_hook` of §55 do their writing before calling the previous hook, and their
+bookkeeping around it; the `ExecutorEnd_hook` writes nothing itself: a statement's rows go in when
+`standard_ExecutorEnd()` closes its indexes, so a hook installed before pg_lion's cannot assume
+they are written when it starts. An extension loaded after pg_lion reaches
 pg_lion through its own chaining, when it chains: Citus does not, for two of these hooks (the
 addendum "Citus and TimescaleDB" below). Nothing is ever uninstalled: core has not unloaded a library since
 PostgreSQL 15 (no `_PG_fini`), and `_PG_init()` runs once per process, so there is no reload-order
@@ -34692,7 +34696,9 @@ loaded about a third of what one writer did, with 70% of their time waiting on t
 lock. Shortening the hold does not help (§5, step 6), and filing the keys on separate leaves gave
 2.2× where batching gave 9× (both measured on throwaway prototypes). So a statement's rows now go in
 as a batch (`lion_defer.c`): after its first row, each row's (key, TID) pairs are kept per index, in
-the backend, and written sorted, each key's rows under one hold of its leaf.
+the backend, and written sorted, a key's rows together: a CHAIN entry's up to 256 per hold of its
+leaf, a new or INLINE entry's one per hold, with other writers and VACUUM free to run between
+holds.
 
 **The batch.** `lioninsert()` hands the pairs of every eligible column to `lion_defer_add()`: the
 key as `lion_key_prepare()` made it, copied, with its bucket hash, or a reserved entry's flag for a
@@ -34762,7 +34768,8 @@ pre-commit one, does them all again. An error in a write aborts the (sub)transac
 whose abort clears the buffer's `writing` flag; a flag still set at the next write means an error
 was swallowed without that, and the write refuses rather than guess what went in.
 
-`pg_lion.batch_inserts` (on) turns it off. `lion_debug_defer_pending(idx)` and
+`pg_lion.batch_inserts` is on by default; setting it to off turns batching off.
+`lion_debug_defer_pending(idx)` and
 `lion_debug_defer_cleanup(on)`, which tests create with `CREATE FUNCTION ... AS 'pg_lion'`, count a
 backend's buffered rows and leave them buffered past the end of a statement, as a caller that never
 calls `index_insert_cleanup()` would.

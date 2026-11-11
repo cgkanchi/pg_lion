@@ -8,8 +8,8 @@
  * few values keeps all of its entries on one leaf, so concurrent statements
  * that insert into it take turns on that leaf row by row, and the lock
  * handoffs - not the inserts - become the cost.  So a statement's rows are
- * kept here, per index, as (key, TID) pairs, and written sorted by key, each
- * key's rows under one hold of its leaf (lion_insert_apply()).
+ * kept here, per index, as (key, TID) pairs, and written sorted by key, a
+ * key's rows together, up to 256 per hold of its leaf (lion_insert_apply()).
  *
  * The rows are written before anything in this backend can need them:
  *
@@ -663,7 +663,7 @@ lion_defer_init(void)
 {
 	DefineCustomBoolVariable("pg_lion.batch_inserts",
 							 "Writes the rows a statement inserts into a lion index in sorted batches.",
-							 "Each key's rows go in under one hold of its directory leaf, "
+							 "A key's rows go in together, up to 256 per hold of its directory leaf, "
 							 "so concurrent statements inserting into a few keys stop "
 							 "taking turns on it row by row.  PostgreSQL 17 and later.",
 							 &lion_batch_inserts,
