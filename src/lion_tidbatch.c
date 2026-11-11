@@ -21,12 +21,12 @@
  * What an item will take - the directory chunks it has no slots in yet, the
  * directory as it grows, the scratch, its slots' arrays and bitsets - is
  * reckoned before it is kept: when that would pass the bound, what is kept is
- * flushed, and an item that could not fit even then goes at once.  Beyond the
- * moment one array is copied into a larger one, only a damaged item can pass
- * it.  A container key's slot is found through a two-level directory of slots,
- * not a hash: container keys are small and dense, and so are the slots, a
- * 5M-row table's in 21 kB.  All of it is in an arena of anonymous memory,
- * outside malloc's heap (lion_tid_batch_map() says why).
+ * flushed, and an item that could not fit even then goes at once.  Only a
+ * damaged item can pass it.  A container key's slot is found through a
+ * two-level directory of slots, not a hash: container keys are small and
+ * dense, and so are the slots, a 5M-row table's in 21 kB.  All of it is in an
+ * arena of anonymous memory, outside malloc's heap (lion_tid_batch_map() says
+ * why).
  *
  * An array that would outgrow LION_ARRAY_MAX_CARD members, the size of a 4 KB
  * bitset of the container's TIDs, is FOLDED into one, and from then on the
@@ -295,7 +295,9 @@ lion_tid_slot(LionTidBatch *b, uint32 ckey)
  * What m more members of the slot of ckey take from the arena: the array
  * grown as lion_tid_slot_grow() grows it, or, once the members outgrow an
  * ARRAY container, the bitset and the LION_TID_BATCH_PEND buffer that replace
- * it.  A slot with a bitset only folds its buffer again.
+ * it.  A slot with a bitset only folds its buffer again.  Counted whole, not
+ * less the array they replace: that is given back only once they are taken,
+ * so what is kept never passes the count, not even for that moment.
  */
 static Size
 lion_tid_slot_bytes(const LionTidBatch *b, uint32 ckey, uint32 m)
@@ -303,7 +305,6 @@ lion_tid_slot_bytes(const LionTidBatch *b, uint32 ckey, uint32 m)
 	uint32		hi = ckey >> LION_TID_BATCH_DIR_BITS;
 	uint32		n = 0;
 	uint32		cap = 0;
-	Size		had = 0;
 	uint32		grown;
 
 	if (hi < b->ndir && b->dir[hi] != NULL)
@@ -317,16 +318,14 @@ lion_tid_slot_bytes(const LionTidBatch *b, uint32 ckey, uint32 m)
 	}
 	if (n + m <= cap)
 		return 0;
-	if (cap > 0)
-		had = lion_tid_class_bytes(sizeof(uint16) * cap);
 	if (n + m > LION_ARRAY_MAX_CARD)
 		return LION_BITSET_BYTES +
-			lion_tid_class_bytes(sizeof(uint16) * LION_TID_BATCH_PEND) - had;
+			lion_tid_class_bytes(sizeof(uint16) * LION_TID_BATCH_PEND);
 	grown = Max(cap, LION_TID_BATCH_ARRAY_INIT);
 	while (grown < n + m)
 		grown *= 2;
 	grown = Min(grown, LION_ARRAY_MAX_CARD);
-	return lion_tid_class_bytes(sizeof(uint16) * grown) - had;
+	return lion_tid_class_bytes(sizeof(uint16) * grown);
 }
 
 /* lion_tid_item_bytes()'s count of directory chunk hi */

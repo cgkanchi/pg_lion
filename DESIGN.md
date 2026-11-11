@@ -17307,12 +17307,13 @@ them to the bitmap a heap block at a time:
   approximate: it counts the arena blocks handed out. What an item will take is reckoned before it
   is kept - the directory chunks of 1,024 slots (24 KB each) it has no slots in yet, several for a
   sparse item, the directory itself, grown once for the item (a pointer for each 65,536 heap blocks,
-  512 KB at 2^32 blocks), and its slots' arrays as they grow or fold into bitsets - and when that
-  would pass `work_mem`, what is kept is flushed first; an item that could not fit even then goes to
-  the bitmap at once. Beyond the moment one slot's array is copied into a larger one, only a damaged
-  item, whose members are not what its header says, can pass the bound; a check after each item
-  flushes then. The arena maps regions of 1 MB and more and keeps them across flushes; only the
-  pages written to take memory. The bitmap's own memory is the TIDBitmap's, as in any bitmap scan.
+  512 KB at 2^32 blocks), and its slots' arrays as they grow or fold into bitsets, each counted
+  whole since the array it replaces is given back only after - and when that would pass `work_mem`,
+  what is kept is flushed first; an item that could not fit even then goes to the bitmap at once.
+  Only a damaged item, whose members are not what its header says, can pass the bound; a check after
+  each item flushes then. The arena maps regions of 1 MB and more and keeps them across flushes;
+  only the pages written to take memory. The bitmap's own memory is the TIDBitmap's, as in any
+  bitmap scan.
 - It is kept in an arena of anonymous memory (`lion_arena.c` without a file), unmapped when the walk
   ends or with the query's memory if it fails, not in palloc's. glibc's malloc gives the top of its
   heap back to the kernel once it is free and larger than twice the largest block malloc has

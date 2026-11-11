@@ -190,7 +190,7 @@ DEBUG:  lion index "bho_k": 19445 of 19945 TIDs into the bitmap by heap block, i
 (1 row)
 
 SELECT bho_same('SELECT id, t FROM bho WHERE t <@ ARRAY(SELECT generate_series(0, 250))');
-DEBUG:  lion index "bho_t": 119271 of 119826 TIDs into the bitmap by heap block, in 15 flushes
+DEBUG:  lion index "bho_t": 119271 of 119826 TIDs into the bitmap by heap block, in 16 flushes
  bho_same 
 ----------
  t
