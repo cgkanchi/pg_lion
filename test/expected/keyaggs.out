@@ -345,7 +345,7 @@ SELECT lion_kq('SELECT sum(s + (random() * 0)::int) FROM ka');
 SELECT lion_kq('SELECT sum(DISTINCT s) FROM ka');
        lion_kq       
 ---------------------
- no pushdown, 1 rows
+ counts only, 1 rows
 (1 row)
 
 SELECT lion_kq('SELECT sum(s) FILTER (WHERE s > 0) FROM ka');

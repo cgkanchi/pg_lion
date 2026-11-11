@@ -641,16 +641,22 @@ lion_explain_group_index(LionCountScanState *st, List *ancestors,
 
 	/*
 	 * The other columns of the decoded walk (DESIGN.md §34), each read from
-	 * its own index; the scan is never partitioned.
+	 * its own index: the table's, named, or each partition's (§16).
 	 */
 	if (st->decode != NULL)
 	{
 		for (i = 1; i < st->decode->ncol; i++)
-			appendStringInfo(buf, ", %s%s (%s)",
-							 get_rel_name(st->decode->idxoid[i]),
-							 lion_explain_col(st->decode->idxoid[i],
-											  st->decode->attno[i], false, st->plan.vcols),
+		{
+			appendStringInfoString(buf, ", ");
+			if (st->npart == 0)
+				appendStringInfo(buf, "%s%s ",
+								 get_rel_name(st->decode->idxoid[i]),
+								 lion_explain_col(st->decode->idxoid[i],
+												  st->decode->attno[i], false,
+												  st->plan.vcols));
+			appendStringInfo(buf, "(%s)",
 							 lion_explain_attname(st, st->decode->attno[i]));
+		}
 	}
 }
 

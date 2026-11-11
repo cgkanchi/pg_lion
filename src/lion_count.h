@@ -2269,6 +2269,21 @@ extern double lion_key_containers_counted(PlannerInfo *root, RelOptInfo *rel,
 										  double *keyrows);
 
 /*
+ * The keys outside column var's MCV list, as a lion index on the column
+ * counted them (DESIGN.md §33, "The rows of a probed key"): how many, their
+ * rows on average, and the spread of those.  False where none did.
+ */
+typedef struct LionKeyTail
+{
+	double		nkeys;
+	double		mean;
+	double		sd;
+} LionKeyTail;
+
+extern bool lion_key_tail_counted(PlannerInfo *root, RelOptInfo *rel,
+								  Var *var, LionKeyTail *tail);
+
+/*
  * While lion prices one of its own accesses to rel, a range among `clauses`
  * that bounds a column past its histogram's ends is estimated with the ends
  * a lion index on the column holds.  lion_probe_begin() says whether a scope
