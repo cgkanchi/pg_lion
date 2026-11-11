@@ -34528,7 +34528,9 @@ plans the query as written, then the rewritten copy, and keeps the plan with the
 cost. Both go through the previous hook, or `standard_planner()`. A cursor that asks for its
 first rows fast (`CURSOR_OPT_FAST_PLAN`) is planned as written only, the total costs not being
 what it is decided on, and so is a query planned in a parallel worker (a PL/pgSQL function's,
-say), where the next point needs a subtransaction.
+say), where the next point needs a subtransaction, and one planned on a hot standby: a recovery
+conflict there cancels the statement, but met inside a subtransaction it ends the session
+(`ProcessRecoveryConflictInterrupt()`).
 
 The rewritten copy is planned inside a subtransaction, as a PL/pgSQL exception block runs, and an
 error from it - another extension's planner hook that does not take a LATERAL subquery, say - is

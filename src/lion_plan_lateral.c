@@ -39,6 +39,7 @@
 
 #include "access/table.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/pg_index.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -594,7 +595,9 @@ lion_lateral_plan_alt(Query *alt, const char *query_string, int cursorOptions,
  * makes another of it - as rewritten, the cheaper of the two plans kept.  A
  * cursor that asks for its first rows fast is planned as written alone,
  * since the two plans' total costs are not what it is decided on, and so is
- * a query planned in a parallel worker, which cannot start a subtransaction.
+ * a query planned in a parallel worker, which cannot start a subtransaction,
+ * or on a hot standby, where a recovery conflict met in one ends the session
+ * instead of the statement (ProcessRecoveryConflictInterrupt()).
  */
 static PlannedStmt *
 lion_lateral_planner(Query *parse, const char *query_string,
@@ -609,7 +612,8 @@ lion_lateral_planner(Query *parse, const char *query_string,
 	PlannedStmt *altplan;
 
 	if (lion_enable_lateral_counts &&
-		(cursorOptions & CURSOR_OPT_FAST_PLAN) == 0 && !IsInParallelMode())
+		(cursorOptions & CURSOR_OPT_FAST_PLAN) == 0 && !IsInParallelMode() &&
+		!RecoveryInProgress())
 		alt = lion_lateral_rewrite(parse);
 	plan = lion_lateral_plan(parse, query_string, cursorOptions, boundParams
 #if PG_VERSION_NUM >= 190000

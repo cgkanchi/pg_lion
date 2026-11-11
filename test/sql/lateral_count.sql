@@ -26,12 +26,16 @@ VACUUM ANALYZE lat_u, lat_e;
 /*
  * lat_check() says whether the planner kept the rewritten plan (its plan
  * differs from the one with pg_lion.enable_lateral_counts off) and compares
- * the rows of the two as multisets.
+ * the rows of the two as multisets.  The rows are fetched by running q
+ * itself: wrapped in another query (CREATE TABLE AS SELECT ... FROM (q)),
+ * its grouped subquery would not be in the FROM list the hook looks at,
+ * and both runs would be the query as written.
  */
 CREATE FUNCTION lat_check(q text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
+	rec record;
 	p_on text := '';
 	p_off text := '';
 	nrows bigint;
@@ -41,12 +45,18 @@ BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		p_on := p_on || ln || E'\n';
 	END LOOP;
-	EXECUTE format('CREATE TEMP TABLE lat_on AS SELECT s::text AS r FROM (%s) s', q);
+	CREATE TEMP TABLE lat_on (r text);
+	FOR rec IN EXECUTE q LOOP
+		INSERT INTO lat_on VALUES (rec::text);
+	END LOOP;
 	PERFORM set_config('pg_lion.enable_lateral_counts', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		p_off := p_off || ln || E'\n';
 	END LOOP;
-	EXECUTE format('CREATE TEMP TABLE lat_off AS SELECT s::text AS r FROM (%s) s', q);
+	CREATE TEMP TABLE lat_off (r text);
+	FOR rec IN EXECUTE q LOOP
+		INSERT INTO lat_off VALUES (rec::text);
+	END LOOP;
 	PERFORM set_config('pg_lion.enable_lateral_counts', 'on', true);
 	SELECT count(*) INTO nrows FROM lat_on;
 	SELECT (SELECT count(*) FROM (TABLE lat_on EXCEPT ALL TABLE lat_off) a) +
