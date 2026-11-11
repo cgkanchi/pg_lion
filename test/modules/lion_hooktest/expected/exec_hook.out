@@ -87,6 +87,12 @@ INSERT INTO nc_nodes VALUES
 	 'SELECT id, count(*) OVER () FROM nc WHERE k = 3 ORDER BY o LIMIT 5', 'int4eq(int4,int4)', ''),
 	('LionWindowCount, its window function',
 	 'SELECT id, count(1) OVER () FROM nc WHERE k = 3 ORDER BY o LIMIT 5', 'count("any")', ''),
+	('LionCountRows',
+	 'SELECT count(*) FROM (SELECT 1 FROM nc WHERE k = 3 LIMIT 200) s', 'int4eq(int4,int4)', ''),
+	('LionCountMinMax',
+	 'SELECT count(*), min(o), max(o) FROM nc WHERE k = 3 AND j = 2', 'int4eq(int4,int4)', ''),
+	('LionCountMinMax, its min or max',
+	 'SELECT count(*), min(o), max(o) FROM nc WHERE k = 3 AND j = 2', 'max(int4)', ''),
 	('LionSemiJoin',
 	 'SELECT d.pk FROM ncd d WHERE EXISTS (SELECT 1 FROM nc WHERE nc.k = d.pk AND nc.j = 3)',
 	 'int4eq(int4,int4)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
@@ -291,6 +297,21 @@ SELECT node, nc_hook(node) FROM nc_nodes ORDER BY node;
  LionCount, its aggregate                         | plain EXPLAIN: as the ordinary plan
  LionCount, its aggregate                         | a cached plan: ERROR: lion_hooktest: execution of count() denied
  LionCount, its aggregate                         | allowed again: the answer
+ LionCountMinMax                                  | plan: planned
+ LionCountMinMax                                  | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
+ LionCountMinMax                                  | plain EXPLAIN: as the ordinary plan
+ LionCountMinMax                                  | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
+ LionCountMinMax                                  | allowed again: the answer
+ LionCountMinMax, its min or max                  | plan: planned
+ LionCountMinMax, its min or max                  | refused: ERROR: lion_hooktest: execution of max(integer) denied, as the ordinary plan
+ LionCountMinMax, its min or max                  | plain EXPLAIN: as the ordinary plan
+ LionCountMinMax, its min or max                  | a cached plan: ERROR: lion_hooktest: execution of max(integer) denied
+ LionCountMinMax, its min or max                  | allowed again: the answer
+ LionCountRows                                    | plan: planned
+ LionCountRows                                    | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
+ LionCountRows                                    | plain EXPLAIN: as the ordinary plan
+ LionCountRows                                    | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
+ LionCountRows                                    | allowed again: the answer
  LionJoinAgg                                      | plan: planned
  LionJoinAgg                                      | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
  LionJoinAgg                                      | plain EXPLAIN: as the ordinary plan
@@ -356,7 +377,7 @@ SELECT node, nc_hook(node) FROM nc_nodes ORDER BY node;
  LionWindowCount, its window function             | plain EXPLAIN: as the ordinary plan
  LionWindowCount, its window function             | a cached plan: ERROR: lion_hooktest: execution of count("any") denied
  LionWindowCount, its window function             | allowed again: the answer
-(135 rows)
+(150 rows)
 
 SHOW lion_hooktest.deny_execute;
  lion_hooktest.deny_execute 

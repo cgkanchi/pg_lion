@@ -449,6 +449,24 @@ _PG_init(void)
 	 * reads every row first.  pg_lion.enable_count_pushdown switches it off
 	 * as well.
 	 */
+	DefineCustomBoolVariable("pg_lion.enable_count_rows",
+							 "Enables lion's count for the rows a LIMIT takes when they read no column.",
+							 "Off, such a LIMIT is left to the planner's scan; pg_lion.enable_count_pushdown = off turns it off too.",
+							 &lion_enable_count_rows,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_lion.enable_count_minmax",
+							 "Enables lion's count beside min() and max() of a column, each from a one-row ordered walk.",
+							 "Off, such an aggregate is left to the planner's Agg; pg_lion.enable_count_pushdown = off turns it off too.",
+							 &lion_enable_count_minmax,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("pg_lion.enable_window_count",
 							 "Enables lion's count beside the rows for count(*) OVER () of the whole result.",
 							 "Off, such a window is left to the planner's WindowAgg; pg_lion.enable_count_pushdown = off turns it off too.",
@@ -649,6 +667,20 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	/*
+	 * DESIGN.md §10, "A test of each key": whether a WHERE clause of one
+	 * column no posting set answers may be counted as the list of the
+	 * column's keys that pass it.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_key_tests",
+							 "Lets the count pushdown answer a WHERE clause of one lion-indexed column, such as upper(col) = 'X' or col ILIKE 'x%', by testing each of the column's keys once.",
+							 "Off, such a clause is tested on each row, by the ordinary plan or as a residual clause.",
+							 &lion_enable_key_tests,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomIntVariable("pg_lion.count_cells_max",
 							"The most cells a count by cells may have: the product of each predicate column's outcomes.",
 							"A plan with more is left to the ordinary plan.",
@@ -780,6 +812,13 @@ _PG_init(void)
 	 * directory has it.
 	 */
 	lion_selfuncs_init();
+
+	/*
+	 * A grouped subquery joined on its grouping column, planned again as a
+	 * LATERAL subquery whose count a lion index answers per outer row
+	 * (DESIGN.md §56): its GUC and the planner hook.
+	 */
+	lion_lateral_init();
 
 	/*
 	 * lionvec (DESIGN.md §44): its tables, its popcount kernel, its

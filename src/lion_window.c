@@ -228,24 +228,29 @@ lion_window_count_agg(void)
 }
 
 /*
- * The count of input_rel under its WHERE, counted into a rel of its own whose
- * target is that count, as lion_try_count_path() plans SELECT count(*) FROM t
- * WHERE ... (the grouping sets do the same, lion_plan_gsets.c): the query is
- * made that one while it plans, and put back.  Its paths are priced in the
- * units pinned for window_rel (DESIGN.md §39), whose competitor - a WindowAgg
- * over the relation - they meet.  The cheapest, or NULL when the node does
- * not count the relation.
+ * The count of input_rel under its WHERE - or aggs, aggregates the node
+ * computes from it, when not NIL - counted into a rel of its own whose target
+ * is that count, as lion_try_count_path() plans SELECT count(*) FROM t WHERE
+ * ... (the grouping sets do the same, lion_plan_gsets.c): the query is made
+ * that one while it plans, and put back.  Its paths are priced in the units
+ * pinned for upper_rel (DESIGN.md §39), whose competitor - a WindowAgg over
+ * the relation, a LIMIT over a scan of it, an Agg - they meet.  The cheapest,
+ * or NULL when the node does not count the relation.  For a node of whatever
+ * stage puts the count beside something else: LionWindowCount here,
+ * LionCountRows (lion_count_rows.c) and LionCountMinMax (lion_minmax.c).
+ * With leakproofresid, a clause tested on the heap may only be one that
+ * raises no error (lion_try_count_path_leakproof()): the count reads rows
+ * the competitor, a LIMIT, stops short of.
  */
-static Path *
-lion_window_count_child(PlannerInfo *root, RelOptInfo *input_rel,
-						RelOptInfo *window_rel)
+Path *
+lion_count_child_path(PlannerInfo *root, RelOptInfo *input_rel,
+					  RelOptInfo *upper_rel, List *aggs, bool leakproofresid)
 {
 	Query	   *parse = root->parse;
 	RelOptInfo *inner;
 	PathTarget *target;
 	GroupPathExtraData extra;
-	List	   *tlist;
-	Aggref	   *n = lion_window_count_agg();
+	List	   *tlist = NIL;
 	bool		savedaggs = parse->hasAggs;
 	bool		savedwindows = parse->hasWindowFuncs;
 	List	   *savedsort = parse->sortClause;
@@ -256,13 +261,21 @@ lion_window_count_child(PlannerInfo *root, RelOptInfo *input_rel,
 	Path	   *best = NULL;
 	ListCell   *lc;
 
+	if (aggs == NIL)
+		aggs = list_make1(lion_window_count_agg());
 	target = create_empty_pathtarget();
-	add_column_to_pathtarget(target, (Expr *) n, 0);
+	foreach(lc, aggs)
+	{
+		Expr	   *agg = (Expr *) lfirst(lc);
+
+		add_column_to_pathtarget(target, agg, 0);
+		tlist = lappend(tlist, makeTargetEntry(agg, list_length(tlist) + 1,
+											   NULL, false));
+	}
 	set_pathtarget_cost_width(root, target);
-	tlist = list_make1(makeTargetEntry((Expr *) n, 1, NULL, false));
 
 	inner = makeNode(RelOptInfo);
-	memcpy(inner, window_rel, sizeof(RelOptInfo));
+	memcpy(inner, upper_rel, sizeof(RelOptInfo));
 	inner->pathlist = NIL;
 	inner->ppilist = NIL;
 	inner->partial_pathlist = NIL;
@@ -287,7 +300,10 @@ lion_window_count_child(PlannerInfo *root, RelOptInfo *input_rel,
 	root->processed_tlist = tlist;
 	PG_TRY();
 	{
-		lion_try_count_path(root, input_rel, inner, &extra, NULL);
+		if (leakproofresid)
+			lion_try_count_path_leakproof(root, input_rel, inner, &extra);
+		else
+			lion_try_count_path(root, input_rel, inner, &extra, NULL);
 	}
 	PG_FINALLY();
 	{
@@ -471,7 +487,7 @@ lion_try_window_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	if (!w.ok || w.fnoids == NIL)
 		return;
 
-	count = lion_window_count_child(root, input_rel, window_rel);
+	count = lion_count_child_path(root, input_rel, window_rel, NIL, false);
 	if (count == NULL)
 		return;
 

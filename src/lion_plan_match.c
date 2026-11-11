@@ -17,6 +17,7 @@
 #include "catalog/pg_type.h"
 #include "mb/pg_wchar.h"
 #include "nodes/miscnodes.h"
+#include "regex/regex.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
@@ -2655,6 +2656,689 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 }
 
 /*
+ * A TEST OF EACH KEY (DESIGN.md §10, "A test of each key").  A WHERE clause
+ * of one column that no posting set answers as it stands - `upper(status) =
+ * 'PAID'`, `country ILIKE 'c1%'`, `country ~ '^c[12]$'`, `kind / 5 = 3` - is
+ * the IN list of the column's keys that pass it, where every row of a key's
+ * entry holds the key's very value: the executor walks the column's entries,
+ * tests each key that a visible row holds, and locates the keys that pass as
+ * a list (lion_keytest_values()).  The clause is evaluated once per key
+ * instead of once per row, which is what it costs a sequential scan.
+ *
+ * What makes the list exactly the clause's rows:
+ *
+ *	- the clause reads one column of the table and nothing else of it - no
+ *	  other column, no system column, no expression column (§41) - so its
+ *	  value on a row is its value on the row's key;
+ *	- it is immutable, so the same key gives the same answer however often
+ *	  and wherever it is evaluated, and needs no snapshot;  parameters are
+ *	  allowed, and evaluated with it once per relation and run;
+ *	- the index holds the rows' own values, not merely equal ones
+ *	  (lion_index_can_emit_value(), checked per relation where the index is
+ *	  matched): `numeric` 1.0 and 1.00 are one entry, and `n::text = '1.00'`
+ *	  is true of one of them only;
+ *	- and it is NULL or false where the column is NULL, so the NULL entry,
+ *	  which the list never holds, holds no row it selects.  That is proved
+ *	  here, by folding the clause with a NULL in the column's place: a strict
+ *	  function or operator of the column folds to NULL.
+ *
+ * The walk tests every key of the column, where a residual clause (§10,
+ * "Residual clauses") tests the rows the other clauses select and the
+ * ordinary plan every row: it is for a column of few keys, no more than a
+ * hundredth of its rows by its statistics (LION_KEYTEST_MAX_KEY_SHARE), and
+ * the cost model weighs it against the ordinary plan from there
+ * (lion_count_path_add()).
+ *
+ * And the clause raises no error on any value of the column
+ * (lion_keytest_cannot_fail()).  The walk tests keys a sequential scan might
+ * never evaluate the clause on: a key whose every row another clause
+ * rejects, which the scan may test first - `z <> 0 AND 12 / z > 1`, `kind
+ * <> 'x' AND 12 / z > 1` where only kind 'x' has a z of 0 - and the most
+ * common values the cost model folds it on, before any row is read.  So
+ * every function it calls is leakproof, which promises as much, or one of
+ * the few that fail on nothing or only on their other arguments, which are
+ * then constants checked here: lower(), upper(), LIKE, ILIKE and the regular
+ * expressions of the column against a constant pattern, a division of it by
+ * a constant other than 0 and -1 (lion_keytest_fn_safe()).  A pattern known
+ * only at run time - a parameter's, an outer row's - may fail on some keys
+ * or on all, and is declined.
+ *
+ * Nor is a key that only deleted or updated rows still hold tested at all:
+ * the walk asks whether a row the snapshot sees holds it first.
+ *
+ * The leaf is an ARRAY clause on the column, under the type's own equality,
+ * whose value is the clause itself (LionLeafInfo.keytest).  Its cost clause
+ * is the IN list of the most common values that pass it, where those are all
+ * but a sliver of the column's rows (lion_keytest_costclause()), and the
+ * clause itself otherwise.
+ */
+typedef struct LionKeytestSubst
+{
+	Var		   *var;
+	Node	   *with;
+} LionKeytestSubst;
+
+static Node *
+lion_keytest_subst_mutator(Node *node, LionKeytestSubst *ks)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var) && ((Var *) node)->varno == ks->var->varno &&
+		((Var *) node)->varattno == ks->var->varattno &&
+		((Var *) node)->varlevelsup == 0)
+		return copyObject(ks->with);
+	return expression_tree_mutator(node, lion_keytest_subst_mutator, ks);
+}
+
+/* clause with `with` in var's place, folded */
+static Node *
+lion_keytest_fold(PlannerInfo *root, Node *clause, Var *var, Node *with)
+{
+	LionKeytestSubst ks;
+
+	ks.var = var;
+	ks.with = with;
+	return eval_const_expressions(root,
+								  lion_keytest_subst_mutator(clause, &ks));
+}
+
+/*
+ * The cost model's view of the clause: `var = ANY (the most common values
+ * that pass it)`, when the most common values hold all but a hundredth of the
+ * column's non-NULL rows - a column of few keys, which is the one the test is
+ * for - so that its rows and its keys are priced as such a list's
+ * (lion_cost_set_clause()).  NULL where they do not, or a value does not
+ * fold to a constant: the clause itself is priced then, by core's estimate.
+ */
+static Node *
+lion_keytest_costclause(PlannerInfo *root, Var *var, Node *clause, Oid eqop,
+						Oid elemtype)
+{
+	VariableStatData vardata;
+	AttStatsSlot sslot;
+	Node	   *result = NULL;
+	double		nullfrac;
+	double		sumfreq = 0.0;
+	Datum	   *kept;
+	int			nkept = 0;
+	int			i;
+
+	/*
+	 * The clause is folded on the column's most common values only where the
+	 * user may read every row of the column, as core's estimates ask before
+	 * they hand a function that is not leakproof a value of the statistics
+	 * (statistic_proc_security_check())
+	 */
+	examine_variable(root, (Node *) var, 0, &vardata);
+	if (!HeapTupleIsValid(vardata.statsTuple) || !vardata.acl_ok)
+	{
+		ReleaseVariableStats(vardata);
+		return NULL;
+	}
+	nullfrac = ((Form_pg_statistic) GETSTRUCT(vardata.statsTuple))->stanullfrac;
+	if (!get_attstatsslot(&sslot, vardata.statsTuple, STATISTIC_KIND_MCV,
+						  InvalidOid,
+						  ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS))
+	{
+		ReleaseVariableStats(vardata);
+		return NULL;
+	}
+	for (i = 0; i < sslot.nnumbers; i++)
+		sumfreq += sslot.numbers[i];
+
+	kept = (Datum *) palloc(sizeof(Datum) * Max(sslot.nvalues, 1));
+	if (sumfreq >= (1.0 - nullfrac) * 0.99)
+	{
+		int16		typlen;
+		bool		typbyval;
+
+		get_typlenbyval(var->vartype, &typlen, &typbyval);
+		for (i = 0; i < sslot.nvalues; i++)
+		{
+			Const	   *c = makeConst(var->vartype, var->vartypmod,
+									  var->varcollid, typlen, sslot.values[i],
+									  false, typbyval);
+			Node	   *f = lion_keytest_fold(root, clause, var, (Node *) c);
+
+			if (!IsA(f, Const))
+			{
+				nkept = -1;
+				break;
+			}
+			if (!((Const *) f)->constisnull &&
+				DatumGetBool(((Const *) f)->constvalue))
+				kept[nkept++] = sslot.values[i];
+		}
+		if (nkept >= 0)
+		{
+			int16		elmlen;
+			bool		elmbyval;
+			char		elmalign;
+			ArrayType  *arr;
+			Oid			arrtype = get_array_type(elemtype);
+			ScalarArrayOpExpr *saop;
+			Node	   *left = (Node *) copyObject(var);
+
+			get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+			arr = construct_array(kept, nkept, elemtype, elmlen, elmbyval,
+								  elmalign);
+			if (var->vartype != elemtype)
+				left = (Node *) makeRelabelType((Expr *) left, elemtype, -1,
+												var->varcollid,
+												COERCE_IMPLICIT_CAST);
+			saop = makeNode(ScalarArrayOpExpr);
+			saop->opno = eqop;
+			saop->opfuncid = get_opcode(eqop);
+			saop->hashfuncid = InvalidOid;
+			saop->negfuncid = InvalidOid;
+			saop->useOr = true;
+			saop->inputcollid = var->varcollid;
+			saop->args = list_make2(left,
+									makeConst(arrtype, -1, InvalidOid, -1,
+											  PointerGetDatum(arr), false,
+											  false));
+			saop->location = -1;
+			if (OidIsValid(arrtype))
+				result = (Node *) saop;
+		}
+	}
+	free_attstatsslot(&sslot);
+	ReleaseVariableStats(vardata);
+	return result;
+}
+
+/*
+ * Whether the function a node of the clause calls can fail on the column's
+ * value.  Not when it is leakproof; nor when it is one of those that fail
+ * only on what their other arguments are, which must then not read the
+ * column, and whose constants are checked here, so that folding the clause
+ * on the most common values cannot fail either (lion_keytest_costclause()):
+ *
+ *	- text's case mapping, lengths, trims, left(), right(), two-argument
+ *	  substr() and concatenation, which fail on nothing;
+ *	- a division by a constant other than 0 and -1, the one divisor that
+ *	  overflows (INT_MIN / -1), and a remainder by one other than 0;
+ *	- LIKE, ILIKE and the regular expressions of the column against a
+ *	  constant pattern that cannot fail, under a deterministic collation (the
+ *	  others refuse ILIKE and regular expressions, and LIKE before PostgreSQL
+ *	  18): a LIKE pattern that does not end in its escape character, a
+ *	  regular expression that compiles.  Not a pattern known only at run
+ *	  time, which may be either: `c LIKE $1` with 'a\' fails on a key 'ab'
+ *	  and not on 'ba', which a sequential scan may never test it on, and
+ *	  `CASE WHEN c = 'a' THEN c ~ '(' END` fails where c is 'a' alone.
+ */
+static bool
+lion_keytest_divisor_ok(Oid funcid, List *args, bool division)
+{
+	Const	   *d;
+	int64		v;
+
+	if (list_length(args) != 2 || !IsA(lsecond(args), Const))
+		return false;
+	d = (Const *) lsecond(args);
+	if (d->constisnull)
+		return true;
+	switch (funcid)
+	{
+		case F_INT2DIV:
+		case F_INT2MOD:
+			v = DatumGetInt16(d->constvalue);
+			break;
+		case F_INT4DIV:
+		case F_INT4MOD:
+			v = DatumGetInt32(d->constvalue);
+			break;
+		default:
+			v = DatumGetInt64(d->constvalue);
+			break;
+	}
+	return v != 0 && !(division && v == -1);
+}
+
+/* a LIKE or ILIKE pattern that does not end in its escape character */
+static bool
+lion_keytest_like_text_ok(Datum d)
+{
+	text	   *t = DatumGetTextPP(d);
+	const char *p = VARDATA_ANY(t);
+	int			len = VARSIZE_ANY_EXHDR(t);
+	int			n = 0;
+
+	while (len > 0 && p[len - 1] == '\\')
+	{
+		n++;
+		len--;
+	}
+	return n % 2 == 0;
+}
+
+/*
+ * ... a regular expression that compiles, under the flags and collation the
+ * operator compiles it with (textregexeq(), texticregexeq()): pg_regcomp()
+ * returns what RE_compile_and_cache() would raise, and allocates in a
+ * context of its own here, let go of whatever it returns.
+ */
+static bool
+lion_keytest_regex_text_ok(Datum d, int cflags, Oid collation)
+{
+	text	   *t = DatumGetTextPP(d);
+	int			len = VARSIZE_ANY_EXHDR(t);
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	pg_wchar   *w;
+	int			wlen;
+	regex_t		re;
+	int			rc;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "lion key test regex",
+								ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+	w = (pg_wchar *) palloc((len + 1) * sizeof(pg_wchar));
+	wlen = pg_mb2wchar_with_len(VARDATA_ANY(t), w, len);
+	rc = pg_regcomp(&re, w, wlen, cflags, collation);
+	if (rc == REG_OKAY)
+		pg_regfree(&re);
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
+	return rc == REG_OKAY;
+}
+
+/*
+ * The pattern - or under `op ANY (array)` every one of the array's - is a
+ * constant that cannot fail: LIKE's, or a regular expression's under cflags.
+ */
+static bool
+lion_keytest_pattern_ok(Node *pattern, bool array, bool like, int cflags,
+						Oid collation)
+{
+	Const	   *c;
+	ArrayType  *arr;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	int			i;
+
+	if (!IsA(pattern, Const))
+		return false;
+	c = (Const *) pattern;
+	if (c->constisnull)
+		return true;
+	if (!array)
+		return like ? lion_keytest_like_text_ok(c->constvalue) :
+			lion_keytest_regex_text_ok(c->constvalue, cflags, collation);
+
+	arr = DatumGetArrayTypeP(c->constvalue);
+	get_typlenbyvalalign(ARR_ELEMTYPE(arr), &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(arr, ARR_ELEMTYPE(arr), elmlen, elmbyval, elmalign,
+					  &elems, &nulls, &nelems);
+	for (i = 0; i < nelems; i++)
+	{
+		if (nulls[i])
+			continue;
+		if (like ? !lion_keytest_like_text_ok(elems[i]) :
+			!lion_keytest_regex_text_ok(elems[i], cflags, collation))
+			return false;
+	}
+	return true;
+}
+
+static bool
+lion_keytest_fn_safe(Oid funcid, List *args, Oid inputcollid, bool array)
+{
+	ListCell   *lc;
+	bool		pattern = false;
+	bool		like = false;
+	int			cflags = 0;
+
+	if (!OidIsValid(funcid))
+		return false;
+	if (get_func_leakproof(funcid))
+		return true;
+
+	/*
+	 * Of `col op ANY (array)` with an operator that is not leakproof, only
+	 * LIKE and the regular expressions, whose patterns are checked one by
+	 * one: an array of divisors is not worth it.
+	 */
+	if (array)
+	{
+		switch (funcid)
+		{
+			case F_TEXTLIKE:
+			case F_TEXTNLIKE:
+			case F_TEXTICLIKE:
+			case F_TEXTICNLIKE:
+			case F_TEXTREGEXEQ:
+			case F_TEXTREGEXNE:
+			case F_TEXTICREGEXEQ:
+			case F_TEXTICREGEXNE:
+				break;
+			default:
+				return false;
+		}
+	}
+	switch (funcid)
+	{
+		case F_INT2DIV:
+		case F_INT4DIV:
+		case F_INT8DIV:
+			return lion_keytest_divisor_ok(funcid, args, true);
+		case F_INT2MOD:
+		case F_INT4MOD:
+		case F_INT8MOD:
+			return lion_keytest_divisor_ok(funcid, args, false);
+		case F_TEXTCAT:
+			return true;
+		case F_LOWER_TEXT:
+		case F_UPPER_TEXT:
+		case F_INITCAP:
+		case F_TEXTLEN:
+		case F_LENGTH_TEXT:
+		case F_CHAR_LENGTH_TEXT:
+		case F_OCTET_LENGTH_TEXT:
+		case F_BTRIM_TEXT:
+		case F_BTRIM_TEXT_TEXT:
+		case F_LTRIM_TEXT:
+		case F_LTRIM_TEXT_TEXT:
+		case F_RTRIM_TEXT:
+		case F_RTRIM_TEXT_TEXT:
+		case F_LEFT:
+		case F_RIGHT:
+		case F_SUBSTR_TEXT_INT4:
+			break;
+		case F_TEXTLIKE:
+		case F_TEXTNLIKE:
+		case F_TEXTICLIKE:
+		case F_TEXTICNLIKE:
+			like = true;
+			pattern = true;
+			break;
+		case F_TEXTREGEXEQ:
+		case F_TEXTREGEXNE:
+			pattern = true;
+			cflags = REG_ADVANCED;
+			break;
+		case F_TEXTICREGEXEQ:
+		case F_TEXTICREGEXNE:
+			pattern = true;
+			cflags = REG_ADVANCED | REG_ICASE;
+			break;
+		default:
+			return false;
+	}
+	if (args == NIL)
+		return false;
+	for_each_from(lc, args, 1)
+	{
+		if (contain_var_clause((Node *) lfirst(lc)))
+			return false;
+	}
+	if (pattern)
+	{
+		if (list_length(args) != 2)
+			return false;
+		if (!OidIsValid(inputcollid) ||
+			!get_collation_isdeterministic(inputcollid))
+			return false;
+		if (!lion_keytest_pattern_ok((Node *) lsecond(args), array, like,
+									 cflags, inputcollid))
+			return false;
+	}
+	return true;
+}
+
+static bool
+lion_keytest_fail_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	switch (nodeTag(node))
+	{
+		case T_Var:
+		case T_Const:
+		case T_Param:
+		case T_RelabelType:
+		case T_BoolExpr:
+		case T_NullTest:
+		case T_BooleanTest:
+		case T_CaseExpr:
+		case T_CaseWhen:
+		case T_CaseTestExpr:
+		case T_CoalesceExpr:
+			break;
+		case T_ArrayExpr:
+			/* an array of arrays fails where their lengths differ */
+			if (((ArrayExpr *) node)->multidims)
+				return true;
+			break;
+		case T_FuncExpr:
+			if (!lion_keytest_fn_safe(((FuncExpr *) node)->funcid,
+									  ((FuncExpr *) node)->args,
+									  ((FuncExpr *) node)->inputcollid,
+									  false))
+				return true;
+			break;
+		case T_OpExpr:
+		case T_DistinctExpr:
+		case T_NullIfExpr:
+			set_opfuncid((OpExpr *) node);
+			if (!lion_keytest_fn_safe(((OpExpr *) node)->opfuncid,
+									  ((OpExpr *) node)->args,
+									  ((OpExpr *) node)->inputcollid,
+									  false))
+				return true;
+			break;
+		case T_ScalarArrayOpExpr:
+			set_sa_opfuncid((ScalarArrayOpExpr *) node);
+			if (!lion_keytest_fn_safe(((ScalarArrayOpExpr *) node)->opfuncid,
+									  ((ScalarArrayOpExpr *) node)->args,
+									  ((ScalarArrayOpExpr *) node)->inputcollid,
+									  true))
+				return true;
+			break;
+		case T_CoerceViaIO:
+			/* a value's text: its output function, then text's input */
+			if (((CoerceViaIO *) node)->resulttype != TEXTOID)
+				return true;
+			break;
+		default:
+			return true;
+	}
+	return expression_tree_walker(node, lion_keytest_fail_walker, context);
+}
+
+/* ... and whether none of them can (see above) */
+static bool
+lion_keytest_cannot_fail(Node *clause)
+{
+	return !lion_keytest_fail_walker(clause, NULL);
+}
+
+#if PG_VERSION_NUM < 180000
+/* The rows of the live members of the inherited table relid, leaf by leaf. */
+static double
+lion_keytest_member_rows(PlannerInfo *root, Index relid)
+{
+	double		rows = 0.0;
+	ListCell   *lc;
+
+	foreach(lc, root->append_rel_list)
+	{
+		AppendRelInfo *appinfo = (AppendRelInfo *) lfirst(lc);
+		RelOptInfo *child;
+
+		if (appinfo->parent_relid != relid)
+			continue;
+		child = root->simple_rel_array[appinfo->child_relid];
+		if (child == NULL || IS_DUMMY_REL(child))
+			continue;
+		if (root->simple_rte_array[appinfo->child_relid]->inh)
+			rows += lion_keytest_member_rows(root, appinfo->child_relid);
+		else
+			rows += child->tuples;
+	}
+	return rows;
+}
+#endif
+
+/*
+ * The rows of the table rel reads, which the keys of a column a test of each
+ * key walks are held to a share of: rel->tuples.  For a partitioned or
+ * inherited table that is its members' rows from PostgreSQL 18 on, and before
+ * it the rows the WHERE leaves of them (set_append_rel_size()), which would
+ * hold the keys to a share of the rows the test itself picks; so before 18
+ * the members' are added up here, as 18 adds them.
+ */
+static double
+lion_keytest_table_rows(PlannerInfo *root, RelOptInfo *rel)
+{
+#if PG_VERSION_NUM < 180000
+	if (rel->reloptkind == RELOPT_BASEREL &&
+		root->simple_rte_array[rel->relid]->inh)
+		return Max(lion_keytest_member_rows(root, rel->relid), rel->tuples);
+#endif
+	return rel->tuples;
+}
+
+/*
+ * The keys of the column a test of each key walks: the table's, whatever the
+ * WHERE leaves of its rows (which estimate_num_groups() would scale them
+ * by); *isdefault where the column has no statistics and this is core's
+ * guess.
+ *
+ * get_variable_numdistinct() scales a relative estimate - a column whose keys
+ * grow with its rows, a unique one - and the guess for a table of fewer rows
+ * than DEFAULT_NUM_DISTINCT by rel->tuples, which of an inherited table
+ * before PostgreSQL 18 is the rows the WHERE leaves of it
+ * (lion_keytest_table_rows()).  Those are made of its members' rows here, as
+ * 18 makes them.
+ */
+double
+lion_keytest_keys(PlannerInfo *root, Var *var, bool *isdefault)
+{
+	VariableStatData vardata;
+	double		nd;
+
+	examine_variable(root, (Node *) var, 0, &vardata);
+	nd = get_variable_numdistinct(&vardata, isdefault);
+#if PG_VERSION_NUM < 180000
+	if (!*isdefault && vardata.rel != NULL && vardata.rel->tuples > 0.0)
+	{
+		double		rows = lion_keytest_table_rows(root, vardata.rel);
+		double		stadistinct = 0.0;
+		double		stanullfrac = 0.0;
+
+		if (HeapTupleIsValid(vardata.statsTuple))
+		{
+			Form_pg_statistic stats;
+
+			stats = (Form_pg_statistic) GETSTRUCT(vardata.statsTuple);
+			stadistinct = stats->stadistinct;
+			stanullfrac = stats->stanullfrac;
+		}
+		else if (vardata.vartype == BOOLOID)
+			stadistinct = 2.0;
+		if (vardata.isunique)
+			stadistinct = -1.0 * (1.0 - stanullfrac);
+
+		if (rows > vardata.rel->tuples && stadistinct < 0.0)
+			nd = clamp_row_est(-stadistinct * rows);
+		else if (rows > vardata.rel->tuples && stadistinct == 0.0)
+		{
+			if (rows < DEFAULT_NUM_DISTINCT)
+				nd = clamp_row_est(rows);
+			else
+			{
+				nd = DEFAULT_NUM_DISTINCT;
+				*isdefault = true;
+			}
+		}
+	}
+#endif
+	ReleaseVariableStats(vardata);
+	return Max(nd, 1.0);
+}
+
+bool
+lion_keytest_leaf(PlannerInfo *root, Node *clause, Index rti,
+				  LionLeafInfo *out)
+{
+	List	   *vars;
+	ListCell   *lc;
+	Var		   *var = NULL;
+	TypeCacheEntry *typentry;
+	Oid			lefttype;
+	Oid			righttype;
+	Node	   *nulled;
+
+	memset(out, 0, sizeof(LionLeafInfo));
+	if (!lion_enable_key_tests || clause == NULL ||
+		exprType(clause) != BOOLOID)
+		return false;
+	if (contain_mutable_functions(clause) || contain_subplans(clause) ||
+		!lion_keytest_cannot_fail(clause))
+		return false;
+
+	vars = pull_var_clause(clause, PVC_INCLUDE_PLACEHOLDERS);
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!IsA(v, Var) || v->varno != (int) rti || v->varlevelsup != 0 ||
+			v->varattno <= 0 || LION_ATTNO_IS_VCOL(v->varattno) ||
+			(var != NULL && v->varattno != var->varattno))
+			return false;
+		var = v;
+	}
+	if (var == NULL)
+		return false;
+
+	/* a column of few keys, by statistics it has */
+	{
+		RelOptInfo *rel = find_base_rel(root, rti);
+		bool		isdefault;
+		double		nd = lion_keytest_keys(root, var, &isdefault);
+
+		if (isdefault ||
+			nd > Max(lion_keytest_table_rows(root, rel) *
+					 LION_KEYTEST_MAX_KEY_SHARE, 1.0))
+			return false;
+	}
+
+	typentry = lookup_type_cache(var->vartype, TYPECACHE_EQ_OPR);
+	if (!OidIsValid(typentry->eq_opr))
+		return false;
+	op_input_types(typentry->eq_opr, &lefttype, &righttype);
+	if (!OidIsValid(get_array_type(righttype)))
+		return false;
+
+	/* NULL or false where the column is NULL */
+	nulled = lion_keytest_fold(root, clause, var,
+							   (Node *) makeNullConst(var->vartype,
+													  var->vartypmod,
+													  var->varcollid));
+	if (!IsA(nulled, Const) ||
+		!(((Const *) nulled)->constisnull ||
+		  !DatumGetBool(((Const *) nulled)->constvalue)))
+		return false;
+
+	out->var = var;
+	out->val = clause;
+	out->opno = typentry->eq_opr;
+	out->cmptype = righttype;
+	out->strategy = LION_STRAT_EQUAL;
+	out->kind = LION_CLAUSE_ARRAY;
+	out->collation = var->varcollid;
+	out->keytest = true;
+	out->costclause = lion_keytest_costclause(root, var, clause,
+											  typentry->eq_opr, righttype);
+	return true;
+}
+
+/*
  * Append one analysed clause to the parallel lists the planner carries.  The
  * flattened clause array holds the leaves of an OR restriction alongside the
  * plain clauses (DESIGN.md §19), so everything that follows - matching an
@@ -2689,6 +3373,7 @@ lion_append_clause(const LionLeafInfo *leaf, Node *clause, bool inor,
 	ci->collation = leaf->collation;
 	ci->inor = inor;
 	ci->positions = leaf->positions;
+	ci->keytest = leaf->keytest;
 	ci->rinfono = -1;			/* the caller's to say */
 	ci->clause = (leaf->costclause != NULL && leaf->costexact) ?
 		leaf->costclause : clause;

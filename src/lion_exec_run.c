@@ -1341,6 +1341,11 @@ lion_scan_sums_add(LionScanWorkerSums *sums, const LionCountScanState *st)
 	if (st->lbatch != NULL)
 		sums->listbatches += st->lbatch->batches;
 	sums->listbatches += st->glistbatches;
+	for (i = 0; i < st->nclause; i++)
+	{
+		sums->keystested += st->clause[i].keystested;
+		sums->keyspassed += st->clause[i].keyspassed;
+	}
 	if (dr != NULL)
 	{
 		sums->decodepasses += dr->passes;

@@ -2,7 +2,9 @@
  * lion_arena.h
  *	  An allocator over a temporary file mapped into memory: where a
  *	  LionOrdered set lives once it outgrows hash_mem (DESIGN.md §30.4,
- *	  "Spilling").
+ *	  "Spilling").  With no file it maps anonymous memory instead: where a
+ *	  bitmap scan gathers its TIDs by heap block (DESIGN.md §28, "Many keys
+ *	  into one bitmap").
  *
  *	  The arena maps the file in regions, each a whole number of
  *	  LION_ARENA_GRAIN bytes, doubling in size to LION_ARENA_REGION_MAX, and
@@ -24,6 +26,12 @@
  *	  at the first write to it would end the process with SIGBUS - and what
  *	  lets the caller's file layer count the bytes (temp_file_limit,
  *	  log_temp_files).
+ *
+ *	  Without a file (`fd` NULL, `extend` unused) each region is a private
+ *	  anonymous mapping, zero filled by the kernel page by page as it is
+ *	  first touched: memory of the process's own that malloc() never sees,
+ *	  so that what the arena maps and unmaps leaves the heap's shape, and
+ *	  malloc's choices of what to give back to the kernel, as they were.
  *
  *	  No palloc, no elog: the struct and the regions' array are the
  *	  caller's, a failure comes back as NULL with errno set, and the file is
@@ -112,7 +120,8 @@ lion_arena_class_size(int cls)
 /*
  * Set up an arena over no regions yet, with room for maxregions of them in
  * the caller's array; the file is extended and mapped through the
- * callbacks, with arg.
+ * callbacks, with arg - or, when fd is NULL, there is no file and the
+ * regions are anonymous memory.
  */
 extern void lion_arena_init(LionArena *a, LionArenaRegion *regions,
 							int maxregions, LionArenaExtend extend,

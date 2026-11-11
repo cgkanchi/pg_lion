@@ -2296,7 +2296,10 @@ Planner integration
     The target list holds those counts, the columns the rules below let it print, and any
     expression over them; window functions over them are computed above the node ("Shapes
     rewritten to the node's counts" at the end of this section). `count(*) OVER ()` over the
-    table's own rows is the node's count beside them ("A count of every row beside the rows").
+    table's own rows is the node's count beside them ("A count of every row beside the rows"), a
+    LIMIT over rows that read no column takes as many as the count ("A count capped by a LIMIT"),
+    and a `min` or `max` beside the counts is a one-row ordered walk ("A count beside min or
+    max").
   - **HAVING** is accepted when it is a filter the node can apply itself. By the time the hook runs,
     `havingQual` is an implicit-AND list of only those clauses that mention an aggregate (or are
     volatile, or contain a subquery): `subquery_planner()` has moved every other clause into WHERE,
@@ -4000,6 +4003,110 @@ ms to 1.2 ms; with `status = 'paid'` alone (400,000 rows) 249 ms to 0.3 ms; no W
 ms; OFFSET 200 under two filters 70 ms to 3.9 ms. Without a LIMIT both read every row (42 ms and
 39 ms).
 
+### A count capped by a LIMIT (2026-11-10)
+
+`SELECT count(*) FROM (SELECT 1 FROM t WHERE ... LIMIT 10001) s`: a count that stops at a cap, to
+print "10,000+" (`lion_count_rows.c`). The subquery is planned on its own, and core's plan for it is a
+LIMIT over a scan that reads every row the LIMIT takes, with its heap page, for the Aggregate above
+to count. Nothing above reads a column of those rows - core makes each column the outer query does
+not read a NULL before it plans the subquery (`remove_unused_subquery_outputs()`) - so every row is
+the same row, and how many there are is the count of t under the WHERE, less the OFFSET, up to the
+LIMIT.
+
+**The plan.** At UPPERREL_FINAL over one base relation, `lion_try_count_rows_path()` takes a LIMIT,
+an OFFSET or both (not WITH TIES) over the relation's FROM and WHERE with no grouping, window,
+DISTINCT, ORDER BY, set operation, row mark or set-returning function, whose target holds no Var,
+nothing volatile and no subquery. It counts the relation under its WHERE into a rel of its own, as
+LionWindowCount does (§39's units pinned for the final rel, whose competitor is the LIMIT over a
+scan), and adds the LionCountRows node over that count. Its rows are the LIMIT's estimate
+(`adjust_limit_rows_costs()`), its startup the count's total, and each row a `cpu_tuple_cost`.
+An EXISTS subquery the planner cannot pull up (`... LIMIT 1 OFFSET 0`) is the same shape, so its
+SubPlan is the node when one count costs less than the scan to the first row.
+
+**Execution.** The OFFSET and LIMIT are the node's `custom_exprs`, evaluated as `recompute_limits()`
+in nodeLimit.c evaluates them, before anything is read: a NULL OFFSET is 0, a NULL LIMIT is ALL, a
+negative one raises the Limit's error, and LIMIT 0 returns nothing without counting. Then the count
+runs once and the node returns `max(0, min(count - offset, limit))` rows of its target, which reads
+nothing below it (`custom_scan_tlist` is empty). A rescan evaluates the OFFSET and LIMIT again and
+counts again only when a parameter of the count changed, so a LIMIT that changes with each outer
+row costs one count. EXPLAIN prints the OFFSET and LIMIT. The node reads forward only: a
+scrollable cursor's plan has a Material above it.
+
+**Exact.** The count is the number of rows the LIMIT's scan would have found, under the same
+snapshot (§9, §11). A volatile clause, which core's plan evaluates for as many rows as the LIMIT
+needs and the count for every row, declines. So does the count's plan with a residual clause (§10)
+that can raise an error: one that hands a column to a function not marked leakproof, such as
+`100 / w > 20`, whose division by zero may be in a row past the ones the LIMIT reads
+(`lion_residual_ok()` under `lion_try_count_path_leakproof()`). Clauses a posting set answers
+evaluate nothing per row and are unaffected.
+
+`pg_lion.enable_count_rows` turns it off, as `enable_count_pushdown` does. `test/sql/countrows.sql`
+compares each shape with the LIMIT's answer over NULLs and dead and updated rows: LIMIT past the
+count, OFFSET alone and past the count, NULL and subquery LIMIT and OFFSET, FETCH FIRST, a subquery
+that selects columns nobody reads, a constant target read above, the declines (a residual clause
+that divides by zero past the LIMIT among them), the negative LIMIT and OFFSET errors, LIMIT 0 with
+the count never run, generic plans, rescans, a scrollable cursor and a partitioned table. 2M rows, vacuumed, PostgreSQL 18 (release build), against the LIMIT:
+`... WHERE status = 'paid' AND country = 'c7' LIMIT 10001` 40 ms to 0.9 ms; with a third filter 34
+ms to 1.0 ms; with `status = 'paid'` alone (400,000 rows) 2.8 ms to 0.7 ms. Most of what is left
+is the Aggregate counting the rows the node returns.
+
+### A count beside min or max (2026-11-10)
+
+`SELECT count(*), min(ts), max(ts) FROM t WHERE ...` (`lion_minmax.c`). Core answers `min(ts)` or
+`max(ts)` from the first row of an ordered scan under the WHERE (planagg.c), but only when every
+aggregate of the query is a min or a max; beside a `count(*)` it is one Agg over every row the WHERE
+selects. The node's count answers the count, but a min or max only of a sliced column (§52) or with
+no WHERE, by walking every key.
+
+**The plan.** At UPPERREL_GROUP_AGG over one base relation with no GROUP BY, HAVING, window or
+DISTINCT, `lion_minmax_prepare()` sorts the grouped target's aggregates as `can_minmax_aggs()` would:
+each min or max with one argument, no ORDER BY or FILTER, nothing mutable in the argument and not a
+row type is a walk - once for each aggregate and argument, as core's `MinMaxAggInfo` - and every
+other aggregate is the count's. It needs one of each. For each walk it builds the subquery planagg.c
+builds,
+
+    SELECT ts FROM t WHERE <the relation's clauses> AND ts IS NOT NULL ORDER BY ts LIMIT 1
+
+with its own copy of the range table entry and its permission info, and plans it with
+`subquery_planner()` as a subquery of the query, so its path is whichever walk is cheapest - a
+btree, a LionOrdered, a sort when there is nothing better - and gives it an output Param. The
+subqueries are planned with lion's own hooks, so this runs before the hook pins its competitor or
+begins the endpoint probe. `lion_try_count_minmax_path()` then counts the other aggregates into a
+rel of their own (§39's units, the Agg the competitor) and adds the LionCountMinMax node over that
+count, priced as the count's total plus each walk's cost.
+
+**What it declines.** The WHERE must be one a subquery can carry: no SubPlan, PlaceHolderVar or
+pseudoconstant, no Param of an outer query (a correlated subquery's WHERE stays with the Agg), no
+volatile function, no row-level security or security-barrier level, no TABLESAMPLE. setrefs.c puts a
+walk's Param in place of every aggregate of its function and argument, FILTER or not
+(`find_minmax_agg_replacement_param()`), so no other aggregate may share a walk's function and
+argument.
+
+**The plan, made.** When the node is chosen, each walk's plan becomes an InitPlan of the query
+(`SS_make_initplan_from_plan()`, as `create_minmaxagg_plan()` does) and `root->minmax_aggs` the walks,
+so that setrefs.c makes each min or max its Param in every plan node of the query, a Sort above
+included. The count child's aggregates are the node's `custom_scan_tlist`, which the target's other
+aggregates become references to. The node returns the count child's one row with the target
+computed over it, and EXPLAIN prints the InitPlans above the count, as for core's MinMaxAgg.
+EXECUTE on each min and max is asked at startup as ExecInitAgg() asks it; the count asks it of its
+own. A rescan reads the count again only when a parameter of it changed; the InitPlans are core's
+to run again.
+
+**Exact.** The count and the walks read the same relation and clauses under the statement's
+snapshot. A walk's first row is the min or max over the rows the WHERE selects, NULLs left out, as
+core's MinMaxAgg answers it; with no row it is NULL, as the aggregate over no rows is.
+
+`pg_lion.enable_count_minmax` turns it off, as `enable_count_pushdown` does.
+`test/sql/countminmax.sql` compares each shape with the Agg's answer over NULLs in the min and max
+columns and dead and updated rows at both ends: min, max or both, of one column or two, `count(1)`,
+expressions over them, `min(DISTINCT ...)`, an empty result, a WHERE on the column, an ORDER BY, the
+declines, generic plans, a rescan (count and walks made once), a partitioned table, row-level
+security and the EXECUTE check. 2M rows, vacuumed, PostgreSQL 18 (release build), against the plan
+without the node: `count(*), max(ts) ... WHERE status = 'paid'` (400,000 rows) 61 ms to 0.4 ms;
+`count(*), min(ts), max(ts)` under two filters (8,000 rows) 42 ms to 0.7 ms; the same with no WHERE
+110 ms (a LionCount walking every key of ts) to 0.6 ms; `count(*), max(amount)` of a sliced column
+under two filters 3.9 ms (the slices) to 1.1 ms (a LionOrdered walk of amount).
+
 ### Filtered counts
 
 `count(*) FILTER (WHERE c)`, `count(CASE WHEN c THEN 1 END)`, `sum(CASE WHEN c THEN 1 ELSE 0
@@ -4197,6 +4304,100 @@ the table larger than shared_buffers): `count(*) WHERE c20 = 3 AND payload LIKE 
 bitmap heap scan; `c200 = 17 AND payload LIKE 'ab%'` 9.3 to 8.7 against a plain lion index scan.
 `test/sql/countresid.sql` checks the shapes against the sequential plan, with dead versions the
 residual must not see; `node_contracts.sql` revokes `int4mod` under a residual.
+
+### A test of each key (2026-11-10)
+
+A WHERE clause of one column that no posting set answers as it stands - `lower(status) = 'paid'`,
+`country ILIKE 'c1%'`, `country ~ '^c[12]$'`, `kind % 5 = 0` - is, on a column of few keys, the IN
+list of the keys that pass it. The node walks the column's entries, evaluates the clause once per
+key, and locates the keys that pass as it locates any IN list (§15): a batch at a time past
+`lion_array_batch_size()`, or collected beside a GROUP BY. No row is fetched for it, where a
+residual clause (above) fetches every row the other clauses select and the ordinary plan reads the
+table.
+
+**Which clauses** (`lion_keytest_leaf()`, tried where `lion_analyze_leaf()` finds nothing):
+
+- it reads one user column of the table and nothing else of it - no system column, no expression
+  column (§41) - and is immutable, with no subplan: a key's answer is every row's of that key,
+  however often and wherever it is evaluated. Parameters are allowed as values (`lower(s) = $1`),
+  and evaluated with it, but not as patterns (below);
+- the index holds the rows' own values (`lion_index_can_emit_value()`, the value-representation
+  rule above, checked where the index is matched): numeric's 1.0 and 1.00 are one entry, and
+  `n::text = '1.00'` is true of one of them only;
+- it is NULL or false where the column is NULL, proved by folding it with a NULL in the column's
+  place: the NULL entry, which the list never holds, holds no row it selects;
+- it can raise no error on any value of the column (`lion_keytest_cannot_fail()`): every function it
+  calls is leakproof, or one that fails on nothing or only on its other, constant arguments, which
+  are checked - text's case mapping, lengths, trims, `left()`, `right()`, two-argument `substr()`
+  and `||`; LIKE, ILIKE and the regular expressions of the column against a constant pattern under a
+  deterministic collation, a LIKE pattern not ending in its escape character, a regular expression
+  that compiles (`pg_regcomp()`, which returns the error `RE_compile_and_cache()` raises); a
+  division by a constant other than 0 and -1 (`INT_MIN / -1` overflows), a remainder by one other
+  than 0; a value's text. The walk tests keys a sequential scan may never evaluate the clause on:
+  one whose every row another clause rejects, which the scan tests first because it orders a row's
+  clauses by their cost, so that `z <> 0 AND 12 / z > 1` raises nothing there. A clause that cannot
+  fail does not depend on that order, nor does the cost model's fold of it on the most common values
+  (below), which runs before any row is read, and may meet a value no row holds any more. So a
+  pattern known only at run time - a parameter's, an outer row's - is declined: it may fail on some
+  keys and not on others (`c LIKE $1` with `'a\'` fails on `'ab'`, not on `'ba'`), or on every one;
+- the column has few keys by its statistics: no more than a hundredth of the table's rows
+  (`LION_KEYTEST_MAX_KEY_SHARE`), a partitioned table's being its members' rows. Before PostgreSQL
+  18 the planner gives a partitioned table the rows its WHERE leaves of them instead, and scales a
+  column's keys by those where its statistics are relative to the rows, so
+  `lion_keytest_table_rows()` and `lion_keytest_keys()` make both of the members' rows, as 18 does.
+  The list is held whole, as a parameter's of any length is, and every key is tested.
+
+An OR of the one column is one test, taken whole (`upper(c) = 'C1' OR c = 'c5'`); an OR across
+columns is not. A LIKE prefix is the range it spells ("Other spellings of answered clauses", above)
+and takes no test, but in an OR the posting sets otherwise answer - `c LIKE 'c1%' OR c = 'c5'` - its
+range is a leaf of a union, collected with no pin (§32), which a count with no other pinned source
+declines. Where such an OR could be a test, the build that takes the union is made once more with
+the OR's keys tested instead (`lion_count_path_or_range()`), and add_path() keeps the cheaper. The
+clause may stand in a count, a GROUP BY (§36's derived groups included), a count(DISTINCT), over a
+partitioned table, whose every partition tests its own keys, and in the parallel count and GROUP BY,
+whose participants each make the list. Not in a filtered count's condition or beside filtered
+counts, a count by cells, the FK-side join, the anti join, the decoded walk, §37's aggregates over
+keys, a SELECT DISTINCT's keys or the top k (`lion_count_path_keytest_ok()`). Where a build takes a
+test, it is made once more with the clause left to what else would take it - residual, or the
+ordinary plan - and add_path() keeps the cheaper: a few rows the other clauses select are fetched
+for less than every key is tested, and a shape that takes no test may take a residual clause.
+
+**A key no visible row holds** is not tested either: the walk first asks whether a row the snapshot
+sees holds the key (the existence test of a count(DISTINCT) walk, §26, against the key's set alone)
+and releases the set before the clause runs. So the keys tested are those a sequential scan sees.
+
+**How it is carried.** The leaf is an ARRAY clause on the column under the type's own equality, its
+value the clause itself, flagged `LION_CLAUSE_KEYTEST` in CLAUSEKINDS (shape 35).
+`lion_plan_custom_path()` adds the column to `custom_scan_tlist` as a resjunk `LION_TL_RESID` one,
+as for a residual clause, so setrefs.c points the clause's Var at it, records its functions as
+plan dependencies and sees its Params. `lion_begin_keytest()` initialises it with ExecInitQual()
+over a virtual slot of the scan tuple, which checks EXECUTE on what it calls; `lion_keytest_values()`,
+at the start of each relation's turn and each run (`lion_locate_where()`), puts each key in the
+column's place, evaluates the clause and makes the array of the keys that pass, in a context of the
+clause's own. A LATERAL value in the clause makes a new list per outer row. Only the relation's own
+items are tested: a partition whose bounds imply the clause (§16) leaves it out and walks nothing.
+
+**The price** (`lion_count_path_keytest_price()`): per key of the column, by its statistics, in each
+relation counted, the entry's read (`LION_RANGE_ENTRY_COST`), the existence test
+(`LION_DISTINCT_TEST_COST`) and the clause's evaluation, all at startup, and whole in each
+participant of a parallel count or GROUP BY, which each make the list (`LionRangeCost.keys`). The
+rows it selects are priced as the IN list of the most common values that pass it, folded on each at
+plan time (`lion_keytest_costclause()`), where those hold all but a hundredth of the column's
+non-NULL rows and the user may read every row of the column (`acl_ok`, as core's estimates ask
+before a function that is not leakproof sees a value of the statistics), and by core's estimate of
+the clause otherwise.
+
+Measured on 2M rows (PostgreSQL 18.7 release build, warm, `status` of 5 values, `country` of 50,
+`kind` of 20), against the plan with `pg_lion.enable_key_tests` off and a sequential scan: `count(*)
+WHERE lower(status) = 'paid'` 0.4 ms against 458 and 457; `country ILIKE 'C1%'` 2.2 against 655 and
+621; `country ~ '^c[12]$'` 0.5 against 411 and 448; `status, count(*) WHERE country ILIKE 'C1%'
+GROUP BY status` 4.1 against 609 and 601; `kind % 5 = 0` 1.2 against 120 and 118.
+
+EXPLAIN prints the clause as itself, `t_c ((c ~~* 'C1%'::text))`, and ANALYZE counts `Keys Tested`
+and `Keys Passed` over every relation, run and participant. `pg_lion.enable_key_tests` turns it
+off. `test/sql/where_keytest.sql` checks the shapes against the sequential plan, with a key only
+deleted rows hold, updated rows, partitions, generic plans, a LATERAL rescan and the clauses
+declined, run-time patterns among them.
 
 ### Filtered counts, residual clauses and complements beside the other shapes
 
@@ -5258,8 +5459,9 @@ Tests: `test/sql/scan_notnull.sql` (§29.12).
 ## 15. IN lists and ScalarArrayOp (v1, implemented)
 
 AM: `amsearcharray = true`. liongetbitmap receives an SK_SEARCHARRAY key whose argument is an array
-datum: deconstruct it, skip NULL elements, look up each value and emit its set. Duplicates are not
-filtered there - set semantics make them harmless, they only cost a second lookup.
+datum: deconstruct it, skip NULL elements, look up each value and emit its set, through the batch of
+§28 ("Many keys into one bitmap") when there are several. Duplicates are not filtered there - set
+semantics make them harmless, they only cost a second lookup.
 
 Count pushdown: accept `ScalarArrayOpExpr` with useOr = true whose operator is strategy 1 of the
 index opfamily and whose array is a non-NULL one-dimensional Const of at most LION_MAX_LIST_ELEMS =
@@ -10846,10 +11048,12 @@ lion_ordered.c, lion_bm25_scan.c, lion_selfuncs.c, lion_wal.c): `create_upper_pa
 `set_join_pathlist_hook`; `set_rel_pathlist_hook` three times over - `LionOrdered` (§30), `LionBm25`
 (§39) and the plain-scan repricing with the row correction (§33, §40), installed in that order, so
 the repricing runs first -; `get_relation_stats_hook` and `get_index_stats_hook` (§33, §41);
-since §55, `ExecutorStart_hook`, `ExecutorEnd_hook` and `ProcessUtility_hook`, which write a
-statement's buffered inserts before a query or a utility command and note `INSERT ... ON CONFLICT`
-runs, and a transaction and a subtransaction callback (lion_defer.c); and nothing else among the
-hooks - no planner or object-access hook -; a custom WAL resource manager, only while `shared_preload_libraries` is processed; its GUCs, with the
+`planner_hook` (§56, lion_plan_lateral.c), which calls the previous hook - or
+`standard_planner()` - once, or twice for a query it rewrites; since §55, `ExecutorStart_hook`,
+`ExecutorEnd_hook` and `ProcessUtility_hook`, which write a statement's buffered inserts before a
+query or a utility command and note `INSERT ... ON CONFLICT` runs, and a transaction and a
+subtransaction callback (lion_defer.c); and nothing else among the hooks - no object-access hook
+-; a custom WAL resource manager, only while `shared_preload_libraries` is processed; its GUCs, with the
 `pg_lion` prefix reserved by `MarkGUCPrefixReserved()`. Every hook saves the previous value and
 calls it: all but one planner hook FIRST, adding their own path after (`lion_create_upper_paths()`,
 `lion_ordered_set_rel_pathlist()`), so whichever extension was loaded before pg_lion has already
@@ -17262,7 +17466,9 @@ The walk emits entry by entry: an INLINE payload from the leaf's private copy, a
 `lion_emit_chain()` one page at a time, with nothing pinned between entries. A range of any width
 therefore holds at most one index pin at a time and draws nothing from §15's pin budget - the bitmap
 scan needs no §9 interlock at all, since the executor visits every TID it emits - and its memory is
-the TIDBitmap's own `work_mem` budget, which goes lossy rather than growing.
+about the TIDBitmap's own `work_mem` budget, which turns pages lossy to stay within it and is raised
+only when lossy pages cannot get it there, and about as much again for the TIDs it gathers by heap
+block on their way into the bitmap ("Many keys into one bitmap" below).
 
 On a column with SUMMARY posting sets (§32) the walk is the summed walk of a count
 (`lion_entry_scan_begin_summed()`, from `lion_walk_begin()`): the keys of the buckets at the range's
@@ -17351,6 +17557,89 @@ recheck only on a column that has an equality or a list of its own. `test/sql/ra
 has the shape - a synthetic table, the bound a literal, a stable expression and a generic plan's
 parameter, with and without summaries - at a `work_mem` that holds the answer exactly and the range
 alone lossily: no row removed by the recheck and no lossy page.)*
+
+### Many keys into one bitmap
+
+A TIDBitmap finds a heap page's entry by hashing its block number, once for each run of TIDs on one
+page that `tbm_add_tuples()` is handed. One key's posting set comes in TID order, a page at a time.
+A walk of many keys emits key after key, and on a column in no heap order each key's few rows are
+spread over the whole heap: every TID is then a run of its own and a lookup, a cache miss once the
+bitmap holds more pages than the cache. On a 5M-row table of 56,819 pages (PostgreSQL 18.7, warm
+cache) one key's 2.5M TIDs took 9 ns each; the same number from a range over 9,901 keys 39 ns and
+over 499,000 keys 62 ns, two thirds of it in the bitmap's hash table.
+
+So every walk of many keys - a range (this section), `IS NOT NULL` (§14), `< ANY` (above), the
+whole-index fallback of a multi-key query (§17) and a list of values (§15) - puts its items through
+a batch (`lion_tidbatch.c`) that gathers them by container key (§2: 64 heap blocks at 8K) and gives
+them to the bitmap a heap block at a time:
+
+- A container key's members are appended to an array of lo values; past `LION_ARRAY_MAX_CARD` (the
+  4 KB of a BITSET) the array is folded into a bitset, and from then on it is a buffer of 512
+  members folded in whenever it fills. Setting each TID's bit as it came would be a cache miss a TID
+  again once the bitsets outgrow the cache - 3.5 MB of them for the table above - where an append
+  writes to the cache line at the array's end. The keys' slots are found through a two-level
+  directory indexed by container key, not a hash.
+- What is kept goes to the bitmap when the walk is over, or whenever it outgrows `work_mem`: one
+  `tbm_add_tuples()` a heap block, an array counting-sorted by block first. The bound is
+  approximate: it counts the arena blocks handed out. What an item will take is reckoned before it
+  is kept - the directory chunks of 1,024 slots (24 KB each) it has no slots in yet, several for a
+  sparse item, the directory itself, grown once for the item (a pointer for each 65,536 heap blocks,
+  512 KB at 2^32 blocks), and its slots' arrays as they grow or fold into bitsets, each counted
+  whole since the array it replaces is given back only after - and when that would pass `work_mem`,
+  what is kept is flushed first; an item that could not fit even then goes to the bitmap at once.
+  Only a damaged item, whose members are not what its header says, can pass the bound; a check after
+  each item flushes then. The arena maps regions of 1 MB and more and keeps them across flushes;
+  only the pages written to take memory. The bitmap's own memory is the TIDBitmap's, as in any
+  bitmap scan.
+- It is kept in an arena of anonymous memory (`lion_arena.c` without a file), unmapped when the walk
+  ends or with the query's memory if it fails, not in palloc's. glibc's malloc gives the top of its
+  heap back to the kernel once it is free and larger than twice the largest block malloc has
+  unmapped, and a TIDBitmap's page table, which doubles, each table made before the last is freed,
+  leaves a heap of about that size; a few hundred kilobytes more from the batch tipped scans that
+  had stayed under that line over it, and the next scan faulted the whole heap in again (3,000
+  faults, 4 ms, on the table below).
+- An item of 512 members or more is a few TIDs a page already and goes to the bitmap at once.
+- Batching saves only the lookups of a page the bitmap already has. Until the bitmap has been given
+  as many TIDs as the heap had pages at its last VACUUM or ANALYZE (`relpages`), most TIDs are a
+  page's first, and they go to the bitmap at once: a narrow range over few rows costs what it did.
+- A walk in heap order already - a range over a column the rows were appended in the order of -
+  hands the bitmap its TIDs a page at a time without help. While the bitmap warms up, the batch
+  counts the runs of one heap block among the TIDs of the items under 512 members; at four TIDs a
+  run or more, the rest of the walk goes to the bitmap at once too.
+- A flush before the end that found fewer than two TIDs a page - a heap far larger than `work_mem`,
+  whose rows the walk spreads thinner than that between two flushes - stops the batching, and the
+  rest of the walk goes to the bitmap at once.
+
+A scan returns the same rows either way; only the order of `tbm_add_tuples()` calls changes. A
+bitmap that passes `work_mem` and turns pages lossy does so at a different moment, so other pages
+can end up lossy and a different number of rows is rechecked.
+Each walk's DEBUG1 line says how many TIDs went through the batch and in how many flushes
+(`test/sql/bitmap_heaporder.sql`, which checks every answer against a sequential scan: ranges above
+and below `relpages`, a list, `IS NOT NULL`, a multi-key fallback rechecked, a walk in heap order,
+several flushes at `work_mem` = 64kB, a lossy bitmap).
+
+Measured on the same rows with two columns in heap order added (61,729 pages), PostgreSQL 18.7
+release build, warm cache, `work_mem` = 4MB, the Bitmap Index Scan alone (median over three rounds
+of seven runs, each round alternating with the code before; the heap scan after it is unchanged):
+
+| Walk | Keys | TIDs | Before | After |
+|---|---:|---:|---:|---:|
+| `c200 BETWEEN 10 AND 110` | 101 | 2.54M | 97 ms | 42 ms |
+| `c20k BETWEEN 5000 AND 14900` | 9,901 | 2.47M | 108 ms | 50 ms |
+| `c1m BETWEEN 1000 AND 500000` | 495,641 | 2.50M | 156 ms | 93 ms |
+| `c20k IS NOT NULL` | 20,000 | 5.00M | 207 ms | 87 ms |
+| `c200 BETWEEN 10 AND 49` | 40 | 1.00M | 40 ms | 19 ms |
+| `c20k BETWEEN 5000 AND 8999` | 4,000 | 1.00M | 46 ms | 25 ms |
+| `c1m BETWEEN 1000 AND 200000` | 197,723 | 1.00M | 69 ms | 43 ms |
+| `c200 IN` (20 values) | 20 | 0.50M | 24 ms | 17 ms |
+| `c200 IN` (10 values), `c20k BETWEEN 5000 AND 5999` | 10, 1,000 | 0.25M | 14 to 16 ms | 14 ms |
+| narrower ranges (3 to 10,001 keys, 25k to 125k TIDs) | | | 3 to 10 ms | the same |
+| `ts BETWEEN 10000 AND 60000`: 50 rows a key, in heap order | 50,001 | 2.50M | 20 ms | the same |
+| `ts3 BETWEEN 100000 AND 900000`: 3 rows a key, in heap order | 800,001 | 2.40M | 84 ms | the same |
+
+At four TIDs a heap page or fewer there is little to gather, and the batch costs about what it
+saves; a walk in heap order goes to the bitmap at once after the warm-up. What is left on the
+widest walks is the walk itself: decoding half a million entries' items and appending their TIDs.
 
 ### amcostestimate
 
@@ -35461,3 +35750,113 @@ while another writer fills the same key and VACUUM empties part of it) and
 `test/isolation/summary_batch_race.spec` (a summary run parked between two holds while another
 writer closes the bucket it is filling); `test/sql/summary.sql` inserts a row at a time, so that its
 buckets are the same on PostgreSQL 16.
+
+## 56. A grouped subquery joined in, planned again as LATERAL (2026-11-10)
+
+    SELECT u.id, s.n
+      FROM users u
+      JOIN (SELECT user_id, count(*) AS n FROM events
+             WHERE status = 'paid' GROUP BY user_id) s ON s.user_id = u.id
+     WHERE u.plan = 'ent' AND u.region = 'r3';
+
+PostgreSQL plans the subquery on its own - every user's count, from every paid event - and joins
+the few users the outer side keeps to the result. The join clause cannot reach the subquery as a
+restriction, since it names another relation, and a grouped subquery is never pulled up into the
+join. Written by hand with the clause inside it,
+
+    JOIN LATERAL (SELECT user_id, count(*) AS n FROM events
+                   WHERE status = 'paid' AND user_id = u.id
+                   GROUP BY user_id) s ON true
+
+the subquery counts one key for each outer row, which LionCount answers from the sets of a lion
+index on `user_id` - the count pushdown's equality on a nested loop's parameter (§10).
+`pg_lion.enable_lateral_counts` (lion_plan_lateral.c) makes that rewrite itself and lets the
+planner choose.
+
+### 56.1 When the two are the same query
+
+`lion_lateral_rewrite()` moves a clause `s.k OP expr` (or `expr OP s.k`) of the outer query into
+the grouped subquery `s` as `k OP expr`, `expr`'s Vars one level up, and marks `s` LATERAL. That
+returns the same rows where:
+
+- **The clause is an equality of the grouping.** OP is strict, mergejoinable or hashjoinable, and
+  `equality_ops_are_compatible()` with the grouping's own equality on `k`, in the same collation:
+  rows the grouping puts in one group are then all equal to `expr` under OP or all unequal, so
+  filtering rows by OP before the grouping keeps or drops whole groups, and drops exactly the
+  groups the join would have dropped. A strict OP drops the NULL group either way.
+- **Every join of the outer query is an inner join**, so that nothing nullable sits between the
+  subquery and the relations `expr` reads, and `expr` reads only relations named before `s` in
+  the FROM list - those a LATERAL subquery may see - and no aggregate, window function, sublink
+  or volatile function.
+- **Nothing in the subquery's result depends on rows outside the group**, or on how many times
+  it runs: a plain `SELECT ... GROUP BY` (no grouping sets) with an aggregate, and no window
+  function, set-returning function in the target list, `DISTINCT`, `LIMIT`/`OFFSET`, row lock,
+  set operation, CTE, sublink or volatile function. `HAVING` and `FILTER` are a group's own, and
+  stay.
+- **`k` is a plain column of a table** (read through the group RTE from PostgreSQL 18 on), with
+  no row-level security on the subquery and no `security_barrier` view around it - the moved
+  clause would otherwise run beside the view's quals before them - and a lion index has the
+  column among its keys, so that a query that cannot gain is not planned twice.
+
+The clause is taken out of the outer query rather than kept there too: every group the rewritten
+subquery returns meets it, and kept it would be estimated a second time as a join filter (the
+example's join was estimated at 25 rows with it, 5,006 without, and returns 4,262). The rewrite is applied to every subquery that
+qualifies, each with its own clause.
+
+### 56.2 Which plan
+
+Which is faster turns on how many outer rows there are, which only the planner knows: one count
+per outer row against one grouping of every row. The planner hook (`lion_lateral_planner()`)
+plans the query as written, then the rewritten copy, and keeps the plan with the lower total
+cost. Both go through the previous hook, or `standard_planner()`. A cursor that asks for its
+first rows fast (`CURSOR_OPT_FAST_PLAN`) is planned as written only, the total costs not being
+what it is decided on, and so is a query planned in a parallel worker (a PL/pgSQL function's,
+say), where the next point needs a subtransaction, and one planned on a hot standby: a recovery
+conflict there cancels the statement, but met inside a subtransaction it ends the session
+(`ProcessRecoveryConflictInterrupt()`).
+
+The rewritten copy is planned inside a subtransaction, as a PL/pgSQL exception block runs, and an
+error from it - another extension's planner hook that does not take a LATERAL subquery, say - is
+dropped with its plan: the query as written already has one. A cancel, and anything above ERROR,
+is not dropped. `test/modules/lion_hooktest` has a planner hook that refuses LATERAL subqueries
+while `lion_hooktest.refuse_lateral` is on, and `make hookcheck` runs the example under it.
+
+The price is a second planning of a query that qualifies (0.53 ms against 0.38 for the example),
+and for any other a pass over its range table, or, where it has a grouped subquery, a copy of it
+and the checks above. Two consequences of the hook's place in the chain:
+
+- **pg_stat_statements** counts two plannings of a qualifying query when it was loaded before
+  pg_lion (its hook is then the previous one, called twice), and one when it was loaded after.
+- **The library has to be loaded before the query is planned.** pg_lion is otherwise loaded by
+  the first query that opens a lion index, in the middle of its planning, after the planner hook
+  would have run: preload it (`shared_preload_libraries` or `session_preload_libraries`), or that
+  first query of a session is planned as written.
+
+### 56.3 Measured
+
+PostgreSQL 18.7, release build, 2 parallel workers per gather, warm, best of 6; a synthetic
+`users` of 200,000 rows (lion indexes on `plan` and `region`) and `events` of 2,000,031 (lion
+indexes on `status` and `user_id`, 399,548 paid, a B-tree on `users.id`):
+
+| outer rows | as written (Hash Join over HashAggregate) | rewrite on | |
+| --- | --- | --- | --- |
+| 4,262 (the example) | 258 ms | 54 ms (Nested Loop over LionCount) | 4.8x |
+| 44,641 (`u.plan = 'ent'` alone) | 319 ms | 263 ms (as written kept; the LATERAL plan forced runs 464 ms) | 1.0x |
+
+### 56.4 Not done
+
+- A subquery named before the relations its clause reads (`FROM (SELECT ...) s JOIN users u`):
+  reordering the FROM list to put it after them is possible but not done.
+- An outer join to the subquery. `u LEFT JOIN (SELECT ...) s ON s.k = u.id` is the same query
+  as a `LEFT JOIN LATERAL` with the clause inside; the outer-join cases (which side the subquery
+  is on, which `ON` the clause is in) need checks of their own, and are left for later.
+- A grouping key that is an expression (`GROUP BY date_trunc('day', ts)`), which the clause
+  would have to match as an expression index's column.
+- `DISTINCT` without aggregates, the same idea as a semi join.
+
+Tests: `test/sql/lateral_count.sql` (the clause either way round, in `ON` beside other clauses,
+in `WHERE` over a comma join, an expression of the outer side, across integer widths, `HAVING`
+and `FILTER`, aggregates lion does not count per key, a join inside the subquery and a third
+relation outside it, two subqueries, a text key, a view, many outer rows, every decline above,
+the setting off, and a prepared statement's custom and generic plans; every answer compared with
+the setting off), and `test/modules/lion_hooktest/sql/hooks_lion_outer.sql` (the refusing hook).
