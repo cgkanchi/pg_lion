@@ -495,6 +495,9 @@ typedef struct LionCountPathBuild
 								 * added, its price */
 	List	   *vcols;			/* the expression columns (DESIGN.md §41) */
 	bool		distinctstage;	/* a SELECT DISTINCT's keys as the groups */
+	bool		leakproofresid; /* residual clauses only ones that raise no
+								 * error: the count of LionCountRows tests
+								 * rows its LIMIT never reaches */
 	int			ncompl;			/* ORs with a complement arm (§35) */
 	bool		runtimemulti;	/* a multi-key clause outside the ORs whose
 								 * query is known only at run time (§17) */
@@ -1840,10 +1843,13 @@ lion_all_as_and(Node *clause)
  * over the table's own user columns, Params and constants that calls
  * nothing volatile and holds no subplan, which the node evaluates as the
  * ordinary plan's scan would - with ExecInitQual() - on the rows the
- * snapshot sees.  Over a partitioned table, not one on a partitioning key
- * with a Param or a stable function in it: that is a clause run-time
- * pruning decides, and the node, which keeps the planner's partitions
- * (§16), would fetch the rows of every partition pruning skips to test it.
+ * snapshot sees.  For the count of a LIMIT's rows (lion_count_rows.c), also
+ * none that hands a column to a function not marked leakproof, which may
+ * raise an error - `100 / w > 20` - on a row the LIMIT would never read.
+ * Over a partitioned table, not one on a partitioning key with a Param or a
+ * stable function in it: that is a clause run-time pruning decides, and the
+ * node, which keeps the planner's partitions (§16), would fetch the rows of
+ * every partition pruning skips to test it.
  */
 static bool
 lion_residual_ok(LionCountPathBuild *cx, RestrictInfo *rinfo)
@@ -1858,6 +1864,8 @@ lion_residual_ok(LionCountPathBuild *cx, RestrictInfo *rinfo)
 		return false;
 	if (contain_subplans(clause) || contain_volatile_functions(clause) ||
 		contain_agg_clause(clause) || contain_window_function(clause))
+		return false;
+	if (cx->leakproofresid && contain_leaked_vars(clause))
 		return false;
 	vars = pull_var_clause(clause, PVC_INCLUDE_PLACEHOLDERS);
 	foreach(lc, vars)
@@ -7406,7 +7414,7 @@ static void
 lion_try_count_path_ext(PlannerInfo *root, RelOptInfo *input_rel,
 						RelOptInfo *output_rel, GroupPathExtraData *extra,
 						const LionFkJoin *fj, const LionSmallAnti *anti,
-						bool distinctstage)
+						bool distinctstage, bool leakproofresid)
 {
 	LionCountPathBuild cx;
 	LionPartialCands *cands;
@@ -7415,6 +7423,7 @@ lion_try_count_path_ext(PlannerInfo *root, RelOptInfo *input_rel,
 	lion_count_path_init(&cx, root, input_rel, output_rel, extra, fj);
 	cx.anti = anti;
 	cx.distinctstage = distinctstage;
+	cx.leakproofresid = leakproofresid;
 
 	if (!lion_count_path_query(&cx))
 		return;
@@ -7444,7 +7453,20 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				   const LionFkJoin *fj)
 {
 	lion_try_count_path_ext(root, input_rel, output_rel, extra, fj, NULL,
-							false);
+							false, false);
+}
+
+/*
+ * The same, for a count whose residual clauses (DESIGN.md §10) may only be
+ * ones that raise no error (lion_residual_ok()).
+ */
+void
+lion_try_count_path_leakproof(PlannerInfo *root, RelOptInfo *input_rel,
+							  RelOptInfo *output_rel,
+							  GroupPathExtraData *extra)
+{
+	lion_try_count_path_ext(root, input_rel, output_rel, extra, NULL, NULL,
+							false, true);
 }
 
 /*
@@ -7460,7 +7482,7 @@ lion_try_count_anti_path(PlannerInfo *root, RelOptInfo *input_rel,
 						 const LionSmallAnti *anti)
 {
 	lion_try_count_path_ext(root, input_rel, output_rel, extra, NULL, anti,
-							false);
+							false, false);
 }
 
 /*
@@ -7505,7 +7527,7 @@ lion_try_distinct_path(PlannerInfo *root, RelOptInfo *input_rel,
 	PG_TRY();
 	{
 		lion_try_count_path_ext(root, input_rel, output_rel, &extra, NULL,
-								NULL, true);
+								NULL, true, false);
 	}
 	PG_FINALLY();
 	{

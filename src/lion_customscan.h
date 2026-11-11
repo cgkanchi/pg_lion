@@ -4897,6 +4897,10 @@ extern void lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 								RelOptInfo *output_rel,
 								GroupPathExtraData *extra,
 								const LionFkJoin *fj);
+extern void lion_try_count_path_leakproof(PlannerInfo *root,
+										  RelOptInfo *input_rel,
+										  RelOptInfo *output_rel,
+										  GroupPathExtraData *extra);
 extern void lion_try_distinct_path(PlannerInfo *root, RelOptInfo *input_rel,
 								   RelOptInfo *output_rel);
 extern void lion_try_count_anti_path(PlannerInfo *root, RelOptInfo *input_rel,
@@ -4914,11 +4918,31 @@ extern void lion_try_distinct_agg_path(PlannerInfo *root,
 									   GroupPathExtraData *extra);
 
 /* lion_window.c */
+extern Path *lion_count_child_path(PlannerInfo *root, RelOptInfo *input_rel,
+								   RelOptInfo *upper_rel, List *aggs,
+								   bool leakproofresid);
 extern void lion_try_window_count_path(PlannerInfo *root,
 									   RelOptInfo *input_rel,
 									   RelOptInfo *window_rel);
 extern const CustomPathMethods lion_window_count_path_methods;
 extern const CustomScanMethods lion_window_count_scan_methods;
+
+/* lion_count_rows.c */
+extern void lion_try_count_rows_path(PlannerInfo *root, RelOptInfo *input_rel,
+									 RelOptInfo *final_rel,
+									 FinalPathExtraData *extra);
+extern const CustomPathMethods lion_count_rows_path_methods;
+extern const CustomScanMethods lion_count_rows_scan_methods;
+
+/* lion_minmax.c */
+extern List *lion_minmax_prepare(PlannerInfo *root, RelOptInfo *input_rel,
+								 RelOptInfo *grouped_rel);
+extern void lion_try_count_minmax_path(PlannerInfo *root,
+									   RelOptInfo *input_rel,
+									   RelOptInfo *grouped_rel,
+									   List *minmax);
+extern const CustomPathMethods lion_count_minmax_path_methods;
+extern const CustomScanMethods lion_count_minmax_scan_methods;
 
 /* lion_plan_hooks.c */
 extern Plan *lion_plan_join_agg_path(PlannerInfo *root, RelOptInfo *rel,

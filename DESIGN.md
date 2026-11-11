@@ -2291,7 +2291,10 @@ Planner integration
     The target list holds those counts, the columns the rules below let it print, and any
     expression over them; window functions over them are computed above the node ("Shapes
     rewritten to the node's counts" at the end of this section). `count(*) OVER ()` over the
-    table's own rows is the node's count beside them ("A count of every row beside the rows").
+    table's own rows is the node's count beside them ("A count of every row beside the rows"), a
+    LIMIT over rows that read no column takes as many as the count ("A count capped by a LIMIT"),
+    and a `min` or `max` beside the counts is a one-row ordered walk ("A count beside min or
+    max").
   - **HAVING** is accepted when it is a filter the node can apply itself. By the time the hook runs,
     `havingQual` is an implicit-AND list of only those clauses that mention an aggregate (or are
     volatile, or contain a subquery): `subquery_planner()` has moved every other clause into WHERE,
@@ -3994,6 +3997,110 @@ WindowAgg: `... WHERE status = 'paid' AND country = 'c7' ORDER BY ts DESC LIMIT 
 ms to 1.2 ms; with `status = 'paid'` alone (400,000 rows) 249 ms to 0.3 ms; no WHERE 455 ms to 0.7
 ms; OFFSET 200 under two filters 70 ms to 3.9 ms. Without a LIMIT both read every row (42 ms and
 39 ms).
+
+### A count capped by a LIMIT (2026-11-10)
+
+`SELECT count(*) FROM (SELECT 1 FROM t WHERE ... LIMIT 10001) s`: a count that stops at a cap, to
+print "10,000+" (`lion_count_rows.c`). The subquery is planned on its own, and core's plan for it is a
+LIMIT over a scan that reads every row the LIMIT takes, with its heap page, for the Aggregate above
+to count. Nothing above reads a column of those rows - core makes each column the outer query does
+not read a NULL before it plans the subquery (`remove_unused_subquery_outputs()`) - so every row is
+the same row, and how many there are is the count of t under the WHERE, less the OFFSET, up to the
+LIMIT.
+
+**The plan.** At UPPERREL_FINAL over one base relation, `lion_try_count_rows_path()` takes a LIMIT,
+an OFFSET or both (not WITH TIES) over the relation's FROM and WHERE with no grouping, window,
+DISTINCT, ORDER BY, set operation, row mark or set-returning function, whose target holds no Var,
+nothing volatile and no subquery. It counts the relation under its WHERE into a rel of its own, as
+LionWindowCount does (§39's units pinned for the final rel, whose competitor is the LIMIT over a
+scan), and adds the LionCountRows node over that count. Its rows are the LIMIT's estimate
+(`adjust_limit_rows_costs()`), its startup the count's total, and each row a `cpu_tuple_cost`.
+An EXISTS subquery the planner cannot pull up (`... LIMIT 1 OFFSET 0`) is the same shape, so its
+SubPlan is the node when one count costs less than the scan to the first row.
+
+**Execution.** The OFFSET and LIMIT are the node's `custom_exprs`, evaluated as `recompute_limits()`
+in nodeLimit.c evaluates them, before anything is read: a NULL OFFSET is 0, a NULL LIMIT is ALL, a
+negative one raises the Limit's error, and LIMIT 0 returns nothing without counting. Then the count
+runs once and the node returns `max(0, min(count - offset, limit))` rows of its target, which reads
+nothing below it (`custom_scan_tlist` is empty). A rescan evaluates the OFFSET and LIMIT again and
+counts again only when a parameter of the count changed, so a LIMIT that changes with each outer
+row costs one count. EXPLAIN prints the OFFSET and LIMIT. The node reads forward only: a
+scrollable cursor's plan has a Material above it.
+
+**Exact.** The count is the number of rows the LIMIT's scan would have found, under the same
+snapshot (§9, §11). A volatile clause, which core's plan evaluates for as many rows as the LIMIT
+needs and the count for every row, declines. So does the count's plan with a residual clause (§10)
+that can raise an error: one that hands a column to a function not marked leakproof, such as
+`100 / w > 20`, whose division by zero may be in a row past the ones the LIMIT reads
+(`lion_residual_ok()` under `lion_try_count_path_leakproof()`). Clauses a posting set answers
+evaluate nothing per row and are unaffected.
+
+`pg_lion.enable_count_rows` turns it off, as `enable_count_pushdown` does. `test/sql/countrows.sql`
+compares each shape with the LIMIT's answer over NULLs and dead and updated rows: LIMIT past the
+count, OFFSET alone and past the count, NULL and subquery LIMIT and OFFSET, FETCH FIRST, a subquery
+that selects columns nobody reads, a constant target read above, the declines (a residual clause
+that divides by zero past the LIMIT among them), the negative LIMIT and OFFSET errors, LIMIT 0 with
+the count never run, generic plans, rescans, a scrollable cursor and a partitioned table. 2M rows, vacuumed, PostgreSQL 18 (release build), against the LIMIT:
+`... WHERE status = 'paid' AND country = 'c7' LIMIT 10001` 40 ms to 0.9 ms; with a third filter 34
+ms to 1.0 ms; with `status = 'paid'` alone (400,000 rows) 2.8 ms to 0.7 ms. Most of what is left
+is the Aggregate counting the rows the node returns.
+
+### A count beside min or max (2026-11-10)
+
+`SELECT count(*), min(ts), max(ts) FROM t WHERE ...` (`lion_minmax.c`). Core answers `min(ts)` or
+`max(ts)` from the first row of an ordered scan under the WHERE (planagg.c), but only when every
+aggregate of the query is a min or a max; beside a `count(*)` it is one Agg over every row the WHERE
+selects. The node's count answers the count, but a min or max only of a sliced column (§52) or with
+no WHERE, by walking every key.
+
+**The plan.** At UPPERREL_GROUP_AGG over one base relation with no GROUP BY, HAVING, window or
+DISTINCT, `lion_minmax_prepare()` sorts the grouped target's aggregates as `can_minmax_aggs()` would:
+each min or max with one argument, no ORDER BY or FILTER, nothing mutable in the argument and not a
+row type is a walk - once for each aggregate and argument, as core's `MinMaxAggInfo` - and every
+other aggregate is the count's. It needs one of each. For each walk it builds the subquery planagg.c
+builds,
+
+    SELECT ts FROM t WHERE <the relation's clauses> AND ts IS NOT NULL ORDER BY ts LIMIT 1
+
+with its own copy of the range table entry and its permission info, and plans it with
+`subquery_planner()` as a subquery of the query, so its path is whichever walk is cheapest - a
+btree, a LionOrdered, a sort when there is nothing better - and gives it an output Param. The
+subqueries are planned with lion's own hooks, so this runs before the hook pins its competitor or
+begins the endpoint probe. `lion_try_count_minmax_path()` then counts the other aggregates into a
+rel of their own (§39's units, the Agg the competitor) and adds the LionCountMinMax node over that
+count, priced as the count's total plus each walk's cost.
+
+**What it declines.** The WHERE must be one a subquery can carry: no SubPlan, PlaceHolderVar or
+pseudoconstant, no Param of an outer query (a correlated subquery's WHERE stays with the Agg), no
+volatile function, no row-level security or security-barrier level, no TABLESAMPLE. setrefs.c puts a
+walk's Param in place of every aggregate of its function and argument, FILTER or not
+(`find_minmax_agg_replacement_param()`), so no other aggregate may share a walk's function and
+argument.
+
+**The plan, made.** When the node is chosen, each walk's plan becomes an InitPlan of the query
+(`SS_make_initplan_from_plan()`, as `create_minmaxagg_plan()` does) and `root->minmax_aggs` the walks,
+so that setrefs.c makes each min or max its Param in every plan node of the query, a Sort above
+included. The count child's aggregates are the node's `custom_scan_tlist`, which the target's other
+aggregates become references to. The node returns the count child's one row with the target
+computed over it, and EXPLAIN prints the InitPlans above the count, as for core's MinMaxAgg.
+EXECUTE on each min and max is asked at startup as ExecInitAgg() asks it; the count asks it of its
+own. A rescan reads the count again only when a parameter of it changed; the InitPlans are core's
+to run again.
+
+**Exact.** The count and the walks read the same relation and clauses under the statement's
+snapshot. A walk's first row is the min or max over the rows the WHERE selects, NULLs left out, as
+core's MinMaxAgg answers it; with no row it is NULL, as the aggregate over no rows is.
+
+`pg_lion.enable_count_minmax` turns it off, as `enable_count_pushdown` does.
+`test/sql/countminmax.sql` compares each shape with the Agg's answer over NULLs in the min and max
+columns and dead and updated rows at both ends: min, max or both, of one column or two, `count(1)`,
+expressions over them, `min(DISTINCT ...)`, an empty result, a WHERE on the column, an ORDER BY, the
+declines, generic plans, a rescan (count and walks made once), a partitioned table, row-level
+security and the EXECUTE check. 2M rows, vacuumed, PostgreSQL 18 (release build), against the plan
+without the node: `count(*), max(ts) ... WHERE status = 'paid'` (400,000 rows) 61 ms to 0.4 ms;
+`count(*), min(ts), max(ts)` under two filters (8,000 rows) 42 ms to 0.7 ms; the same with no WHERE
+110 ms (a LionCount walking every key of ts) to 0.6 ms; `count(*), max(amount)` of a sliced column
+under two filters 3.9 ms (the slices) to 1.1 ms (a LionOrdered walk of amount).
 
 ### Filtered counts
 
