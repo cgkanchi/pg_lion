@@ -3590,8 +3590,10 @@ would have. It is a count compared with zero, read the same way, so §26's argum
 covers it unchanged. It applies to a GROUP BY or DISTINCT with no aggregate in its target or HAVING
 that the node walks a group or a pair at a time - one column, two (§20), an IN list on the group
 column (§15), a GROUP BY folded to one group, `coalesce(col, c)` - and not to the decoded walk
-(§34), which counts every combination in one pass, the top k, which ranks by the counts, or the
-cells, the sums over slices and the aggregates over entries. As for a count(DISTINCT) of existence
+(§34), which counts every combination in one pass, the top k, which ranks by the counts, the
+cells, the sums over slices and the aggregates over entries, or a GROUP BY beside the anti join over
+a small inner side (§27), which subtracts the rows it drops from each group's count: from a test's
+one row that would lose a group that still has rows. As for a count(DISTINCT) of existence
 tests, the WHERE is not collected ("The WHERE sets, collected once"): a test reads a share of each
 intersection, and a collection could read more than every test together. The price is §26's for
 the same tests (`LION_DISTINCT_EXISTS`). The same plan with counts is priced beside it - it may
@@ -3599,11 +3601,12 @@ collect the WHERE and count the groups of a walk together (below), or divide the
 participants of a Gather ("A GROUP BY in parallel") - and add_path() keeps the cheaper. EXPLAIN
 prints `Group Strategy: First Visible Row`, and EXPLAIN ANALYZE `Groups Tested`.
 `test/sql/countshapes.sql` checks the shapes against a sequential scan, with a key whose every row
-is deleted or updated away and never vacuumed. 2M rows, vacuumed, PostgreSQL 18 (release build),
-against the same plan counting: `SELECT DISTINCT country ... WHERE status = 'paid'` (50 keys)
-8.3 ms to 0.23 ms, 150 containers visited (core: 113 ms); `country, kind ... GROUP BY 1, 2` with
-the same WHERE (1,000 pairs) 24 ms to 8.1 ms (core: 113 ms); `DISTINCT kind` under an IN list of
-three countries 5.7 ms to 0.7 ms (core: 69 ms).
+is deleted or updated away and never vacuumed, and `test/sql/countanti.sql` the anti join's groups
+counted. 2M rows, vacuumed, PostgreSQL 18 (release build), against the same plan counting:
+`SELECT DISTINCT country ... WHERE status = 'paid'` (50 keys) 8.3 ms to 0.23 ms, 150 containers
+visited (core: 113 ms); `country, kind ... GROUP BY 1, 2` with the same WHERE (1,000 pairs) 24 ms
+to 8.1 ms (core: 113 ms); `DISTINCT kind` under an IN list of three countries 5.7 ms to 0.7 ms
+(core: 69 ms).
 
 ### Other spellings of answered clauses (2026-11-10)
 

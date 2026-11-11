@@ -4637,14 +4637,16 @@ lion_count_path_topk(LionCountPathBuild *cx)
  * "Groups nothing counts")?  A GROUP BY or a DISTINCT whose counts nothing
  * reads, walked a group or a pair at a time - not the decoded walk, which
  * counts every combination in one pass, nor the top k, which ranks by the
- * counts.
+ * counts, nor beside a small-side anti join, which subtracts the rows it
+ * drops from each group's count (lion_anti_adjust()) - from a test's one row
+ * that loses a group that still has rows.
  */
 static bool
 lion_count_path_tests(const LionCountPathBuild *cx)
 {
 	return cx->groupsexist && !cx->decode && cx->topkn == 0 &&
 		cx->distvar == NULL && cx->sattnos == NIL && cx->wattnos == NIL &&
-		cx->nfilter == 0;
+		cx->nfilter == 0 && cx->anti == NULL;
 }
 
 /*
@@ -6949,6 +6951,8 @@ lion_try_count_path_once(LionCountPathBuild *cx)
 	 */
 	if (lion_count_path_tests(cx))
 	{
+		/* no anti join here: lion_count_path_fill() would drop its part */
+		Assert(cx->anti == NULL);
 		cx->groupsexist = false;
 		lion_count_path_fill(cx);
 		cpath = lion_count_path_make(cx);
