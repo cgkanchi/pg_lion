@@ -20,7 +20,7 @@ CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_
        src/lion_exec_begin.o src/lion_exec_locate.o src/lion_exec_count.o \
        src/lion_exec_cells.o src/lion_exec_slice.o \
        src/lion_exec_fkjoin.o src/lion_exec_anti.o src/lion_exec_run.o src/lion_exec_explain.o \
-       src/lion_probejoin.o
+       src/lion_probejoin.o src/lion_window.o
 # The SQL-callable helpers: lion_funcs.c and lion_index_verify()'s files, which
 # share the private header src/lion_funcs.h.
 FUNCS_OBJS = src/lion_funcs.o src/lion_verify.o src/lion_verify_dir.o src/lion_verify_heap.o \
@@ -38,7 +38,7 @@ READAHEAD_OBJS = src/lion_readahead.o src/lion_readahead_ring.o
 # standalone.
 OBJS = src/lion_planes.o src/lion_container.o src/lion_sparse.o src/lion_positions.o src/lion_wal.o src/lion_waldelta.o $(PAGES_OBJS) src/lion_dir.o src/lion_dir_delete.o src/lion_posting.o src/lion_posting_delete.o src/lion_postree.o src/lion_posbuild.o src/lion_posfilter.o src/lion_bm25.o src/lion_bm25_scan.o src/lion_reader.o \
        src/lion_am.o src/lion_amcost.o src/lion_build.o src/lion_spool.o src/lion_scan.o \
-       src/lion_insert.o src/lion_vacuum.o $(FUNCS_OBJS) $(COUNT_OBJS) $(CUSTOMSCAN_OBJS) \
+       src/lion_insert.o src/lion_defer.o src/lion_vacuum.o $(FUNCS_OBJS) $(COUNT_OBJS) $(CUSTOMSCAN_OBJS) \
        src/lion_multikey.o src/lion_jsonb.o src/lion_fkjoin.o src/lion_ordered.o src/lion_selfuncs.o \
        src/lion_costs.o src/lion_arena.o $(VEC_OBJS) $(READAHEAD_OBJS)
 PGFILEDESC = "pg_lion - roaring bitmap inverted index"

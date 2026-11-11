@@ -188,7 +188,7 @@ SELECT fp_run($q$SELECT count(*) FROM fp_fact f JOIN fp_dim d ON f.fk = d.pk
 	WHERE f.d @@ 'foo <-> bar'$q$);
                             fp_run                            
 --------------------------------------------------------------
- probed, then collected; 15225 checked, 10150 removed; 1 rows
+ probed, then collected; 15525 checked, 10350 removed; 1 rows
 (1 row)
 
 RESET pg_lion.fkjoin_collect_container_cost;
@@ -283,9 +283,9 @@ FROM (VALUES (3), (100)) v(k);
 
 SELECT fp_run($q$SELECT count(*) FROM fp_not f JOIN fp_ndim d ON f.fk = d.pk
 	WHERE d.pk <= 3 AND f.d @@ 'foo <-> !bar'$q$);
-                            fp_run                            
---------------------------------------------------------------
- probed, then collected; 20030 checked, 18029 removed; 1 rows
+                 fp_run                 
+----------------------------------------
+ probed; 30 checked, 28 removed; 1 rows
 (1 row)
 
 DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN EXECUTE 'RESET enable_eager_aggregate'; END IF; END$$;

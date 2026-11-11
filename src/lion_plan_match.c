@@ -3730,26 +3730,42 @@ lion_rel_has_sliced_index(RelOptInfo *rel)
  * Is agg an aggregate a bit-sliced column's slices answer (DESIGN.md §52) -
  * and which?  count, sum, avg, min or max of a bare column of relation rti
  * (a RelabelType over it allowed, which a domain's column brings), with no
- * DISTINCT, ORDER BY or FILTER: count(x) of any type, sum and avg of an
- * int2, int4 or int8 - sum and avg of a date, time or timestamp are no SQL
- * aggregates - and min and max of each type of the allowlist
- * (lion_slice_type_nbits()), each answered as core's aggregate of that type
- * answers it.  *attno is the column, and *argtype the type the aggregate
- * takes it as - which the slices have to be of - or InvalidOid for count(x),
- * which takes any.  Whether it is sliced is the caller's to ask.  Without
- * 128-bit integers sum and avg are not taken.
+ * DISTINCT or ORDER BY: count(x) of any type, sum and avg of an int2, int4
+ * or int8 - sum and avg of a date, time or timestamp are no SQL aggregates -
+ * and min and max of each type of the allowlist (lion_slice_type_nbits()),
+ * each answered as core's aggregate of that type answers it.  *attno is the
+ * column, and *argtype the type the aggregate takes it as - which the slices
+ * have to be of - or InvalidOid for count(x), which takes any.  Whether it
+ * is sliced is the caller's to ask.  Without 128-bit integers sum and avg
+ * are not taken.
+ *
+ * A FILTER is taken where the caller asks for it (filter not NULL): *filter
+ * is then the condition, or NULL for none, and the aggregate is the same one
+ * over the rows the condition is true of (§52, "Filtered aggregates").
+ *
+ * A partial aggregate (AGGSPLIT_INITIAL_SERIAL) is taken where its partial
+ * state is the value the slices answer, which a node emitting partial rows
+ * puts there as it is (§52, "Partial rows"): count, sum of an int2 or int4
+ * (an int8 either way), min and max - not avg, nor sum of an int8, whose
+ * states are a count beside a sum.
  */
 int
-lion_sagg_classify(Aggref *agg, Index rti, AttrNumber *attno, Oid *argtype)
+lion_sagg_classify(Aggref *agg, Index rti, AttrNumber *attno, Oid *argtype,
+				   Node **filter)
 {
 	Node	   *arg;
 	Var		   *v;
 	int			kind;
 	Oid			type = InvalidOid;
 
+	if (filter != NULL)
+		*filter = (Node *) agg->aggfilter;
 	if (agg->aggdistinct != NIL || agg->aggorder != NIL ||
-		agg->aggfilter != NULL || agg->agglevelsup != 0 || agg->aggstar ||
-		agg->aggkind != AGGKIND_NORMAL || agg->aggsplit != AGGSPLIT_SIMPLE ||
+		(agg->aggfilter != NULL && filter == NULL) ||
+		agg->agglevelsup != 0 || agg->aggstar ||
+		agg->aggkind != AGGKIND_NORMAL ||
+		(agg->aggsplit != AGGSPLIT_SIMPLE &&
+		 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL) ||
 		list_length(agg->args) != 1)
 		return LION_SAGG_NONE;
 	arg = (Node *) ((TargetEntry *) linitial(agg->args))->expr;
@@ -3832,6 +3848,8 @@ lion_sagg_classify(Aggref *agg, Index rti, AttrNumber *attno, Oid *argtype)
 		default:
 			return LION_SAGG_NONE;
 	}
+	if (agg->aggsplit != AGGSPLIT_SIMPLE && !LION_SAGG_IS_PARTIAL_OK(kind))
+		return LION_SAGG_NONE;
 	*attno = v->varattno;
 	*argtype = type;
 	return kind;

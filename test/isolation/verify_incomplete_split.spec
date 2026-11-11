@@ -60,8 +60,11 @@ teardown
 	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
 }
 
+# Row by row: a batch of inserts (DESIGN.md §55, PostgreSQL 17 and later)
+# writes one key's rows before the other's, and so splits another leaf
+# first, which the warnings name.
 session s1
-setup			{ SELECT injection_points_set_local(); }
+setup			{ SET pg_lion.batch_inserts = off; SELECT injection_points_set_local(); }
 step s1_shape	{
 	SELECT max_posting_height > 0 AS posting_is_a_tree FROM lion_index_stats('vis_p_k');
 	SELECT directory_height > 0 AS directory_has_a_root FROM lion_index_stats('vis_d_k');

@@ -649,16 +649,22 @@ lion_explain_group_index(LionCountScanState *st, List *ancestors,
 
 	/*
 	 * The other columns of the decoded walk (DESIGN.md §34), each read from
-	 * its own index; the scan is never partitioned.
+	 * its own index: the table's, named, or each partition's (§16).
 	 */
 	if (st->decode != NULL)
 	{
 		for (i = 1; i < st->decode->ncol; i++)
-			appendStringInfo(buf, ", %s%s (%s)",
-							 get_rel_name(st->decode->idxoid[i]),
-							 lion_explain_col(st->decode->idxoid[i],
-											  st->decode->attno[i], false, st->plan.vcols),
+		{
+			appendStringInfoString(buf, ", ");
+			if (st->npart == 0)
+				appendStringInfo(buf, "%s%s ",
+								 get_rel_name(st->decode->idxoid[i]),
+								 lion_explain_col(st->decode->idxoid[i],
+												  st->decode->attno[i], false,
+												  st->plan.vcols));
+			appendStringInfo(buf, "(%s)",
 							 lion_explain_attname(st, st->decode->attno[i]));
+		}
 	}
 }
 
@@ -885,6 +891,7 @@ lion_explain_slice_range(LionCountScanState *st, int lead, int first, int n,
 
 		if (b->kind != LION_CLAUSE_RANGESRC || !b->sliced ||
 			b->attno != cl->attno || st->inor[j] != st->inor[lead] ||
+			st->plan.clause[j].filter != st->plan.clause[lead].filter ||
 			lion_explain_dropped_all(st, j))
 			continue;
 		if (firstbound && buf->len > 0)
@@ -933,13 +940,18 @@ lion_explain_slice_range(LionCountScanState *st, int lead, int first, int n,
 		nbits = lion_index_column_state(idx, col)->slicebits;
 		index_close(idx, AccessShareLock);
 	}
-	appendStringInfo(buf, " (%d slices)", nbits);
+	if (st->plan.clause[lead].filter > 0)
+		appendStringInfo(buf, " (%d slices, filter %d)", nbits,
+						 st->plan.clause[lead].filter);
+	else
+		appendStringInfo(buf, " (%d slices)", nbits);
 }
 
 /*
  * "Range From Slices" (DESIGN.md §53): each range the plan collects from the
- * slices of its column - a WHERE's, and an OR's leaf, one an arm - with its
- * bounds and the slices its column has.
+ * slices of its column - a WHERE's or a filtered count's (§10), which names
+ * its filter, and an OR's leaf, one an arm - with its bounds and the slices
+ * its column has.
  */
 static void
 lion_explain_slice_ranges(LionCountScanState *st, List *ancestors,
@@ -952,7 +964,7 @@ lion_explain_slice_ranges(LionCountScanState *st, List *ancestors,
 
 	initStringInfo(&buf);
 
-	/* outside the ORs: the first bound of each column's range */
+	/* outside the ORs: the first bound of each column's range, a run's */
 	for (i = 0; i < st->nclause; i++)
 	{
 		LionClauseState *cl = &st->clause[i];
@@ -963,7 +975,8 @@ lion_explain_slice_ranges(LionCountScanState *st, List *ancestors,
 		{
 			if (st->clause[j].kind == LION_CLAUSE_RANGESRC &&
 				st->clause[j].sliced && !st->inor[j] &&
-				st->clause[j].attno == cl->attno)
+				st->clause[j].attno == cl->attno &&
+				st->plan.clause[j].filter == st->plan.clause[i].filter)
 				break;
 		}
 		if (j < i)
@@ -1268,6 +1281,14 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 		pfree(buf.data);
 	}
 
+	/*
+	 * Groups nothing counts, each a test for a visible row (DESIGN.md §10,
+	 * "Groups nothing counts").
+	 */
+	if (lion_plan_flag(st, LION_FLAG_EXISTS) && st->decode == NULL &&
+		st->cells == NULL)
+		ExplainPropertyText("Group Strategy", "First Visible Row", es);
+
 	/* The column count(DISTINCT) counts (DESIGN.md §26). */
 	if (st->plan.distattno != 0)
 		ExplainPropertyText("Distinct Key",
@@ -1292,9 +1313,10 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 	 * The sliced columns aggregates are answered from (DESIGN.md §52): each
 	 * index and column, and which of its slices are counted against the
 	 * WHERE - every bit's and E's for a sum or an average, E's alone
-	 * otherwise - and the descents its extremes take.  A partitioned scan
-	 * names no index, as it names none in Lion Indexes: each partition reads
-	 * its own (§52.13).
+	 * otherwise - and the descents its extremes take; a column counted over
+	 * a filter's rows names it, as Count Filter does (§52, "Filtered
+	 * aggregates").  A partitioned scan names no index, as it names none in
+	 * Lion Indexes: each partition reads its own (§52.13).
 	 */
 	if (st->slice != NULL)
 	{
@@ -1305,12 +1327,16 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 		{
 			LionSCol   *col = &st->slice->col[c];
 			int			want = col->want;
+			char		run[32] = "";
 
-			appendStringInfo(&buf, "%s%s%s(%s: %s%s%s)", (c > 0) ? ", " : "",
+			if (col->run > 0)
+				snprintf(run, sizeof(run), ", filter %d", col->run);
+			appendStringInfo(&buf, "%s%s%s(%s%s: %s%s%s)",
+							 (c > 0) ? ", " : "",
 							 (st->npart > 0) ? "" :
 							 get_rel_name(col->idxoid),
 							 (st->npart > 0) ? "" : " ",
-							 lion_explain_attname(st, col->attno),
+							 lion_explain_attname(st, col->attno), run,
 							 (want & LION_SWANT_SUM) ?
 							 "every bit counted" : "existence counted",
 							 (want & LION_SWANT_MIN) ? ", min descent" : "",
@@ -1625,6 +1651,13 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 		ExplainPropertyInteger("Groups Counted in Batches", NULL,
 							   st->groupsbatched + w->groupsbatched, es);
 	}
+
+	/*
+	 * The groups tested for a visible row in place of their counts
+	 * (LION_FLAG_EXISTS; DESIGN.md §10, "Groups nothing counts").
+	 */
+	if (lion_plan_flag(st, LION_FLAG_EXISTS))
+		ExplainPropertyInteger("Groups Tested", NULL, st->grouptests, es);
 
 	/*
 	 * The decoded walk's passes (DESIGN.md §34): the container keys it

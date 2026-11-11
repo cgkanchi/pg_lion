@@ -2025,11 +2025,13 @@ extern Oid	lion_get_am_oid(void);
 /*
  * EXECUTE on a function, or on an aggregate and its support functions, that
  * the query a count stands for would call - the checks ExecInitFunc() and
- * ExecInitAgg() make, with the same errors and the object-access hook.  Made
- * when the count starts, never at plan time (DESIGN.md §9, "Privileges").
+ * ExecInitAgg() (or ExecInitWindowAgg()) make, with the same errors and the
+ * object-access hook.  Made when the count starts, never at plan time
+ * (DESIGN.md §9, "Privileges").
  */
 extern void lion_check_execute(Oid funcid);
 extern void lion_check_aggregate_execute(Oid aggfnoid);
+extern void lion_check_window_execute(Oid winfnoid);
 
 /* ---------------------------------------------------------------------
  * the LionCount custom scan, lion_plan_*.c and lion_exec_*.c (DESIGN.md
@@ -2126,6 +2128,7 @@ extern PGDLLIMPORT set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook;
  * small inner side"): pg_lion.enable_count_anti.
  */
 extern PGDLLIMPORT bool lion_enable_count_anti;
+extern PGDLLIMPORT bool lion_enable_window_count;
 
 /*
  * Whether a GROUP BY over a join of a table to a dimension by its primary key
@@ -2261,6 +2264,12 @@ extern void lion_ordjoin_init(void);
 extern void lion_selfuncs_init(void);
 
 /*
+ * The INLINE limit lion index idx's entries were written under, from its meta
+ * page (DESIGN.md §10, "Planner integration").
+ */
+extern double lion_index_inline_limit(PlannerInfo *root, IndexOptInfo *idx);
+
+/*
  * How many containers a key of lion index idx's key column col (from 1) has,
  * on average over the column's keys, as its meta page counted them, and the
  * rows a key had then (*keyrows); 0 when the page has no count of it or the
@@ -2269,6 +2278,21 @@ extern void lion_selfuncs_init(void);
 extern double lion_key_containers_counted(PlannerInfo *root, RelOptInfo *rel,
 										  IndexOptInfo *idx, AttrNumber col,
 										  double *keyrows);
+
+/*
+ * The keys outside column var's MCV list, as a lion index on the column
+ * counted them (DESIGN.md §33, "The rows of a probed key"): how many, their
+ * rows on average, and the spread of those.  False where none did.
+ */
+typedef struct LionKeyTail
+{
+	double		nkeys;
+	double		mean;
+	double		sd;
+} LionKeyTail;
+
+extern bool lion_key_tail_counted(PlannerInfo *root, RelOptInfo *rel,
+								  Var *var, LionKeyTail *tail);
 
 /*
  * While lion prices one of its own accesses to rel, a range among `clauses`

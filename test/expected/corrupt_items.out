@@ -666,7 +666,7 @@ SELECT lion_di_try($$SELECT lion_index_verify('lion_di_s_i')$$);
 
 DROP TABLE lion_di_s;
 -- ---------- 10. an index of another format version ----------
--- An index with its meta page's version (at byte 28) made 0, 2, 14 and 15,
+-- An index with its meta page's version (at byte 28) made 0, 1, 14 and 15,
 -- versions this build does not write: an index of another format may hold
 -- what this build would read wrongly, so lion_index_verify() reports it and
 -- a reader refuses it, asking for a REINDEX - which makes it whole again.
@@ -691,7 +691,7 @@ SELECT lion_di_evict('lion_di_old_i');
 SELECT lion_di_u32(lion_di_block('lion_di_old_i', 0), 28) AS version;
  version 
 ---------
-       1
+       2
 (1 row)
 
 SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(0));
@@ -718,7 +718,7 @@ SELECT lion_di_evict('lion_di_old_i');
  
 (1 row)
 
-SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(2));
+SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(1));
  lion_di_poke 
 --------------
  
@@ -788,7 +788,7 @@ REINDEX INDEX lion_di_old_i;
 SELECT lion_di_u32(lion_di_block('lion_di_old_i', 0), 28) AS version;
  version 
 ---------
-       1
+       2
 (1 row)
 
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
@@ -814,7 +814,7 @@ SELECT lion_di_evict('lion_di_old_i');
  
 (1 row)
 
-SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(2));
+SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(1));
  lion_di_poke 
 --------------
  
@@ -828,7 +828,7 @@ SELECT lion_di_hint($$SELECT ntids FROM lion_index_stats('lion_di_old_i')$$);
 
 VACUUM lion_di;
 ERROR:  index "lion_di_old_i" is not a valid lion index
-DETAIL:  Meta page magic 52424931 version 2, expected 52424931 version 1.
+DETAIL:  Meta page magic 52424931 version 1, expected 52424931 version 2.
 HINT:  The index was written by a build of pg_lion with another on-disk format: REINDEX it with this build.
 CONTEXT:  while cleaning up index "lion_di_old_i" of relation "public.lion_di"
 -- To the planner such an index is not there (DESIGN.md §21, "An index of
@@ -880,7 +880,7 @@ SELECT count(*) FROM lion_di a JOIN lion_di b ON a.k = b.k WHERE a.k = 7 AND b.k
 
 INSERT INTO lion_di VALUES (7);
 ERROR:  index "lion_di_old_i" is not a valid lion index
-DETAIL:  Meta page magic 52424931 version 2, expected 52424931 version 1.
+DETAIL:  Meta page magic 52424931 version 1, expected 52424931 version 2.
 HINT:  The index was written by a build of pg_lion with another on-disk format: REINDEX it with this build.
 REINDEX INDEX lion_di_old_i;
 SELECT lion_di_lion('SELECT count(*) FROM lion_di WHERE k = 7') AS planned_with_lion;

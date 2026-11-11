@@ -60,6 +60,7 @@
 #include "postgres.h"
 
 #include "lion_count_int.h"
+#include "lion_defer.h"
 
 #include "access/skey.h"
 #include "executor/executor.h"
@@ -666,7 +667,11 @@ lion_text_filter_begin(LionTextFilter *ff, const char *what, Relation heap,
 
 		if (index->rd_rel->relam == lion_get_am_oid() &&
 			index->rd_index->indisvalid)
+		{
+			/* rows this backend has buffered for it go in first (§55) */
+			lion_defer_flush_index(index);
 			ff->indexes = lappend(ff->indexes, index);
+		}
 		else
 			index_close(index, AccessShareLock);
 	}

@@ -398,11 +398,11 @@ SELECT lion_index_verify('lion_vfy_bad_root');
 SET client_min_messages = warning;
 
 -- (9) a position tree with an internal level (DESIGN.md §17): 600 rows of 255
--- positions each, twenty leaves of about two heap blocks each under a root.
+-- positions each, 22 leaves of about two heap blocks each under a root.
 -- verify() must report a downlink to the wrong leaf (the third goes to the
--- fourth leaf), a separator below what the leaf to its left holds (a
--- reader of that block lands on the leaf to the right, and misses the left
--- one's last chunk), and a leaf whose min - which a tree without an internal
+-- fourth leaf), a separator below the last block the leaf to its left
+-- holds, its max (a reader of that block lands on the leaf to the right, and
+-- misses the left one's last chunk), and a leaf whose min - which a tree without an internal
 -- level is routed by - is not its first chunk's header.  The root is the one
 -- internal page of the tree: flag 128, level 1; the min is at 8 of the
 -- special area.
@@ -418,9 +418,13 @@ SELECT b AS posroot
 						   current_setting('block_size')::int8 - 1) b
  WHERE lion_vfy_u32('lion_vfy_badpos_twin', b, :special + 26) & 128 <> 0
    AND lion_vfy_u32('lion_vfy_badpos_twin', b, :special + 24) & 65535 = 1 \gset
-SELECT lion_vfy_item('lion_vfy_badpos_twin', :posroot, 3) AS item3,
+SELECT lion_vfy_item('lion_vfy_badpos_twin', :posroot, 2) AS item2,
+	   lion_vfy_item('lion_vfy_badpos_twin', :posroot, 3) AS item3,
 	   lion_vfy_item('lion_vfy_badpos_twin', :posroot, 4) AS item4 \gset
-SELECT lion_vfy_u32('lion_vfy_badpos_twin', :posroot, :item3) AS sep3,
+SELECT lion_vfy_u32('lion_vfy_badpos_twin',
+					lion_vfy_u32('lion_vfy_badpos_twin', :posroot, :item2 + 4),
+					:special + 12) AS max2,
+	   lion_vfy_u32('lion_vfy_badpos_twin', :posroot, :item3) AS sep3,
 	   lion_vfy_u32('lion_vfy_badpos_twin', :posroot, :item3 + 4) AS leaf3,
 	   lion_vfy_u32('lion_vfy_badpos_twin', :posroot, :item4 + 4) AS leaf4 \gset
 SET client_min_messages = error;
@@ -436,7 +440,7 @@ SET client_min_messages = warning;
 CREATE INDEX lion_vfy_bad_possep ON lion_vfy_badpos USING lion (d)
   WITH (store_positions = true);
 SELECT lion_vfy_poke('lion_vfy_bad_possep', :posroot, :item3,
-					 lion_vfy_le32(:sep3 - 1));
+					 lion_vfy_le32(:max2 - 1));
 SET client_min_messages = error;
 SELECT lion_index_verify('lion_vfy_bad_possep');
 SET client_min_messages = warning;
@@ -522,11 +526,12 @@ SET client_min_messages = warning;
 -- 'alpha' is the entry of rows 1 and 2, (0,1) and (0,2), the second item of
 -- block 1, and its positions are the last pos_len bytes of it - pos_len is
 -- the uint32 at 28, after the 12-byte header, the 9-byte key and pos_root -
--- one chunk: an 8-byte header, its used bytes, then for each TID the delta
--- of its code, its count of positions and the positions.  The second TID's
--- delta, at 13 of the chunk, goes from 1 to 2: the chunk names (0,1) and
--- (0,3), and a phrase query through the index loses row 2.  verify() must
--- report it.
+-- one chunk: an 8-byte header, its used bytes, the last member's code (the
+-- uint32 at 10) and its impacts, then from 22 for each TID the delta of its
+-- code, its count of positions and the positions.  The second TID's delta,
+-- at 25 of the chunk, goes from 1 to 2, and the last code from 2 to 3: the
+-- chunk names (0,1) and (0,3), and a phrase query through the index loses
+-- row 2.  verify() must report it.
 CREATE TEMP TABLE lion_vfy_badph (id int4, d tsvector);
 INSERT INTO lion_vfy_badph
 VALUES (1, 'alpha:1 beta:2'), (2, 'alpha:1 beta:2'), (3, 'gamma:1');
@@ -536,8 +541,12 @@ SELECT lion_vfy_item('lion_vfy_bad_inlpos', 1, 2) AS item,
 	   lion_vfy_u32('lion_vfy_bad_inlpos', 1, 24 + 4 * 1) >> 17 AS itemlen \gset
 SELECT lion_vfy_poke('lion_vfy_bad_inlpos', 1,
 					 :item + :itemlen -
-					 lion_vfy_u32('lion_vfy_bad_inlpos', 1, :item + 28) + 13,
+					 lion_vfy_u32('lion_vfy_bad_inlpos', 1, :item + 28) + 25,
 					 '\x02');
+SELECT lion_vfy_poke('lion_vfy_bad_inlpos', 1,
+					 :item + :itemlen -
+					 lion_vfy_u32('lion_vfy_bad_inlpos', 1, :item + 28) + 10,
+					 '\x03');
 SET client_min_messages = error;
 SET enable_seqscan = off;
 SELECT id FROM lion_vfy_badph WHERE d @@ 'alpha <-> beta';
@@ -734,15 +743,16 @@ SET client_min_messages = warning;
 DROP TABLE lion_vfy_badsi;
 
 -- (17) a position tree without positions for some TIDs of its posting set.
--- 600 rows of 'alpha:5 beta:6', whose keys are CHAIN entries (inline_limit
--- = 64) with a position tree of one leaf each: one chunk, a 10-byte header
--- and the 600 rows' three bytes - the delta of the code (1), the count of
+-- 150 rows of 'alpha:5 beta:6', whose keys are CHAIN entries (inline_limit
+-- = 64) with a position tree of one leaf each: one chunk, a 22-byte header
+-- and the 150 rows' three bytes - the delta of the code (1), the count of
 -- positions (1), the position (20 for 'alpha': a position is stored shifted
 -- left by two, over its weight).  The first member's delta goes from 1 to
--- 2, which moves every member one offset on and leaves the first row of
--- each of the five heap blocks without positions.  verify() must report it.
+-- 2, and the last code, the uint32 at 10, one up with it, which moves every
+-- member one offset on and leaves the first row of each of the two heap
+-- blocks without positions.  verify() must report it.
 CREATE TEMP TABLE lion_vfy_badpc (id int4, d tsvector);
-INSERT INTO lion_vfy_badpc SELECT i, 'alpha:5 beta:6' FROM generate_series(1, 600) i;
+INSERT INTO lion_vfy_badpc SELECT i, 'alpha:5 beta:6' FROM generate_series(1, 150) i;
 CREATE INDEX lion_vfy_bad_poscov ON lion_vfy_badpc USING lion (d)
   WITH (store_positions = true, inline_limit = 64);
 SELECT b AS posleaf, lion_vfy_item('lion_vfy_bad_poscov', b, 1) AS item
@@ -750,8 +760,10 @@ SELECT b AS posleaf, lion_vfy_item('lion_vfy_bad_poscov', b, 1) AS item
 					   current_setting('block_size')::int8 - 1) b
  WHERE (lion_vfy_u32('lion_vfy_bad_poscov', b, :special + 24) >> 16) & 128 <> 0
    AND lion_vfy_peek('lion_vfy_bad_poscov', b,
-					 lion_vfy_item('lion_vfy_bad_poscov', b, 1) + 10, 3) = '\x010114' \gset
-SELECT lion_vfy_poke('lion_vfy_bad_poscov', :posleaf, :item + 10, '\x02');
+					 lion_vfy_item('lion_vfy_bad_poscov', b, 1) + 22, 3) = '\x010114' \gset
+SELECT lion_vfy_poke('lion_vfy_bad_poscov', :posleaf, :item + 22, '\x02');
+SELECT lion_vfy_poke('lion_vfy_bad_poscov', :posleaf, :item + 10,
+					 lion_vfy_le32(lion_vfy_u32('lion_vfy_bad_poscov', :posleaf, :item + 10) + 1));
 SET client_min_messages = error;
 SELECT lion_index_verify('lion_vfy_bad_poscov');
 SET client_min_messages = warning;
@@ -759,7 +771,7 @@ SET client_min_messages = warning;
 -- (18) positions that are not the row's own, which only heapallindexed
 -- finds: every structure is sound, and a phrase query decided from them
 -- loses the row.  An INLINE entry's chunk, laid out as in (11): row 2's
--- position under 'alpha', at 15 of the chunk, goes from 1 to 3 (4 -> 12).
+-- position under 'alpha', at 27 of the chunk, goes from 1 to 3 (4 -> 12).
 -- And a position tree laid out as in (17), where row 1's goes from 5 to 7.
 -- The message names the key and both positions to a superuser.
 CREATE TEMP TABLE lion_vfy_badhp (id int4, d tsvector);
@@ -771,10 +783,10 @@ SELECT lion_vfy_item('lion_vfy_bad_hpinl', 1, 2) AS item,
 	   lion_vfy_u32('lion_vfy_bad_hpinl', 1, 24 + 4 * 1) >> 17 AS itemlen \gset
 SELECT lion_vfy_poke('lion_vfy_bad_hpinl', 1,
 					 :item + :itemlen -
-					 lion_vfy_u32('lion_vfy_bad_hpinl', 1, :item + 28) + 15,
+					 lion_vfy_u32('lion_vfy_bad_hpinl', 1, :item + 28) + 27,
 					 '\x0c');
 CREATE TEMP TABLE lion_vfy_badhc (id int4, d tsvector);
-INSERT INTO lion_vfy_badhc SELECT i, 'alpha:5 beta:6' FROM generate_series(1, 600) i;
+INSERT INTO lion_vfy_badhc SELECT i, 'alpha:5 beta:6' FROM generate_series(1, 150) i;
 CREATE INDEX lion_vfy_bad_hpch ON lion_vfy_badhc USING lion (d)
   WITH (store_positions = true, inline_limit = 64);
 SELECT b AS posleaf, lion_vfy_item('lion_vfy_bad_hpch', b, 1) AS item
@@ -782,8 +794,8 @@ SELECT b AS posleaf, lion_vfy_item('lion_vfy_bad_hpch', b, 1) AS item
 					   current_setting('block_size')::int8 - 1) b
  WHERE (lion_vfy_u32('lion_vfy_bad_hpch', b, :special + 24) >> 16) & 128 <> 0
    AND lion_vfy_peek('lion_vfy_bad_hpch', b,
-					 lion_vfy_item('lion_vfy_bad_hpch', b, 1) + 10, 3) = '\x010114' \gset
-SELECT lion_vfy_poke('lion_vfy_bad_hpch', :posleaf, :item + 12, '\x1c');
+					 lion_vfy_item('lion_vfy_bad_hpch', b, 1) + 22, 3) = '\x010114' \gset
+SELECT lion_vfy_poke('lion_vfy_bad_hpch', :posleaf, :item + 24, '\x1c');
 SET client_min_messages = error;
 SET enable_seqscan = off;
 SELECT id FROM lion_vfy_badhp WHERE d @@ 'alpha <-> beta';
@@ -809,8 +821,9 @@ SET client_min_messages = warning;
 -- they write none.
 --
 -- And in a twin, the high key of the left internal page and the root's
--- separator for the right one, which are one key, go one block down, under
--- the last block the left page's last leaf holds.  Every level is still in
+-- separator for the right one, which are one key, go down to one block
+-- under the header block of the last chunk of the left page's last leaf, a
+-- block that leaf holds.  Every level is still in
 -- order, and a lookup of that block - lion_postree_fetch(), or a writer
 -- that puts or takes away a member of it - descends through the right
 -- internal page to the leaf after that one, never to it: heapallindexed
@@ -846,10 +859,21 @@ SELECT lion_vfy_item('lion_vfy_bad_parent', :bigroot, o) AS rootitem
 	   :bigright \gset
 SELECT lion_vfy_u32('lion_vfy_bad_parent', :bigroot, :rootitem) = :high
 	   AS same_key;
+-- the left page's last item, its last leaf, and that leaf's last chunk's
+-- header block (pd_lower is the uint16 at 12 of a page)
+SELECT lion_vfy_u32('lion_vfy_bad_parent', :bigleft,
+					lion_vfy_item('lion_vfy_bad_parent', :bigleft,
+								  (((lion_vfy_u32('lion_vfy_bad_parent', :bigleft, 12) & 65535) - 24) / 4)::int) + 4)
+	   AS lastleaf \gset
+SELECT lion_vfy_u32('lion_vfy_bad_parent', :lastleaf,
+					lion_vfy_item('lion_vfy_bad_parent', :lastleaf,
+								  (((lion_vfy_u32('lion_vfy_bad_parent', :lastleaf, 12) & 65535) - 24) / 4)::int))
+	   AS reach \gset
+SELECT :reach <= :high AS reach_le_high;
 SELECT lion_vfy_poke('lion_vfy_bad_parent', :bigleft, :highitem,
-					 lion_vfy_le32(:high - 1));
+					 lion_vfy_le32(:reach - 1));
 SELECT lion_vfy_poke('lion_vfy_bad_parent', :bigroot, :rootitem,
-					 lion_vfy_le32(:high - 1));
+					 lion_vfy_le32(:reach - 1));
 SET work_mem = '64kB';
 SET client_min_messages = debug1;
 SELECT lion_index_verify('lion_vfy_big_d');

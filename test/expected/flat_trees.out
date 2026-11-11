@@ -424,8 +424,8 @@ INSERT INTO ftp SELECT i, ftp_doc(i % 2 = 0, i % 50 = 0) FROM generate_series(1,
 SELECT * FROM ftp_report();
  leaves | internal | head_is_leaf | chained | flagged 
 --------+----------+--------------+---------+---------
-      1 |        0 | t            |       1 |       0
-      9 |        0 | t            |       9 |       0
+      2 |        0 | t            |       2 |       0
+      7 |        0 | t            |       7 |       0
 (2 rows)
 
 SELECT * FROM ft_check('ftp_d');
@@ -459,7 +459,7 @@ END $$;
 SELECT * FROM ftp_report();
  leaves | internal | head_is_leaf | chained | flagged 
 --------+----------+--------------+---------+---------
-      3 |        0 | t            |       3 |       0
+      4 |        0 | t            |       4 |       0
      17 |        1 | f            |       0 |       0
 (2 rows)
 
@@ -472,14 +472,14 @@ SELECT * FROM ft_check('ftp_d');
 SELECT * FROM ftp_counts();
         q        | via_index | via_heap 
 -----------------+-----------+----------
- many <-> many   |       260 |      260
- many <-> some   |       130 |      130
+ many <-> many   |       373 |      373
+ many <-> some   |       186 |      186
  some <-> many   |         0 |        0
- some <2> some   |       130 |      130
+ some <2> some   |       186 |      186
  some <-> some   |         0 |        0
  rare <-> many   |         0 |        0
  some <146> rare |         3 |        3
- many & !some    |       130 |      130
+ many & !some    |       187 |      187
  rare            |         3 |        3
 (9 rows)
 
@@ -495,14 +495,14 @@ SELECT * FROM ft_check('ftp_d');
 SELECT * FROM ftp_counts();
         q        | via_index | via_heap 
 -----------------+-----------+----------
- many <-> many   |       174 |      174
- many <-> some   |        87 |       87
+ many <-> many   |       249 |      249
+ many <-> some   |       124 |      124
  some <-> many   |         0 |        0
- some <2> some   |        87 |       87
+ some <2> some   |       124 |      124
  some <-> some   |         0 |        0
  rare <-> many   |         0 |        0
  some <146> rare |         2 |        2
- many & !some    |        87 |       87
+ many & !some    |       125 |      125
  rare            |         2 |        2
 (9 rows)
 
@@ -511,7 +511,7 @@ SELECT * FROM ftp_report();
  leaves | internal | head_is_leaf | chained | flagged 
 --------+----------+--------------+---------+---------
       2 |        0 | t            |       2 |       0
-      6 |        0 | t            |       6 |       0
+      9 |        0 | t            |       9 |       0
 (2 rows)
 
 SELECT * FROM ft_check('ftp_d');
@@ -523,14 +523,14 @@ SELECT * FROM ft_check('ftp_d');
 SELECT * FROM ftp_counts();
         q        | via_index | via_heap 
 -----------------+-----------+----------
- many <-> many   |       174 |      174
- many <-> some   |        87 |       87
+ many <-> many   |       249 |      249
+ many <-> some   |       124 |      124
  some <-> many   |         0 |        0
- some <2> some   |        87 |       87
+ some <2> some   |       124 |      124
  some <-> some   |         0 |        0
  rare <-> many   |         0 |        0
  some <146> rare |         2 |        2
- many & !some    |        87 |       87
+ many & !some    |       125 |      125
  rare            |         2 |        2
 (9 rows)
 

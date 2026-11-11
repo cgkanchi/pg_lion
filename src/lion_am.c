@@ -58,6 +58,7 @@
 #include "lion_bm25.h"
 #include "lion_costs.h"
 #include "lion_count.h"
+#include "lion_defer.h"
 #include "lion_vec.h"
 
 #if PG_VERSION_NUM >= 180000
@@ -442,6 +443,22 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §10, "A count of every row beside the rows": whether
+	 * count(*) OVER () beside a relation's rows may come from lion's count of
+	 * the relation (the LionWindowCount node) instead of a WindowAgg that
+	 * reads every row first.  pg_lion.enable_count_pushdown switches it off
+	 * as well.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_window_count",
+							 "Enables lion's count beside the rows for count(*) OVER () of the whole result.",
+							 "Off, such a window is left to the planner's WindowAgg; pg_lion.enable_count_pushdown = off turns it off too.",
+							 &lion_enable_window_count,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
 	 * DESIGN.md §46, "The dimension by probe": whether the planner may group
 	 * a join of a table to a dimension by its primary key with LionProbeJoin
 	 * - the dimension's key looked up for each row, its WHERE and the GROUP
@@ -785,6 +802,9 @@ _PG_init(void)
 	 */
 	lion_vec_init();
 
+	/* statement-level insert batching (DESIGN.md §55) */
+	lion_defer_init();
+
 	MarkGUCPrefixReserved("pg_lion");
 
 	/*
@@ -900,7 +920,7 @@ lion_handler(PG_FUNCTION_ARGS)
 		.ambuildempty = lionbuildempty,
 		.aminsert = lioninsert,
 #if PG_VERSION_NUM >= 170000
-		.aminsertcleanup = NULL,
+		.aminsertcleanup = lioninsertcleanup,	/* DESIGN.md §55 */
 #endif
 		.ambulkdelete = lionbulkdelete,
 		.amvacuumcleanup = lionvacuumcleanup,

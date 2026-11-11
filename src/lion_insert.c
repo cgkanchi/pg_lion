@@ -77,6 +77,7 @@
 
 #include "lion.h"
 #include "lion_compat.h"
+#include "lion_defer.h"
 
 static void lion_insert_new_entry(Relation index, Relation heaprel,
 								 LionState *state, Buffer *leafbuf,
@@ -2594,6 +2595,276 @@ lion_slice_insert(Relation index, Relation heaprel, LionState *state,
  */
 #define LION_INSERT_CONTEXT_SIZE	(64 * 1024)
 
+/* ---------------------------------------------------------------------
+ * Batches (DESIGN.md §55)
+ * --------------------------------------------------------------------- */
+
+/*
+ * Rows of one key, held to under one hold of its directory leaf: enough that
+ * the handoffs of the leaf stop mattering, few enough that a writer of
+ * another key on the leaf - or VACUUM - waits for well under a millisecond.
+ */
+#define LION_APPLY_HOLD		256
+
+/* The directory's order of entry kinds (DESIGN.md §21): reserved, then values */
+static inline int
+lion_insert_row_kind(const LionInsertRow *row)
+{
+	return (row->flag != 0) ? lion_reserved_kind(row->flag) : LION_KIND_VALUE;
+}
+
+/*
+ * Do a and b go to the same entry, by the bytes of their keys?  Two keys
+ * that are equal but not byte for byte - which a collation or a type may
+ * make - only make two groups, each of which finds the entry the other
+ * found.  The order is a cheap one, for grouping: columns, kinds, bucket
+ * hashes, key bytes.
+ */
+static int
+lion_insert_row_keycmp(LionIndexState *ix, const LionInsertRow *a,
+					   const LionInsertRow *b)
+{
+	LionState  *state;
+
+	if (a->col != b->col)
+		return (a->col < b->col) ? -1 : 1;
+	if (a->flag != b->flag)
+		return (lion_insert_row_kind(a) < lion_insert_row_kind(b)) ? -1 : 1;
+	if (a->hash != b->hash)
+		return (a->hash < b->hash) ? -1 : 1;
+	if (a->flag != 0)
+		return 0;
+
+	state = &ix->cols[a->col];
+	if (state->typbyval)
+		return (a->key < b->key) ? -1 : (a->key > b->key) ? 1 : 0;
+	if (state->typlen > 0)
+		return memcmp(DatumGetPointer(a->key), DatumGetPointer(b->key),
+					  state->typlen);
+	if (state->typlen == -1)
+	{
+		Size		la = VARSIZE_ANY(DatumGetPointer(a->key));
+		Size		lb = VARSIZE_ANY(DatumGetPointer(b->key));
+
+		if (la != lb)
+			return (la < lb) ? -1 : 1;
+		return memcmp(DatumGetPointer(a->key), DatumGetPointer(b->key), la);
+	}
+	return strcmp(DatumGetCString(a->key), DatumGetCString(b->key));
+}
+
+/* ... and then by TID, so a key's posting set is walked once, in order */
+static int
+lion_insert_row_cmp(const void *pa, const void *pb, void *arg)
+{
+	const LionInsertRow *a = (const LionInsertRow *) pa;
+	const LionInsertRow *b = (const LionInsertRow *) pb;
+	int			c = lion_insert_row_keycmp((LionIndexState *) arg, a, b);
+
+	if (c != 0)
+		return c;
+	return (a->code < b->code) ? -1 : (a->code > b->code) ? 1 : 0;
+}
+
+/* One key's rows of a batch: rows[start .. start + n) */
+typedef struct LionInsertGroup
+{
+	int			start;
+	int			n;
+} LionInsertGroup;
+
+typedef struct LionInsertGroupSort
+{
+	LionIndexState *ix;
+	LionInsertRow *rows;
+} LionInsertGroupSort;
+
+/*
+ * The groups in the directory's own order (lion_cmp_prefix()): column, kind,
+ * an ordered column's comparison, bucket hash, then the bytes.  Keys that
+ * go into the directory in its order land on the leaf the one before them
+ * left off at, and fill leaves the way an ascending run of inserts does,
+ * rather than splitting them all down the middle.
+ *
+ * The comparison is the column's proc 4, as the descent's is - never a sort
+ * operator, which an index whose catalog has changed since its build may no
+ * longer have although its directory is ordered (lion_fill_column_state()).
+ */
+static int
+lion_insert_group_cmp(const void *pa, const void *pb, void *arg)
+{
+	LionInsertGroupSort *gs = (LionInsertGroupSort *) arg;
+	const LionInsertRow *a = &gs->rows[((const LionInsertGroup *) pa)->start];
+	const LionInsertRow *b = &gs->rows[((const LionInsertGroup *) pb)->start];
+	LionState  *state = &gs->ix->cols[a->col];
+
+	if (a->col == b->col && a->flag == 0 && b->flag == 0 && state->ordered)
+	{
+		int32		c = DatumGetInt32(FunctionCall2Coll(&state->cmpproc,
+														state->collation,
+														a->key, b->key));
+
+		if (c != 0)
+			return c < 0 ? -1 : 1;
+	}
+	return lion_insert_row_keycmp(gs->ix, a, b);
+}
+
+/*
+ * Write a batch of buffered rows (lion_defer.c), reordering rows[] in place.
+ *
+ * Each key's rows are what lion_insert_one() would do for them one at a
+ * time, with the descents shared: a CHAIN entry - the posting set of a key of
+ * many rows - takes up to LION_APPLY_HOLD of them under one hold of its leaf,
+ * the entry rewritten in place at its size by each (lion_insert_chain()), so
+ * its offset stays good.  A new entry, or an INLINE one, takes one row per
+ * descent, as either may move the entry; an INLINE entry that spills becomes
+ * a CHAIN one and takes the rest in holds.  The keys go in directory order,
+ * their rows in TID order.
+ *
+ * The rows are untouched but for their order, so a write that fails can be
+ * redone whole: a row already in is a no-op the second time.
+ */
+void
+lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
+				  int nrows)
+{
+	LionIndexState *ix = lion_get_index_state(index);
+	LionInsertGroup *groups;
+	LionInsertGroupSort gs;
+	MemoryContext cxt;
+	MemoryContext holdcxt;
+	MemoryContext oldcxt;
+	int			ngroups = 0;
+	int			g;
+	int			i;
+
+	if (nrows == 0)
+		return;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"lion index insert batch",
+								ALLOCSET_DEFAULT_SIZES);
+	holdcxt = AllocSetContextCreate(cxt,
+									"lion index insert batch hold",
+									LION_INSERT_CONTEXT_SIZE,
+									LION_INSERT_CONTEXT_SIZE,
+									ALLOCSET_DEFAULT_MAXSIZE);
+	oldcxt = MemoryContextSwitchTo(cxt);
+
+	/* the keys' rows together, in TID order, by a cheap comparison ... */
+	qsort_arg(rows, nrows, sizeof(LionInsertRow), lion_insert_row_cmp, ix);
+
+	groups = (LionInsertGroup *) palloc(sizeof(LionInsertGroup) * nrows);
+	for (i = 0; i < nrows; i++)
+	{
+		if (i == 0 || lion_insert_row_keycmp(ix, &rows[i - 1], &rows[i]) != 0)
+		{
+			groups[ngroups].start = i;
+			groups[ngroups++].n = 0;
+		}
+		groups[ngroups - 1].n++;
+	}
+
+	/* ... and the keys in the directory's order, by its own */
+	gs.ix = ix;
+	gs.rows = rows;
+	if (ngroups > 1)
+		qsort_arg(groups, ngroups, sizeof(LionInsertGroup),
+				  lion_insert_group_cmp, &gs);
+
+	MemoryContextSwitchTo(holdcxt);
+
+	for (g = 0; g < ngroups; g++)
+	{
+		LionInsertRow *grows = &rows[groups[g].start];
+		LionState  *state = &ix->cols[grows[0].col];
+		uint16		flag = grows[0].flag;
+		int			end = groups[g].n;
+
+		i = 0;
+		while (i < end)
+		{
+			LionSearchKey sk;
+			Buffer		leafbuf;
+			OffsetNumber entryoff;
+			bool		movedright;
+			bool		found;
+
+			if (flag != 0)
+				lion_search_key_init(state, &sk, lion_reserved_kind(flag),
+									 (Datum) 0, grows[i].hash);
+			else
+				lion_search_key_init(state, &sk, LION_KIND_VALUE,
+									 grows[i].key, grows[i].hash);
+
+			found = lion_dir_find(index, heaprel, state->ix, &sk,
+								  BUFFER_LOCK_EXCLUSIVE, true, &leafbuf,
+								  &entryoff, &movedright);
+			lion_writer_check(index, leafbuf, entryoff, found);
+
+			if (!found)
+			{
+				lion_insert_new_entry(index, heaprel, state, &leafbuf,
+									  entryoff, movedright, grows[i].key, flag,
+									  grows[i].hash,
+									  lion_code_ckey(grows[i].code),
+									  lion_code_lo(grows[i].code), NULL);
+				i++;
+			}
+			else if ((lion_page_entry(BufferGetPage(leafbuf),
+									  entryoff)->flags & LION_ENTRY_INLINE) != 0)
+			{
+				lion_insert_inline(index, heaprel, state, leafbuf, entryoff,
+								   lion_code_ckey(grows[i].code),
+								   lion_code_lo(grows[i].code), NULL);
+				i++;
+			}
+			else
+			{
+				int			stop = Min(end, i + LION_APPLY_HOLD);
+
+				for (; i < stop; i++)
+					lion_insert_chain(index, heaprel, leafbuf, entryoff,
+									  lion_code_ckey(grows[i].code),
+									  lion_code_lo(grows[i].code), NULL);
+			}
+
+			UnlockReleaseBuffer(leafbuf);
+			MemoryContextReset(holdcxt);
+
+			/*
+			 * Test hook: between two holds, with nothing held;
+			 * test/isolation/insert_batch_race.spec has other writers and
+			 * VACUUM take the leaf here.
+			 */
+			LION_INJECTION_POINT("lion-insert-batch-hold");
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
+}
+
+
+/*
+ * What lioninsert() keeps for a statement, in the IndexInfo's ii_AmCache:
+ * the context its rows are inserted in, and how many rows it has had.
+ */
+typedef struct LionInsertCache
+{
+	MemoryContext cxt;
+	uint64		nrows;
+} LionInsertCache;
+
+/* Does lioninsert() buffer this column's keys of the row? */
+static inline bool
+lion_column_batched(bool batch, LionState *state)
+{
+	return batch && !state->positions && !state->summarized && !state->sliced;
+}
+
 /*
  * aminsert
  *
@@ -2614,6 +2885,14 @@ lion_slice_insert(Relation index, Relation heaprel, LionState *state,
  * per column - each under its own column's entry, on its own directory leaf -
  * and the same visibility argument covers them.  A NULL in one column says
  * nothing about the others.
+ *
+ * After the statement's first row, a column's (key, TID) pairs are buffered
+ * rather than written, when lion_defer_allowed() says the statement may and
+ * the column stores nothing beside its keys' posting sets - no positions,
+ * summaries or slices: the buffer is written sorted by key at the end of the
+ * statement, or before anything reads the index (DESIGN.md §55,
+ * lion_defer.c).  The visibility argument is the same once more: no snapshot
+ * that can see the row exists before the statement is done.
  */
 bool
 lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
@@ -2621,8 +2900,11 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		  IndexInfo *indexInfo)
 {
 	LionIndexState *ix;
+	LionInsertCache *cache = NULL;
 	MemoryContext insertcxt;
 	MemoryContext oldcxt;
+	LionDefer  *defer = NULL;
+	bool		batch = false;
 	uint64		code;
 	uint32		ckey;
 	uint16		lo;
@@ -2640,18 +2922,27 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 	 * row allocates - a few work buffers of LION_CONTAINER_MAX_SIZE, which
 	 * the allocator rounds up to 8 kB each - and is kept by every reset, so
 	 * a row allocates nothing from malloc.  A caller without an IndexInfo
-	 * gets a context for the row alone.
+	 * gets a context for the row alone, and no batch.
 	 */
 	if (indexInfo != NULL && indexInfo->ii_Context != NULL)
 	{
 		if (indexInfo->ii_AmCache == NULL)
-			indexInfo->ii_AmCache =
-				AllocSetContextCreate(indexInfo->ii_Context,
-									  "lion index insert",
-									  LION_INSERT_CONTEXT_SIZE,
-									  LION_INSERT_CONTEXT_SIZE,
-									  ALLOCSET_DEFAULT_MAXSIZE);
-		insertcxt = (MemoryContext) indexInfo->ii_AmCache;
+		{
+			cache = (LionInsertCache *)
+				MemoryContextAllocZero(indexInfo->ii_Context,
+									   sizeof(LionInsertCache));
+			cache->cxt = AllocSetContextCreate(indexInfo->ii_Context,
+											   "lion index insert",
+											   LION_INSERT_CONTEXT_SIZE,
+											   LION_INSERT_CONTEXT_SIZE,
+											   ALLOCSET_DEFAULT_MAXSIZE);
+			indexInfo->ii_AmCache = cache;
+		}
+		cache = (LionInsertCache *) indexInfo->ii_AmCache;
+		insertcxt = cache->cxt;
+
+		/* one row is no batch: the statement's first goes straight in */
+		batch = (cache->nrows++ > 0) && lion_defer_allowed(indexInfo);
 	}
 	else
 		insertcxt = AllocSetContextCreate(CurrentMemoryContext,
@@ -2669,6 +2960,14 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		Datum		key;
 
 		/*
+		 * Buffered, or written now: a column whose inserts write more than
+		 * its key's entry - positions, a summary, slices - is always written
+		 * now.
+		 */
+		if (lion_column_batched(batch, state) && defer == NULL)
+			defer = lion_defer_get(index, heapRel);
+
+		/*
 		 * A NULL value belongs to that column's reserved NULL entry, which is
 		 * found by its flag rather than by its (absent) key (DESIGN.md §14).
 		 * A multi-key opclass that extracts nothing from a non-NULL value
@@ -2676,8 +2975,14 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		 * way (DESIGN.md §17).
 		 */
 		if (isnull[c])
-			lion_insert_one(index, heapRel, state, (Datum) 0,
-						   LION_ENTRY_NULLKEY, ckey, lo, NULL);
+		{
+			if (lion_column_batched(batch, state))
+				lion_defer_add(defer, index, heapRel, state, c, (Datum) 0,
+							   LION_ENTRY_NULLKEY, code);
+			else
+				lion_insert_one(index, heapRel, state, (Datum) 0,
+							   LION_ENTRY_NULLKEY, ckey, lo, NULL);
+		}
 		else if (state->multikey)
 		{
 			Datum	   *keys;
@@ -2700,16 +3005,28 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 			for (i = 0; i < nkeys; i++)
 				keys[i] = lion_key_prepare(state, keys[i], heapRel, ht_ctid);
 
-			if (nkeys == 0)
-				lion_insert_one(index, heapRel, state, (Datum) 0, nokey,
-							   ckey, lo, NULL);
-			for (i = 0; i < nkeys; i++)
+			if (lion_column_batched(batch, state))
 			{
-				if (pm != NULL)
-					lion_posmember_from_key(pm, code, &kpos[i]);
-				lion_insert_one(index, heapRel, state, keys[i], 0, ckey, lo,
-							   pm);
-				CHECK_FOR_INTERRUPTS();
+				if (nkeys == 0)
+					lion_defer_add(defer, index, heapRel, state, c, (Datum) 0,
+								   nokey, code);
+				for (i = 0; i < nkeys; i++)
+					lion_defer_add(defer, index, heapRel, state, c, keys[i], 0,
+								   code);
+			}
+			else
+			{
+				if (nkeys == 0)
+					lion_insert_one(index, heapRel, state, (Datum) 0, nokey,
+								   ckey, lo, NULL);
+				for (i = 0; i < nkeys; i++)
+				{
+					if (pm != NULL)
+						lion_posmember_from_key(pm, code, &kpos[i]);
+					lion_insert_one(index, heapRel, state, keys[i], 0, ckey,
+								   lo, pm);
+					CHECK_FOR_INTERRUPTS();
+				}
 			}
 		}
 		else
@@ -2717,7 +3034,10 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 			/* stored as it is, or compressed when long (DESIGN.md §4) */
 			key = lion_key_prepare(state, values[c], heapRel, ht_ctid);
 
-			lion_insert_one(index, heapRel, state, key, 0, ckey, lo, NULL);
+			if (lion_column_batched(batch, state))
+				lion_defer_add(defer, index, heapRel, state, c, key, 0, code);
+			else
+				lion_insert_one(index, heapRel, state, key, 0, ckey, lo, NULL);
 
 			/*
 			 * ... and in its bucket's summary (DESIGN.md §32), which is a
@@ -2745,7 +3065,7 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 	}
 
 	MemoryContextSwitchTo(oldcxt);
-	if (indexInfo != NULL && insertcxt == (MemoryContext) indexInfo->ii_AmCache)
+	if (cache != NULL)
 		MemoryContextReset(insertcxt);
 	else
 		MemoryContextDelete(insertcxt);

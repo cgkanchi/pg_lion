@@ -668,7 +668,9 @@ Lock ordering:
   split rewrites it, both taking it as the LAST buffer of their record; nothing else writes it.
 
 INSERT (`lion_insert.c`: `lioninsert()` calls `lion_insert_one()` once per key column and, for a
-multi-key opclass, once per extracted key)
+multi-key opclass, once per extracted key; a statement's rows after its first are kept and written
+as a batch by the same steps, a CHAIN entry's up to 256 rows per hold of its leaf and a new or
+INLINE entry's one row per hold, with other writers and VACUUM free to run between holds - §55)
 1. Hash the key and build the search key - kind VALUE, or a reserved entry: NULL, or one of the
    key-less entries of §17 (EMPTY, EMPTYDIM, EMPTYINNER, NULLELEMS) (§14, §17). Descend the directory (`lion_dir_find()`) and take the LEAF EXCLUSIVE; a write descent that
    lands on an INCOMPLETE_SPLIT page finishes that split first (§21, the repair rule). The leaf is
@@ -762,6 +764,8 @@ multi-key opclass, once per extracted key)
    structural fix was the custom WAL resource manager of §25, which logs the bytes that changed with
    no image and no diff: the same 8-client, 2-key burst went from 765 tps generic to 1275 rmgr
    (btree 1632, release build), past the unlogged ceiling above.
+   What did move the ceiling of a few keys was taking fewer turns on the leaf: since 2026-11-10 a
+   statement's rows go in as a batch, a key's rows 256 to a hold (§55).
 
 SCAN (`lion_scan.c`, amgetbitmap; §29 says what the plain index scan does differently)
 1. Descend the directory with SHARE locks to the leaf that holds the search key's entry - the probe
@@ -1872,10 +1876,11 @@ Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *k
    are currently consuming). Advance a set's cursor page only after its containers have been fully
    consumed, and consume means: for the resulting AND container, do the VM checks (step 3) before any
    source page pin is released.
-3. For the result container: for each of the ≤ LION_BLOCKS_PER_CONTAINER heap blocks with members
-   (compute member counts per block via lion_container_range_cardinality over the block's lo range;
-   skip blocks with 0), `visibilitymap_get_status(heap, blk, &vmbuf)`; if all-visible: count +=
-   members, PredicateLockPage; else: append the block's TIDs (lion_code_to_tid) to a recheck list.
+3. For the result container: for each of the ≤ LION_BLOCKS_PER_CONTAINER heap blocks with members,
+   `visibilitymap_get_status(heap, blk, &vmbuf)`; if all-visible: PredicateLockPage; else: append
+   the block's TIDs (lion_code_to_tid) to a recheck list. One pass over the container's members
+   queues those of the blocks that are not all-visible and counts them; the count adds the rest
+   ("The recheck's reads" below).
 4. After the merge completes, recheck: sort the TID list (it is already in TID order if produced in
    ckey order), and for each TID call `table_index_fetch_tuple(fetch, &tid, snap, slot, &call_again,
    &all_dead)` in a loop over call_again (HOT chains); count each visible tuple found. Use
@@ -2054,6 +2059,77 @@ not use at all (count_checkxmin.spec: a HOT update before CREATE INDEX makes the
 indcheckxmin, and the old REPEATABLE READ reader must get the eligibility error rather than a count
 that is missing the row it still sees).
 
+### The recheck's reads (2026-11-10)
+
+A count over a heap that has lost its visibility map bits spends its time in step 4. On 5M rows of
+a synthetic table (96,192 heap pages, about 52 rows a page), an UPDATE of 1% of the rows clears the
+bit on 52% of the pages, and `count(*) WHERE c2 = 1` goes from 0.6 ms to 120-130 ms with the whole
+heap in shared buffers. By perf, `heap_hot_search_buffer()` was 60% of it, nearly all of that one
+load: the header of the tuple the root line pointer names, which nothing has brought into the CPU's
+cache, so that the rows of a block waited for their misses one after another. The buffer table
+lookup of each page (core's `ReadBuffer()`) was most of the rest, then queueing the rows. Three
+changes, none of which changes what is read or what is counted:
+
+- **The tuple headers are asked for ahead** (`lion_prefetch_heap_tuple()`, lion_count_int.h). With
+  the block share-locked, the recheck reads the line pointer `LION_RECHECK_PREFETCH` (8) rows ahead
+  of the one it resolves - a redirect's target for a pruned chain - and prefetches the header it
+  names, so that a block's misses overlap; the filtered recheck and the visibility cache's page sweep
+  (`lion_vis_fill_page()`) do the same. A prefetch reads nothing and cannot fault, so a line pointer
+  that names nothing usable costs the instruction. It is a macro, as `lion_prefetch_range()` is: GCC
+  deletes a function that only prefetches. Distances of 8 to 32 measured alike, 4 slower.
+- **The blocks come through a read stream** (PostgreSQL 17 on): `lion_recheck_heap_heap()` reads
+  its blocks as `lion_recheck_heap_filtered()` already did and a bitmap heap scan does, batched on
+  18 (`READ_STREAM_USE_BATCHING`, whose callback may neither lock nor read). The callback
+  (`lion_tid_blocks_next()`) skips the blocks the visibility cache already answers, looking each one
+  up ahead of the recheck. The recheck changes the cache meanwhile - it records the blocks it reads
+  and fills their entries - but only the entry of the block in hand, and it empties none; a sorted
+  list names each block once. So a block filled when the callback looks is filled when the recheck
+  gets to it, and one that is not cannot be filled before the recheck reads it: the callback decides
+  every block as the recheck will, and a buffer for another block is an ERROR. A stream
+  is begun for every recheck, however short: 20,000 groups' counts of a few rows each took the same
+  time with one per count as with none. Warm, it changes nothing; read from storage, it is most of
+  the gain below.
+- **A container's members on dirty blocks are queued and counted in one pass**
+  (`lion_count_container_masks()`): they were counted with a range cardinality per dirty block and
+  then queued by a second pass over every member. Appending to the list is inline
+  (`lion_recheck_append()`), with flushes, spills and growth left to `lion_recheck_add_slow()`.
+
+Measured on PostgreSQL 18.7 at its defaults for I/O (`io_method = worker`, 3 I/O workers,
+`effective_io_concurrency = 16`) and with `max_parallel_workers_per_gather = 0` unless the row says
+otherwise. Warm is the heap in shared buffers: medians of 9 runs (25 for the small counts). Cold is
+`debug_io_direct = data` with the heap evicted before each run: medians of 3. Each build ran twice,
+alternating, and the figures average the two medians.
+
+| Query, after the 1% UPDATE | warm before | warm after | cold before | cold after |
+|---|---|---|---|---|
+| `count(*) WHERE c2 = 1` (2.5M rows) | 128 ms | 87 ms (1.45x) | 2,700 ms | 1,050 ms (2.6x) |
+| the same with two parallel workers | 71 ms | 56 ms (1.25x) | | |
+| `count(*)` | 295 ms | 190 ms (1.55x) | 2,660 ms | 1,110 ms (2.4x) |
+| `count(*) WHERE c200 = 17` | 12.7 ms | 9.0 ms (1.4x) | 620 ms | 240 ms (2.6x) |
+| `c20, count(*) WHERE c200 = 17 GROUP BY c20` | 36.4 ms | 32.4 ms (1.1x) | | |
+| `GROUP BY c200` | 515 ms | 400 ms (1.3x) | 3,300 ms | 1,620 ms (2.0x) |
+| `GROUP BY c20` | 400 ms | 310 ms (1.3x) | 3,070 ms | 1,700 ms (1.8x) |
+
+Vacuumed, the plain counts take under a millisecond and nothing above touches them. Core's
+sequential scan answers the same four large queries in 340 to 690 ms warm (150 to 270 ms with two
+workers) and 670 to 990 ms cold (440 to 490 ms with two). So read from storage, a count that must
+recheck half of a table's pages still loses to reading all of them in order: the recheck's reads
+are single blocks, which this disk serves at about 50,000 a second whatever the concurrency (16,
+64 and 256 measured alike, and 3 or 16 I/O workers), while the sequential scan reads 128 kB at a
+time. The planner prices a heap that fits in `effective_cache_size` as cached, as core does
+(`pg_lion.cold_page_cost`, §39). Warm with two workers, core's grouped counts (250 to 270 ms) also
+beat lion's, which run serially, and the planner still picks lion for them.
+
+What is left, by perf on the warm plain count: `heap_hot_search_buffer()` 30% (the misses the
+prefetch does not hide, mostly a page's first rows, whose line pointers are the page's own first
+miss), the buffer table 22% (core's lookup; a stream makes it ahead of time, not cheaper), queueing
+14%. In a grouped count the visibility cache's hash lookups are 18-28%: each group looks up every
+block it has rows on, at scattered places of a table larger than the L2 cache. Prefetching the
+slots a few blocks ahead measured no gain - the stalls moved to the prefetches. A table indexed by
+block number would turn the lookups into a forward walk, but it takes memory per range of blocks
+rather than per entry, which a cache of scattered blocks would pay many times over in its
+`work_mem` budget; it was not done.
+
 
 ### Direct readers (2026-10-08)
 
@@ -2214,7 +2290,8 @@ Planner integration
     is taken when it is a filtered count ("Filtered counts" at the end of this section).
     The target list holds those counts, the columns the rules below let it print, and any
     expression over them; window functions over them are computed above the node ("Shapes
-    rewritten to the node's counts" at the end of this section).
+    rewritten to the node's counts" at the end of this section). `count(*) OVER ()` over the
+    table's own rows is the node's count beside them ("A count of every row beside the rows").
   - **HAVING** is accepted when it is a filter the node can apply itself. By the time the hook runs,
     `havingQual` is an implicit-AND list of only those clauses that mention an aggregate (or are
     volatile, or contain a subquery): `subquery_planner()` has moved every other clause into WHERE,
@@ -2538,8 +2615,10 @@ Planner integration
     counted, whatever the WHERE leaves of it - with the entry's own set as a source, and one per
     pair of two columns (§20), plus each count's set-up, `LION_ENTRY_COUNT_COST`
     (`LION_LIST_GROUP_COST` for a group of an IN list that drives them, and
-    `LION_INLINE_ENTRY_COUNT_COST` for an entry small enough to be INLINE in a walk counted one entry
-    at a time, §28 "A walk that returns rows", or in the sum over every entry of §14), and each set of a union
+    `LION_INLINE_ENTRY_COUNT_COST` for an entry small enough to be INLINE - under the inline_limit
+    the index's meta page records, which an `ALTER INDEX ... SET` leaves as it was until REINDEX - in a
+    walk counted one entry at a time, §28 "A walk that returns rows", or in the sum over every entry
+    of §14), and each set of a union
     source rebuilt at every count, `LION_UNION_SET_COST`. Before, every container was two
     cpu_operator_cost whatever it held, members and probes were free, and a group was charged the
     containers of its share of the WHERE's rows rather than of its own set. Since 2026-10-20 a
@@ -3581,6 +3660,32 @@ Unique over a full index-only scan, priced as such, and the cost model decides. 
 DISTINCT c200` 128 ms to 4.6 ms (51 ms with a B-tree on c200); `c20, c200 ... GROUP BY 1, 2`
 127 ms to 15 ms (decoded walk).
 
+**Groups nothing counts.** In those queries nothing reads a group's count, only whether it is 0, so
+each group is §26's existence test in place of a count (`lion_count_path_tests()`, the plan's
+`LION_FLAG_EXISTS`): it stops at the first visible row of the group's intersection with the WHERE,
+a container or two where the count read all of them, and a group with no row reads what its count
+would have. It is a count compared with zero, read the same way, so §26's argument for §9 and §11
+covers it unchanged. It applies to a GROUP BY or DISTINCT with no aggregate in its target or HAVING
+that the node walks a group or a pair at a time - one column, two (§20), an IN list on the group
+column (§15), a GROUP BY folded to one group, `coalesce(col, c)` - and not to the decoded walk
+(§34), which counts every combination in one pass, the top k, which ranks by the counts, the
+cells, the sums over slices and the aggregates over entries, or a GROUP BY beside the anti join over
+a small inner side (§27), which subtracts the rows it drops from each group's count: from a test's
+one row that would lose a group that still has rows. As for a count(DISTINCT) of existence
+tests, the WHERE is not collected ("The WHERE sets, collected once"): a test reads a share of each
+intersection, and a collection could read more than every test together. The price is §26's for
+the same tests (`LION_DISTINCT_EXISTS`). The same plan with counts is priced beside it - it may
+collect the WHERE and count the groups of a walk together (below), or divide them among the
+participants of a Gather ("A GROUP BY in parallel") - and add_path() keeps the cheaper. EXPLAIN
+prints `Group Strategy: First Visible Row`, and EXPLAIN ANALYZE `Groups Tested`.
+`test/sql/countshapes.sql` checks the shapes against a sequential scan, with a key whose every row
+is deleted or updated away and never vacuumed, and `test/sql/countanti.sql` the anti join's groups
+counted. 2M rows, vacuumed, PostgreSQL 18 (release build), against the same plan counting:
+`SELECT DISTINCT country ... WHERE status = 'paid'` (50 keys) 8.3 ms to 0.23 ms, 150 containers
+visited (core: 113 ms); `country, kind ... GROUP BY 1, 2` with the same WHERE (1,000 pairs) 24 ms
+to 8.1 ms (core: 113 ms); `DISTINCT kind` under an IN list of three countries 5.7 ms to 0.7 ms
+(core: 69 ms).
+
 ### Other spellings of answered clauses (2026-11-10)
 
 Three clauses that test what the posting sets already answer, written another way, used to leave
@@ -3811,7 +3916,16 @@ grouping column and one distinct column keeps its plan, and a second form of the
 only compete with it. Where §26 declines - two or more grouping columns, two distinct columns, a
 DISTINCT aggregate other than `count`, a partitioned table (whose (g, k) groups the Finalize Agg
 under the node merges, so the distinct counts above it are exact) - or loses to core on price,
-the finer grouping is offered. The cost is core's sort and Agg over the node's path, its
+the finer grouping is offered.
+
+With no GROUP BY (2026-11-10) the query's one group is every row's, and the finer grouping is the
+DISTINCT aggregates' columns alone: `count(DISTINCT c) ... WHERE ...` is `GROUP BY c` counted and
+core's plain Agg over its rows (AGG_PLAIN, one group), sorted by the DISTINCT aggregate's own keys
+where core marked it presorted. §26's walk answers a single count(DISTINCT) of one table and
+keeps it; what is new is the partitioned table, whose distinct counts §26 does not add up, and two
+DISTINCT aggregates of one table, `count(DISTINCT a), count(DISTINCT b)`, which is `GROUP BY a, b`
+counted. Over 2M rows in four partitions, `count(DISTINCT country) ... WHERE status = 'paid'` took
+27 ms against core's 514. The cost is core's sort and Agg over the node's path, its
 aggregate costs computed as for grouping sets, above, and `add_path()` chooses.
 
 A column the finer grouping adds is grouped by its type's default equality, so one value of each
@@ -3826,6 +3940,60 @@ the Finalize Agg under the node checks the equality of every column it groups by
 100k rows, `g200, count(DISTINCT k50) ... GROUP BY g200`, which §26's walk loses to core: 19 ms
 to 2.2 ms. `test/sql/countgsets.sql` compares each shape with the sequential plan over the same
 table, with and without `enable_presorted_aggregate`, and checks the declines.
+
+### A count of every row beside the rows (2026-11-10)
+
+`SELECT id, ts, count(*) OVER () FROM t WHERE ... ORDER BY ts DESC LIMIT 20`: a page of rows with
+the total beside each (`lion_window.c`). A count over a window with no PARTITION BY and no ORDER BY,
+whose frame holds every row, is one number for every row: the rows the FROM and WHERE select.
+Core's WindowAgg reads every one of them into its tuplestore before it returns the first, so the
+LIMIT above it stops nothing below it.
+
+**The plan.** At UPPERREL_WINDOW over one base relation, `lion_try_window_count_path()` checks that
+every window function of the windows' target is `count(*)`, or `count(c)` of a constant that is not
+NULL, with no FILTER and no run condition, over such a window: no PARTITION BY, no ORDER BY, no
+EXCLUDE, and a frame that holds the partition - ROWS from UNBOUNDED PRECEDING to UNBOUNDED
+FOLLOWING, or any RANGE frame, every row being a peer of every other without an ORDER BY. It counts
+the relation under its WHERE into a rel of its own, as the grouping sets do (the query is made
+`SELECT count(*) FROM t WHERE ...` while it plans, and its paths are priced in the units pinned for
+the window rel, §39), and puts the LionWindowCount node over each of the relation's paths, as core
+puts a WindowAgg over each. The node has two children: the count, run once before the first row,
+and the rows, handed up in their order with the count beside each. Its startup cost is the count's
+total plus the rows' startup, so under a LIMIT it is priced as what it reads - the count and the
+rows the LIMIT takes - against the WindowAgg's every row. PostgreSQL 17 prices that WindowAgg's
+first row after every row it reads (`get_windowclause_startup_tuples()`); 16 prices it as its
+input's first row, so under a LIMIT the WindowAgg would look as if it read a few rows and the node
+would never win. On 16, when the node is offered, core's WindowAgg paths for these windows are
+priced as 17 prices them (`lion_window_price_first_row()`).
+
+**Exact.** The count is the number of rows the second child returns: both are the same relation
+and clauses, read under the statement's snapshot, and the count is exact wherever a count is (§9,
+§11). A volatile clause, which could select other rows the second time, declines, and a relation
+the count declines (row-level security, §9) is left to the WindowAgg.
+
+**What it declines.** The window functions become a count(*) Aggref in the node's target, which
+`custom_scan_tlist` names last and setrefs.c matches; EXPLAIN prints them as `count(*)`, since no
+WindowAgg is left to name their window. The nodes above a window stage read its columns by position
+(a Sort, a Limit), so the query's target must reach them as the node returns it: a target finished
+by a projection above the windows (an expensive expression postponed past the LIMIT), a DISTINCT,
+or an ORDER BY of a window function, which look for the window function by its expression, decline.
+So do a window over groups, which has a grouped rel below it, a join, set-returning functions and
+row marks.
+
+**Execution.** EXECUTE on each window function is asked at startup as ExecInitWindowAgg() asks it,
+with its message (`lion_check_window_execute()`); the count asks it of count(*). A rescan in which no
+parameter of the count changed keeps the count and reads the rows again; a changed one counts again.
+The node reads forward only, so a scrollable cursor's plan has a Material above it.
+
+`pg_lion.enable_window_count` turns it off, as `enable_count_pushdown` does. `test/sql/windowcount.sql`
+compares each shape with the WindowAgg's answer over NULLs and dead and updated rows: the frames
+taken and declined, `count(1)` and a named window, an expression over the count, OFFSET, no WHERE,
+an empty result, a residual clause, a generic plan, the rescans, a scrollable cursor, a partitioned
+table and the EXECUTE check. 2M rows, vacuumed, PostgreSQL 18 (release build), against the
+WindowAgg: `... WHERE status = 'paid' AND country = 'c7' ORDER BY ts DESC LIMIT 20` (8,000 rows) 40
+ms to 1.2 ms; with `status = 'paid'` alone (400,000 rows) 249 ms to 0.3 ms; no WHERE 455 ms to 0.7
+ms; OFFSET 200 under two filters 70 ms to 3.9 ms. Without a LIMIT both read every row (42 ms and
+39 ms).
 
 ### Filtered counts
 
@@ -6537,6 +6705,49 @@ more than half the rows to fetch of every partition and of the one sub-partition
 clause, and the switch; a dirty heap before and after VACUUM; and a LATERAL value in the clause,
 which rescans the node partition by partition.
 
+### The decoded walk over partitions (2026-11-10)
+
+A `GROUP BY` of three or more columns, or of two whose pairs (§20) cost more than one pass over
+the rows, is §34's decoded walk over one table. Over a partitioned table it was
+refused, so `kind, country, count(*) ... WHERE status = 'paid'` got either §20's pairs, priced at
+every pair of every partition, or core's plan. The walk's rows are partial counts already, under
+a Finalize Agg, as a partitioned table's are, so nothing above the node changes: each partition is
+decoded in its turn, from its own index of each column, and its passes' rows go up as that
+partition's partial rows.
+
+- **Plan.** The GROUPN member holds the walk's columns as the parent numbers them and one index
+  per column per relation counted: the table's, or each partition's in PARTS order
+  (`lion_priv_decode_groupn()`). A partitioned plan's own are InvalidOid, as its other indexes
+  are, and each partition's first is the one it walks (`groupidxoid`) with no inner index of a
+  pair, which `lion_count_priv_check()` holds it to. Every partition has a scalar lion index on
+  every column, as `lion_collect_targets()` asks of any driving column; one without leaves the
+  query to core. A count by cells (§10), whose driver is a one-column decoded walk, still counts
+  one table: its dimensions' indexes would be per partition too.
+- **Run.** The partitions' indexes are opened with their other relations (`lion_open_parts()`) and
+  made the walk's for the partition's turn (`lion_open_relation()`), which closes only its own. A
+  turn's walk starts afresh for each run - the WHERE's, then each filtered count's (§10) - and reads
+  the run's WHERE as one table's does (`lion_decode_where()`): a clause the partition's bounds
+  imply is left out, and a partition where a clause has no entry counts nothing. The chunk sizes
+  are the first partition's (`lion_decode_caps()`), which every partition's passes then take.
+- **Price.** Each partition's walk as one table's, every column's values that partition's
+  estimate (`lion_cost_decode_path()`), and the rows each partition's combinations with rows, as
+  the pairs' partial rows are estimated.
+
+A residual clause (§16, "Residual clauses over a partitioned table") is never beside the walk,
+which tests no row, so a query that needs one keeps the pairs or core's plan.
+
+On 2M rows in four monthly partitions: `status, kind, country, count(*)` (5,000 groups) took 36
+ms against core's 515, `kind, country, count(*) ... WHERE status = 'paid'` 21 ms against 210, and
+`kind, count(DISTINCT country) ... WHERE status = 'paid' GROUP BY kind`, the finer grouping of §10
+over it, 24 ms against 444. `test/sql/group_decode.sql` runs the walk over a table partitioned by
+LIST whose last partition numbers its columns differently and has an index per column: three
+columns, a `WHERE`, two columns, a clause the bounds imply, one that prunes, one with no entry in
+some partitions, HAVING, filtered counts with and without a `WHERE`, count(DISTINCT) with and
+without a GROUP BY, and a rescan with a new value, each compared with a sequential scan. All run
+the walk but `count(DISTINCT c), count(*)`, whose finer grouping is the one column c. A range in
+a FILTER and a range on an outer row's value are compared too; neither is decoded, as over one
+table.
+
 ### A parent pruned to one leaf (2026-10-26)
 
 An application names the partitioned table, and plan-time pruning leaves it one leaf: a statement
@@ -7236,8 +7447,11 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
 - **Chunks** (`lion_positions.[ch]`, item type `LION_CT_POSITIONS`): a key's members - one per
   row, its heap TID code and its tsvector positions with weights - varint-encoded in ascending
   code order, at most 4,104 bytes a chunk.  The header's `ckey` field holds a heap **block**, a
-  lower bound on the block of every member.  `test/unit/positions_test.c` checks every operation
-  against a brute-force reference and fuzzes damaged chunks.
+  lower bound on the block of every member; the payload's header records the last member's code
+  and the chunk's impacts ("Block bounds", under "Ranking" below).  A position tree's chunks are
+  filled to 512 bytes of members (`LION_POS_TREE_BYTES`), and a chunk of one member to what it
+  needs.  `test/unit/positions_test.c` checks every operation against a brute-force reference and
+  fuzzes damaged chunks.
 - **Position trees** (`lion_postree.c`): a posting tree (§22) whose pages carry
   `LION_PAGE_POSITIONS` and are stamped with the position tree's own head, whose leaf items are
   chunks, and whose keys are heap blocks.  Like a posting set it has no internal level while it has
@@ -7360,7 +7574,12 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     candidate's, so a count whose candidates lie close together - a copy's, a count of every
     row - decodes each member of its lexemes once, and one whose candidates lie further apart than
     a chunk holds decodes part of one at each: 1,606 to 1,703 members a seek, measured over trees
-    of 400,000 to 7.5 million members of one position (`LION_POS_SEEK_MEMBERS`, 1,650).  Each
+    of 400,000 to 7.5 million members of one position (`LION_POS_SEEK_MEMBERS`, 1,650).  That was
+    with chunks of half a page; with the 512-byte chunks of "Block bounds" (2026-11-10), over 2
+    million members on a release build, a seek to every 10,000th member costs what 385 members do
+    and one to every 1,000th 180, against 1,585 and 1,200 before on the same machine (a count of
+    `r & foo <-> bar`, `r` in one row of 1,000: 50 ms to 6.4 ms).  The price is left at 1,650,
+    about four times high: it errs towards the plans it chose before, which now run faster.  Each
     member decoded is `pg_lion.position_member_cost` (2.4 `cpu_operator_cost`), and each
     candidate `pg_lion.position_check_cost` (4.3) a lexeme beyond that, `TS_execute()` and its
     callbacks: 11.4 to 12.8 ns, the leaves a cursor steps and descends to included, and 21.6 ns
@@ -7575,9 +7794,76 @@ one part in 10^9 so a sum of them rounded down cannot pass for a score.
 This pays most when a common lexeme sits beside rarer ones: on a synthetic 500k-row benchmark, top
 10 for one very common lexeme and two rarer ones went from 41 ms to 16 ms. When every lexeme is
 common, each one's maximum is close to the scores at the top, nothing becomes non-essential, and
-the walk still reads every member. Block-max bounds (a maximum per chunk, not per lexeme) would
-skip whole chunks there, but need a maximum tf and a minimum length stored per chunk, which the
-format does not have.
+MaxScore alone reads every member: the block bounds below are for that case.
+
+**Block bounds** (2026-11-10).  A chunk's header bounds what its rows can score, so the walk
+bounds each lexeme by the chunk it is in, not by its lexeme-wide maximum (block-max indexes, Ding
+and Suel, here with MaxScore's essential split rather than WAND's pivot).
+
+- **The header** (`lion_positions.h`).  After the 8-byte container header, a position chunk's
+  payload opens with a uint16 count of its member bytes, then the last member's code as a uint32
+  offset from its header block's base (`LION_POS_LAST_UNKNOWN` for a chunk with no member, or one
+  whose last member is 2^32 codes or more past it), then four impact pairs of bytes, (tf - 1,
+  length code); the members follow at byte 22, where they were at byte 10.  Every member is
+  dominated by a pair, its tf at most the pair's and its row's length at least the length the
+  pair's code stands for.  A term's score rises with tf and falls with the length for every `k1` of
+  at least 0 and `b` from 0 to 1, so the best of the pairs bounds every row of the chunk whatever
+  the query's parameters - they are only known when it runs.  The length code is logarithmic,
+  sixteen steps an octave and rounded down (`lion_pos_len_code()`): codes 0 to 207 cover 0 to
+  65,535, each at most a sixteenth below the length.  The pairs are a Pareto front, tf descending
+  and length descending; a fifth is merged with its neighbour into the pair that dominates both,
+  the two neighbours whose merge costs least in length codes.
+- **Where the lengths come from.** The extraction knows a row's length, which it files under the
+  empty key ("Ranking" above), and sets it on every key of the row (`LionKeyPositions.dl`). The
+  build's spool carries it as one more uint16 after a member's positions, so a run that spills
+  and the parallel build's workers keep it, and inserts take it from the extraction; a build
+  that moves a key's members from its first chunk to a tree keeps their lengths beside them.  A
+  member written without its row's length (`dl` 0) would add the pair that dominates every
+  member, (tf 256, length 0), and its chunk would bound nothing below the lexeme's maximum.
+  VACUUM removes members and leaves the pairs, and a split gives both halves the whole chunk's:
+  bounds that are no longer tight, never wrong.  `lion_poschunk_check()` (and so verify) checks
+  the pairs' order, that no member has more positions than the largest tf allows, and the last
+  code; that a pair's length is at most its rows' is not checked.
+- **Chunk size.** A chunk of half a page held hundreds of a common lexeme's rows, whose best
+  bound was near the lexeme's maximum.  The build fills chunks to 512 bytes of members
+  (`LION_POS_TREE_BYTES`), a few dozen rows, and an insert splits a chunk past that; a chunk of
+  fewer than two members takes what it needs, up to a container.  On a synthetic 500k-row table
+  the index grew 2%.
+- **The walk** (`lion_bm25_topk()`).  The key space is cut into windows: each lexeme's cursor is
+  asked for its chunk at or after the window's start without decoding a member
+  (`lion_poscursor_chunk()`), and the window ends at the lowest last code among those chunks, so
+  within it every lexeme's rows are in that one chunk.  A lexeme's maximum in the window is its
+  chunk's bound, or 0 when the chunk starts past the window's end; MaxScore then runs on those
+  maxima as above, essential lexemes merged and the others sought, and a window whose maxima sum
+  to no more than the heap's worst is stepped over without a member read.  A lexeme whose chunk
+  does not record its last code is bounded by its maximum and ends no window.  Past 16 lexemes
+  (`LION_BM25_WINDOW_TERMS`) the walk is one window at every lexeme's maximum, as before.  A
+  cursor's seek also steps over chunks whose last code is below its target without decoding
+  them, which every position filter gets too.
+- **Exactness.** A row's score is still added up in `lion_bm25_score_row()`'s order, highest idf
+  first, whichever lexemes were essential, so it is the same float.  A row is left out only when
+  a bound says it cannot get in: a sum of bounds is nudged up a relative 1e-9 first
+  (`lion_bm25_cannot()`), far more than rounding takes off it and far less than two different
+  scores differ by.  `test/sql/bm25_blocks.sql` checks rows and scores against scoring every row,
+  bit for bit, after a build that spills, inserts, updates, deletes, VACUUM and a parallel
+  rebuild.
+- **Measured** (PostgreSQL 18.6 release build, warm, synthetic 500k documents of uniform length,
+  top 10 unless said; median ms, before against after):
+
+  | query | before | after |
+  |---|---|---|
+  | one common word | 24.3 | 1.7 |
+  | two common words, AND | 24.2 | 3.7 |
+  | a phrase of two common words | 23.7 | 4.7 |
+  | five common words, OR | 31.8 | 21.8 |
+  | three common words, top 100 | 31.3 | 18.1 |
+  | varied lengths, one common word | 21.2 | 3.2 |
+  | varied lengths, three common words | 33.3 | 24.0 |
+  | varied lengths, common and rare words | 5.6 | 1.6 |
+
+  "Before" already has the faster varint decoding of the same change; without it the first rows
+  took 39, 36 and 48 ms.  The more common words an OR has, the closer every window's sum of bounds
+  is to the top scores, and the less it skips.
 
 **The planner path.** `lion_bm25_score(doc, query, index, k1, b, col)` is the score of one row,
 computed from its tsvector with the N, df and avgdl of the index column `col` names, read once per
@@ -10579,14 +10865,20 @@ What pg_lion installs into the server, all of it from `_PG_init()` (lion_am.c, l
 lion_ordered.c, lion_bm25_scan.c, lion_selfuncs.c, lion_wal.c): `create_upper_paths_hook` and
 `set_join_pathlist_hook`; `set_rel_pathlist_hook` three times over - `LionOrdered` (§30), `LionBm25`
 (§39) and the plain-scan repricing with the row correction (§33, §40), installed in that order, so
-the repricing runs first -; `get_relation_stats_hook` and `get_index_stats_hook` (§33, §41); and
-nothing else among the hooks - no planner, executor, ProcessUtility or object-access hook -; a
-custom WAL resource manager, only while `shared_preload_libraries` is processed; its GUCs, with the
+the repricing runs first -; `get_relation_stats_hook` and `get_index_stats_hook` (§33, §41);
+since §55, `ExecutorStart_hook`, `ExecutorEnd_hook` and `ProcessUtility_hook`, which write a
+statement's buffered inserts before a query or a utility command and note `INSERT ... ON CONFLICT`
+runs, and a transaction and a subtransaction callback (lion_defer.c); and nothing else among the
+hooks - no planner or object-access hook -; a custom WAL resource manager, only while `shared_preload_libraries` is processed; its GUCs, with the
 `pg_lion` prefix reserved by `MarkGUCPrefixReserved()`. Every hook saves the previous value and
-calls it: all but one FIRST, adding their own path after (`lion_create_upper_paths()`,
+calls it: all but one planner hook FIRST, adding their own path after (`lion_create_upper_paths()`,
 `lion_ordered_set_rel_pathlist()`), so whichever extension was loaded before pg_lion has already
 added its paths when pg_lion adds its own; the plain-scan repricing calls it LAST, so that the plain
-paths are repriced before anything compares against them. An extension loaded after pg_lion reaches
+paths are repriced before anything compares against them. The `ExecutorStart_hook` and
+`ProcessUtility_hook` of §55 do their writing before calling the previous hook, and their
+bookkeeping around it; the `ExecutorEnd_hook` writes nothing itself: a statement's rows go in when
+`standard_ExecutorEnd()` closes its indexes, so a hook installed before pg_lion's cannot assume
+they are written when it starts. An extension loaded after pg_lion reaches
 pg_lion through its own chaining, when it chains: Citus does not, for two of these hooks (the
 addendum "Citus and TimescaleDB" below). Nothing is ever uninstalled: core has not unloaded a library since
 PostgreSQL 15 (no `_PG_fini`), and `_PG_init()` runs once per process, so there is no reload-order
@@ -16965,9 +17257,10 @@ GROUP BY coalesce(g, c) adds the NULL entry's and c's counts into its one group 
 taken alone, so nothing is counted ahead that a pause would have kept, and that a LIMIT above may
 never ask for. The WHERE collected and its groups counted in batches (§10, "The groups of a walk,
 counted together") never paused within a batch, and is unchanged. `directory.sql` §20 checks that
-such walks read each leaf once - with no WHERE, a HAVING, coalesce, a WHERE collected and one never
-collected, over leaves that mix INLINE and CHAIN entries - and `countpause.sql` that they pin
-nothing while paused.
+such walks read fewer than two directory pages a leaf - with no WHERE, a HAVING, coalesce, a WHERE
+collected and one never collected, over leaves that mix INLINE and CHAIN entries - rather than one
+a group; the bound leaves room for the descent's pages and for the leaf a collected WHERE reads
+again, above. `countpause.sql` checks that they pin nothing while paused.
 The sums never pause: the sum over a range, the sum-over-all of §14, the count(DISTINCT) walk of §26
 and `lion_index_count_group_stats()` each walk to the end within one call. §28's pinned-GROUP-BY
 test (`range.sql` §14, at most one leaf pinned) holds as before.
@@ -19621,8 +19914,8 @@ each, and the answer's members taken out at each key the entry has. Or, where th
 choice would walk the column (`lion_scan_notnull_walks()`: a scalar column, beside sets with no
 range or long list), the walk, made from the statistics as the executor makes it from the
 directory: the NULL entry from the null fraction, the walk from the column's `ndistinct` entries
-of the other rows, an entry small enough to be INLINE (`LION_DEFAULT_INLINE_LIMIT`) its bytes of
-the leaves and any other its pages, once per window. A lone `IS NOT NULL` walks its column, which
+of the other rows, an entry small enough to be INLINE (under the index's own `inline_limit`, off
+its meta page) its bytes of the leaves and any other its pages, once per window. A lone `IS NOT NULL` walks its column, which
 the full walk's price already covers. The plain scan no longer counts as rechecking for it
 (`lion_plain_scan_shape()`), and `lion_path_rechecked_quals()` names what a plain scan's source
 does leave to the recheck, for §40.3. `indexscan.sql`'s plan pins, `a IS NOT NULL AND b = 5`'s
@@ -23610,6 +23903,86 @@ The plan carries k, the candidates and the tie rule in a new member of custom_pr
 they must all come out); ANALYZE adds `Top K Entries Walked`, `Top K Groups Counted` and, when it
 happened, `Top K Walked Whole`. `pg_lion.enable_topk` turns it off.
 
+### The fallback (2026-11-10)
+
+`GROUP BY user_id ORDER BY count(*) DESC LIMIT 10` under `WHERE status = 'paid'`, on a synthetic
+table of 2M rows and 200,000 users of about ten rows each, took 505 ms as a top k against 215-299
+ms for core's bitmap heap scan and hash aggregate - and was picked, priced at 1,697 against
+75,622. The candidates' counts were a fifth of their bounds, and the bounds of the entries after
+them nearly as large: the walk ran out of candidates and counted all 199,993 groups, which the
+price left out.
+
+**When it falls back.** The k-th count only grows and the next bound only falls as the walk goes,
+so it runs out exactly when, of all its candidates, fewer than k have a count that reaches the
+bound of the first entry left out (more than it, strictly). Under a WHERE that keeps a share s of
+the rows independently of the group, a candidate of bound b reaches that bound T with the
+binomial chance P(Bin(b, s) >= T), taken as normal with a continuity correction; the number that
+do is a sum of those chances, taken as normal too, and P(fewer than k) is how often the top k
+falls back (`lion_topk_whole_share()`). With nothing in the WHERE but g's own clauses every count
+is taken to be its bound, and only the strict rule to fall back. That is an estimate: an entry
+still holding TIDs of dead or invisible rows counts fewer visible rows than its bound, and a
+non-strict top k can then fall back with no WHERE at all, which the price does not foresee - as
+before this change, it pays for the walk it makes.
+
+**The bounds.** The column's most common values give theirs, largest first, but for those a
+clause on g alone rejects (`lion_topk_freqs()`). Past that list the r-th largest key's rows are
+read where the share (r - 1/2) / n of the keys lie above (`lion_topk_tail_bound()`), never above
+the list's smallest; the candidates there are taken in 32 strata of equal numbers, each at its
+middle one's bound. How many keys there are past the list, their rows and the spread of those are
+what a lion index on the column counted (§33, "The rows of a probed key"): its keys less the
+list's, the rows the list leaves, and the spread sqrt(Σn² / keys - mean²), Σn² counted over
+those keys (`lion_key_tail_counted()`), whatever `pg_lion.enable_skew_estimate` says. Where no index counted
+them, ANALYZE's distinct values less the list's, the rows it leaves them, and the spread of rows
+put in keys at random: the square root of the mean. A clause on g alone keeps the share of the
+keys past the list that its selectivity keeps of their rows.
+
+The shape of that spread decides the answer, since the candidates' bounds and the first one left
+out lie a few standard deviations above the mean. Rows put in keys at random spread as a count
+does, and a normal curve cuts a count's upper tail short: ten rows a key on average, the 75th of
+200,000 keys holds 22, which a normal curve puts at 19.6 - too far below the candidates', so a
+WHERE that keeps 90% was priced to fall back strictly three times in four, where it never did.
+That part of the spread, up to the mean, is read as a gamma variable by Wilson and Hilferty's
+cube-root form, m (1 - 1/9a + z / 3 sqrt(a))^3 with a = m^2 / v, which keeps the count's tail; the
+spread beyond it is the column's skew, with a longer tail still and no negative values, and is
+read as log-normal; a key's bound is the larger of the two. A skewed column with a short list -
+ANALYZE at a statistics target of 10, its tail's spread several times its mean - read as normal
+put the bounds after the k-th far below the real ones, priced its top k to fall back, and planned
+a walk more than ten times slower than the top k it replaced; read as log-normal it keeps the top k.
+
+So a column whose largest entries are about as large as the ones after them falls back under a
+WHERE that takes away more than they differ by, a skewed one only where the WHERE takes away more
+than the bounds fall from the k-th to the first left out - which the candidates, 2k/s of them,
+are sized to cover - and keys of exactly the same rows always fall back under the strict rule.
+On the table above (PostgreSQL 18, warm cache, best of several runs), `WHERE kind < n` keeping
+the share shown, against the plans before this change (with the GROUP BY walk reading each leaf
+once, §28 "One read per leaf"):
+
+| WHERE keeps | falls back, priced | before | now | strictly, priced | before | now |
+| --- | --- | --- | --- | --- | --- | --- |
+| 100% | 0 | top k, 10 counted, 7 ms | the same | 0 | top k, 12 counted, 8 ms | the same |
+| 95% | 2e-25 | top k, 23 counted, 19 ms | the same | 8e-9 | top k, 50 counted, 18 ms | the same |
+| 90% | 5e-7 | top k, 40 counted, 18 ms | the same | 0.04 | top k, 50 counted, 17 ms | the same |
+| 85% | 0.06 | walked whole, 592 ms | the same | 0.86 | walked whole, 599 ms | hash aggregate, 531 ms |
+| 80% | 0.88 | walked whole, 602 ms | hash aggregate, 531 ms | 1 | walked whole, 706 ms | hash aggregate, 523 ms |
+| 70% | 1 | walked whole, 626 ms | hash aggregate, 499 ms | 1 | walked whole, 639 ms | hash aggregate, 531 ms |
+| 50% | 1 | walked whole, 614 ms | hash aggregate, 424 ms | 1 | walked whole, 585 ms | hash aggregate, 445 ms |
+
+The query that lost, under a WHERE keeping a fifth, went from 468 ms to 210 ms. At 85% the top k
+counts 21 for the 10th group against a first bound left out of 22: a near
+thing, priced as unlikely, and planned as before. On a Zipf-like column of 160,714 keys in 2M
+rows, under WHERE clauses keeping 5% or 20% of the rows and under none, and the same with a
+statistics target of 10, every plan is as before.
+
+**The price.** The walk the top k falls back on is the plain GROUP BY's, so it is made a path of
+its own beside the top k (`lion_try_count_path_once()`), priced as any GROUP BY walk is, and the
+top k's price adds that path's, as it went to `add_path()`, times how often the fallback is
+expected - before the first row, like the rest of the top k's. `add_path()` keeps the cheaper of
+the two, and core's plans weigh against both: the query above now plans core's hash aggregate.
+The plain path is made only where the fallback is expected at all, and the spread asked of the
+index only where a candidate or the first entry left out lies past the list. DEBUG2 prints the
+chance (`lion: a top 10 from 101 candidates, under a WHERE that keeps 0.2 of the rows, counts
+every group in 1 of runs`).
+
 ### Expressions of the grouping column
 
 `GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3` was declined: a grouping clause that
@@ -23694,7 +24067,10 @@ group counted, and not without a tie-breaker); `g <> c` and `g IS NOT NULL` taki
 the declines - ascending, ordered by the group, HAVING, DISTINCT, a window function, count(g)
 beside the NULL group, few groups, a generic plan's LIMIT, the setting off; deleted rows still in
 the entries' counts, before and after VACUUM; a rescan under each outer row's WHERE; expressions of
-the grouping column, and the volatile one, the one of another column and the one alone it declines.
+the grouping column, and the volatile one, the one of another column and the one alone it declines;
+the fallback - a column of about equal keys with no WHERE, with ties broken, under a WHERE that
+keeps 95% (the top k) and one that keeps a fifth (the plain walk), keys of exactly the same rows
+under the strict rule (the plain walk), and heavy groups under a WHERE (the top k).
 
 ## 37. Aggregates over the entries of lion columns, weighted by their rows (implemented 2026-09-30)
 
@@ -33729,10 +34105,11 @@ percentiles (§52.12).
 
 - **The aggregates**: `count(x)`; `sum(x)` and `avg(x)` of `int2`, `int4` and `int8` - sums of
   integers only: the date and time types have none, and the allowlist's others are not sliced;
-  `min(x)` and `max(x)` of those and of `date`, `time`, `timestamp` and `timestamptz` - of the bare
-  column (a `RelabelType` aside), with no `DISTINCT`, `FILTER` or `ORDER BY`. They are told by
-  `aggfnoid` (`F_SUM_INT4`, `F_MAX_TIMESTAMPTZ`, ...), so a user's aggregate of the same name is
-  not taken. Without `int128` in the compiler, sum and avg are left to the other plans.
+  `min(x)` and `max(x)` of those and of `date`, `time`, `timestamp` and `timestamptz` - of the
+  bare column (a `RelabelType` aside), with no `DISTINCT` or `ORDER BY` (a `FILTER`: §52.14). They
+  are told by `aggfnoid` (`F_SUM_INT4`, `F_MAX_TIMESTAMPTZ`, ...), so a user's aggregate of the
+  same name is not taken. Without `int128` in the compiler, sum and avg are left to the other
+  plans.
 - **The column**: a key column of a whole (not partial) lion index that slices it at its type's
   width (`LionState.sliced`, `slicebits == lion_slice_type_nbits(typid)`), not multi-key. Several
   columns, of one index or several, in one query; a column may also be the grouping column.
@@ -33742,18 +34119,15 @@ percentiles (§52.12).
   (§32) - parameters of a generic plan and stable expressions; `count(*)` and `count(*) FILTER
   (WHERE ...)` beside the aggregates and a `HAVING` over them; a `GROUP BY` of one or two
   lion-indexed columns, an `IN` list on the grouping column driving its groups (§15), or none.
-- **Declined** (`lion_count_path_slices_ok()`): a join (the FK-side join of §27, an anti join), a
-  partitioned table's `GROUP BY` (each partition would answer its own and core's partial
-  aggregates add them up, which needs the partial states of `avg` and `sum(int8)` serialized - not
-  written; the one row of a partitioned table is taken, §52.13), a
+- **Declined** (`lion_count_path_slices_ok()`): a join (the FK-side join of §27, an anti join),
+  `avg` and `sum(int8)` in a partitioned table's `GROUP BY` or beside filters in one (§52.15), a
   residual clause (§10: the slices would have to be counted over the rows the heap keeps), the
   aggregates over keys in the same target list (§37), `count(DISTINCT)`, the top k (§36), the
-  decoded walk of §34, three grouping columns, a filtered count beside a `GROUP BY`, a coalesce
-  group or cells (§10), a parallel plan, and a hot standby, where the pushdown collects nothing
-  (§10) - a plan made on the primary and run there all the same counts every slice beside the
-  `WHERE`'s located sets (`lion_slice_column()`'s standby branch), exact and slow. With no `WHERE`
-  and no `GROUP BY` this and the aggregates over keys (§37) are both offered, and the price
-  decides.
+  decoded walk of §34, three grouping columns, a coalesce group or cells (§10), a parallel plan,
+  and a hot standby, where the pushdown collects nothing (§10) - a plan made on the primary and
+  run there all the same counts every slice beside the `WHERE`'s located sets
+  (`lion_slice_column()`'s standby branch), exact and slow. With no `WHERE` and no `GROUP BY` this
+  and the aggregates over keys (§37) are both offered, and the price decides.
 - **The switches**: `pg_lion.enable_count_slices` (on) turns the whole of it off, and the planner
   builds what it built before; `pg_lion.enable_slice_decode` (on) the decode route alone (§52.4);
   `pg_lion.enable_slice_kernel` (on) the plane kernel alone (§52.5).
@@ -33986,14 +34360,13 @@ Batches Decoded`, `Slice Keys Decoded` and `Slice Rows Decoded` (and `Slice Rows
 `Slice Heap TIDs Rechecked` and `Slice Heap Blocks Rechecked` where the map did not vouch for a
 page.
 
-### 52.9 Not on a standby, a join or a partitioned table's groups
+### 52.9 Not on a standby or a join
 
 Restated from §52.1 because the task asked for each: on a hot standby the planner offers none of
 this (the pushdown collects nothing there, §10), and a plan made on the primary runs exact and
 slow - every slice counted beside the located sets, the descent's steps intersected again, and the
-groups a group at a time; a join (the FK-side join of §27, a semi or anti join) and a partitioned
-table's `GROUP BY` are declined, the latter for want of serialized partial states for core's
-Finalize Agg (§52.12). A partitioned table's one row is answered (§52.13).
+groups a group at a time; a join (the FK-side join of §27, a semi or anti join) is declined. A
+partitioned table's one row is answered (§52.13), and its groups as partial rows (§52.15).
 
 ### 52.10 Measured
 
@@ -34149,11 +34522,12 @@ What the tables say:
   of the pass's combinations, whose rows go up final), or with serialized partial states below a
   Finalize Agg.
 - **Partitioned tables' groups, joins** *(the one row of a partitioned table: done 2026-10-28,
-  §52.13)*: each partition answering its own needs partial states core's
-  Finalize Agg can combine - `sum(int8)` and `avg` keep `internal` states, which the node would
-  have to emit serialized (`int8_avg_serialize()`, `numeric_poly_serialize()`); `min`, `max` and the
-  int8 sums of `sum(int2/int4)` combine as they are. The FK-side join's counts per dimension row
-  (§27) would each need the slices - a group at a time, or decoded by fact key.
+  §52.13; groups as partial rows but for `avg` and `sum(int8)`: 2026-11-10, §52.15)*: each
+  partition answering its own needs partial states core's Finalize Agg can combine - `sum(int8)`
+  and `avg` keep `internal` states, which the node would have to emit serialized
+  (`int8_avg_serialize()`, `numeric_poly_serialize()`); `min`, `max` and the int8 sums of
+  `sum(int2/int4)` combine as they are. The FK-side join's counts per dimension row (§27) would
+  each need the slices - a group at a time, or decoded by fact key.
 - **The decode route on a standby**, which cannot collect the `WHERE`: a walk with the row filter
   and the located sources would do, as §34's does without a copy.
 - **A summed range's collection for C0 is underpriced**: `u4 sum, range 10%` runs at 210 units a
@@ -34221,9 +34595,9 @@ planner keeps (§16):
   a parent pruned to one leaf is priced as that leaf named alone.
 - **EXPLAIN** names no index in `Aggregates From Slices`, as it names none in `Lion Indexes`:
   each leaf reads its own.
-- **Not taken**: a `GROUP BY` (§52.12: core's Finalize HashAggregate combines the leaves'
-  partial groups, and `avg` and `sum(int8)` have `internal` partial states the node would have to
-  serialize; an in-node merge of every leaf's groups is what §16 removed for its memory); a clause
+- **Not taken**: `avg` and `sum(int8)` in a `GROUP BY`, whose `internal` partial states the node
+  would have to serialize for core's Finalize HashAggregate (the rest of a `GROUP BY`: §52.15;
+  an in-node merge of every leaf's groups is what §16 removed for its memory); a clause
   on the partition key with `enable_partition_pruning` off, or one a kept leaf's bounds do not
   imply, which stays residual (§16, "Residual clauses over a partitioned table"); a hot standby,
   as for a table. A range on a sliced column, as the `WHERE` of these aggregates or of a count,
@@ -34237,8 +34611,8 @@ index, every type of the allowlist with NULLs, extremes and infinities, `int8` s
 `bigint`; `WHERE`s on other indexed columns, pruning by the key, the key implied, pruned to
 nothing, pruning off, a generic plan and a LATERAL rescan; a dirty heap - updates that move rows
 between leaves, deletes, this transaction's rows rolled back - and VACUUM, with `EXPLAIN ANALYZE`'s
-counters; and the declines (a leaf with an unsliced, a partial or an expression's index, a
-`GROUP BY`, a residual clause, the switch off; a REINDEX under a cursor refused).
+counters; and the declines (a leaf with an unsliced, a partial or an expression's index, an
+`avg` per group, a residual clause, the switch off; a REINDEX under a cursor refused).
 `test/sql/slices_partitioned_leaf.sql` has the cases pruned to one leaf (of a sub-partitioned
 parent, an empty one, a LIST's NULL partition, one of a HASH's), apart because PostgreSQL 18.0 to
 18.6 drop a disabled path's `disabled_nodes` in an Append of one child (fixed upstream for 18.7):
@@ -34246,7 +34620,116 @@ the plan forced off is not off there and is the cheaper on data this small, so t
 once on those releases.
 `test/isolation/slices_partitioned.spec` runs §52.11's snapshot checks against a parent of three
 leaves, the writer's updates moving rows between them; `slices_plan.sql`'s partitioned table now
-gets its one row from the slices and its `GROUP BY` from core.
+gets its one row and its groups (§52.15) from the slices.
+
+### 52.14 Filtered aggregates (2026-11-10)
+
+An aggregate of §52.1 with a `FILTER` is answered from the slices over its filter's rows:
+
+    SELECT sum(b) FILTER (WHERE h = 1), sum(b) FILTER (WHERE h = 2), sum(b),
+           count(*) FILTER (WHERE h = 1)
+      FROM t WHERE g = 3;
+
+      Custom Scan (LionCount)
+        Lion Indexes: t_g (g = 3)
+        Count Filter 1: t_h (h = 1)
+        Count Filter 2: t_h (h = 2)
+        Aggregates From Slices: t_v (b, filter 1: every bit counted),
+          t_v (b, filter 2: every bit counted), t_v (b: every bit counted)
+
+- **The filter is a filtered count's** (§10, "Filtered counts"): its condition numbered and
+  analysed as a filtered count's is, one filter for each distinct condition, shared by a
+  `count(*) FILTER` of the same condition. A condition the posting sets do not answer declines the
+  query as it declines a filtered count. `count(x) FILTER (WHERE c)` of a sliced column is taken
+  here, from C0's count, with no NOT NULL proof (E holds no NULL), where a column no index slices
+  goes to the filtered counts and their proof.
+- **A sliced column is a column and a run**: `sum(b)`, `sum(b) FILTER (WHERE h = 1)` and `max(b)
+  FILTER (WHERE h = 1)` are two columns of member 25, (b, run 0) and (b, run 1), the second with its
+  sum and its descent. Member 25 has a fifth list, each column's run; a run past the plan's filters
+  is refused on decode.
+- **The executor** answers a run's columns where run 0's were answered, after the run is located
+  and before its sets are released (`lion_count_runs()` calls `lion_slice_run()` or, on a
+  partitioned table, `lion_slice_part()` for every run): C0 = E ∧ (WHERE ∧ filter f), collected
+  from run f's located sources, and then §52.2's counts and descents. A run is counted only where
+  the target list asks for its count (`lion_run_counted()`): a run whose only readers are slice
+  columns is located and collected, not counted, since |C0| is the count those columns need. A run
+  that selects nothing answers 0 and NULLs as §52.2's `WHERE` does.
+- **A range in a filter** on a sliced column is folded from the slices (§53) as a range of the
+  `WHERE` is: `lion_count_path_filters()` marks it a slice range where the build is §53's, and
+  EXPLAIN's `Range From Slices` lists it with its filter, `(32 slices, filter 2)`. §53's build is
+  offered with no `WHERE` when an aggregate has a `FILTER` (`lion_query_may_slice_ranges()`).
+  A range on another column is §10's: a source collected from its entries (§32).
+- **The price** is each run's own: its located sources and collection priced as
+  `lion_count_path_price_runs()` priced that run (`runcost[r]`), its rows the relation's under the
+  `WHERE`'s and the filter's selectivity, and its count only where something counts it - where
+  every run had been priced as the whole multi-run count, which left plans the slices win to
+  core.
+- **Why it is exact**: §52.2's argument, run by run. Run f's sources are located under the node's
+  snapshot with their pins; C0 is a copy made after it, counted only ANDed with a slice located
+  with its pin. Nothing in a run touches another's sets (§10, "Runs").
+
+### 52.15 Partial rows (2026-11-10)
+
+A `GROUP BY` beside filters, and a partitioned table's `GROUP BY`, go up as §10's partial rows
+below core's Finalize HashAggregate:
+
+    SELECT g, count(*), sum(b) FILTER (WHERE h = 1), max(tz) FILTER (WHERE h = 1), min(b)
+      FROM t GROUP BY g;
+
+      Finalize HashAggregate
+        Group Key: g
+        ->  Custom Scan (LionCount)
+              Lion Indexes: t_g (g)
+              Count Filter 1: t_h (h = 1)
+              Group Key: g
+              Aggregates From Slices: t_v (b, filter 1: every bit counted),
+                t_v (tz, filter 1: existence counted, max descent), t_v (b: existence counted, min descent)
+              Slice Groups: one at a time
+
+- **The rows**: each run's groups, and each leaf's, are rows of their own, as §10's filtered
+  counts per group are; a row of run r holds run r's sliced columns, answered a group at a time
+  (§52.3), and NULL in every other run's (`lion_slice_partial_null()`), which the combine
+  functions of `sum`, `min` and `max` skip. Over a partitioned table each leaf's groups go up as
+  that leaf's run is answered (§52.13), and the Finalize Agg adds a group's leaves up.
+- **The aggregates** are those whose partial state is their value (`LION_SAGG_IS_PARTIAL_OK()`):
+  `count(x)` (int8), `sum(int2)` and `sum(int4)` (an int8 sum), `min` and `max`. `avg` and
+  `sum(int8)` keep `internal` partial states core serializes with `int8_avg_serialize()` and
+  `numeric_poly_serialize()`, which the node does not write; a query with one of them in partial
+  rows is declined, here and on a partitioned table, and goes to the counts with an Agg above
+  them or to core's plan. A `GROUP BY` of a table with no filter is §52.3's final rows, as before.
+- **Not the decode route** (§52.4): its batches go up final, so a plan with partial rows answers
+  its groups one at a time. Many groups of a filtered run lose to the ordinary plan, and the
+  price says so (§52.6's per-group counts).
+- **The price**: the rows are the groups the node emits (`outrows`) where the partitioned
+  branch had priced one row.
+
+**Measured** (PostgreSQL 18.7 release build, two parallel workers a gather, warm, best of five; a
+synthetic table of 2 million rows, `amount int4` sliced, five statuses, 50 countries of 40,000
+rows each, 20 kinds, a third of the rows flagged; the partitioned copy in four leaves, each with
+its own indexes; "before" is the plan with `pg_lion.enable_count_slices` off, which is the plan
+these queries got before):
+
+| query | before | from slices | |
+|---|---|---|---|
+| `sum(amount) FILTER (WHERE flag), sum(amount) FILTER (WHERE kind = 3), sum(amount), count(*) ... WHERE country = 'c1'` | 37.8 ms | 7.0 ms | 5.4x |
+| `sum FILTER (flag), max FILTER (kind = 3), min FILTER (status = 'paid')`, no `WHERE` | 93.0 ms | 17.4 ms | 5.3x |
+| `count(*) FILTER (WHERE amount > 5000), sum(amount) FILTER (WHERE amount > 5000), count(*)` | 80.8 ms | 13.7 ms | 5.9x |
+| partitioned: `avg FILTER (kind = 3), max FILTER (status = 'paid') ... WHERE country = 'c2'` | 32.8 ms | 4.5 ms | 7.3x |
+| `status, count(*), sum(amount) FILTER (WHERE flag) GROUP BY status` | 106.4 ms | 16.4 ms | 6.5x |
+| the same with `max FILTER`, `min` and `WHERE country = 'c1'` | 33.5 ms | 30.1 ms | 1.1x |
+| partitioned: `status, sum(amount), max(amount) GROUP BY status` | 108.5 ms | 32.4 ms | 3.3x |
+| partitioned: `status, count(*), sum FILTER (kind = 3) ... WHERE country = 'c2' GROUP BY status` | 35.5 ms | 8.6 ms | 4.1x |
+
+`country, sum(amount), min(amount) ... WHERE status = 'paid' GROUP BY country` over the partitions,
+50 groups of a fifth of the rows in four leaves, is priced at three times core's parallel plan and
+left to it (82 ms against 222 from slices when forced).
+
+`test/sql/slices_plan.sql` (section 8) and `test/sql/slices_partitioned.sql` compare each answer
+with the pushdown off: every type of the allowlist in a filter, a column in several runs, a filter
+that selects nothing, a range in a filter from the entries and from the slices, a `HAVING` over a
+filtered aggregate, one and two grouping columns with filters, a partitioned table's groups with
+and without filters, and the declines (an `avg` or an int8 `sum` in partial rows, a filter the
+posting sets do not answer).
 
 ## 53. Ranges from slices (2026-10-27)
 
@@ -34631,8 +35114,9 @@ What the tables say:
   planner's build decide per partition - the slices' index is matched per relation already
   (§16), but the build is declined whole, as §52's is. *(2026-10-28, §53.11: partitioned
   tables done, every partition's index slicing the column or the build declined.)* The FK-side
-  join's fact filters (§27) and the anti join's take ranges as §32's sources only. A filtered
-  count's condition (§10, "Filtered counts") takes its ranges from the entries.
+  join's fact filters (§27) and the anti join's take ranges as §32's sources only. *(A filtered
+  count's condition (§10, "Filtered counts") takes a range on a sliced column from the slices
+  since 2026-11-10, §52.14.)*
 - **The fold at the WHERE's keys alone**: beside a selective clause, E's keys are mostly keys the
   count never reaches. Folding only at the keys of the other sources (sought as the probe of §32
   seeks a summed range's sets) would make the copy the WHERE's and no longer a source of its own,
@@ -34769,3 +35253,129 @@ bucket's edge, BC buckets, infinities, NULLs, the clause under OR, NOT, `IS NOT 
 outer join's `ON`, the declines, an expression index, a table without lion, a partitioned table
 pruned by the range, and a generic plan), each against the same query with the rewrite off and
 sequential scans only.
+
+## 55. Statement-level insert batching (2026-11-10)
+
+Every writer of a key holds the directory leaf that files the key's entry EXCLUSIVE for the whole
+of its insert (§5), and a column of a few values keeps all of its entries on one leaf. So
+concurrent statements inserting into such a column took turns on that leaf row by row, and the
+handoffs of the lock rather than the inserts became the cost: four writers into a two-value column
+loaded about a third of what one writer did, with 70% of their time waiting on the leaf's content
+lock. Shortening the hold does not help (§5, step 6), and filing the keys on separate leaves gave
+2.2× where batching gave 9× (both measured on throwaway prototypes). So a statement's rows now go in
+as a batch (`lion_defer.c`): after its first row, each row's (key, TID) pairs are kept per index, in
+the backend, and written sorted, a key's rows together: a CHAIN entry's up to 256 per hold of its
+leaf, a new or INLINE entry's one per hold, with other writers and VACUUM free to run between
+holds.
+
+**The batch.** `lioninsert()` hands the pairs of every eligible column to `lion_defer_add()`: the
+key as `lion_key_prepare()` made it, copied, with its bucket hash, or a reserved entry's flag for a
+NULL or a multi-key value with no keys (§14, §17). A buffer is one index's, holds one
+subtransaction's rows, and is written when it outgrows `work_mem`. `lion_insert_apply()` sorts the
+rows by (column, kind, hash, key bytes, TID), which puts each key's rows together in TID order,
+then sorts the keys into the directory's own order (`lion_cmp_prefix()`: an ordered column by its
+proc 4, as a descent compares it - never a sort operator, which a column whose catalog changed since
+the build may have lost, §21), so that a run of new keys fills leaves as an ascending run of inserts does rather
+than splitting them all down the middle. Then each key: one descent with the leaf EXCLUSIVE and the
+writer's SERIALIZABLE check (§9), as `lion_insert_one()` makes, and
+
+- a CHAIN entry takes up to `LION_APPLY_HOLD` (256) rows under that one hold, each through
+  `lion_insert_chain()`, which rewrites the entry in place at its size, so its offset stays good;
+- a new entry or an INLINE one takes one row per descent, since either may move the entry; an
+  INLINE entry that spills is a CHAIN one from the next descent on.
+
+A key of many rows - the case that queued - is a CHAIN entry after its first few hundred, so its
+rows go in 256 to a lock handoff; a key of one row costs what it did, plus the sort.
+
+**When the rows go in.** Nobody else can see them before the transaction commits, so what has to be
+covered is this backend reading the index before they are written, and the commit:
+
+- the end of the statement: `aminsertcleanup` (`lioninsertcleanup()`), which `ExecCloseIndices()`
+  calls for every index the executor opened for inserts, before it lets go of its
+  RowExclusiveLock on it - so `lion_index_verify()`'s wait for writers (§7) covers the write - and
+  `validate_index()` calls for CREATE INDEX CONCURRENTLY;
+- a query whose range table names the table (an `ExecutorStart_hook`): a trigger's or a volatile
+  function's query, run in the middle of the statement, sees the rows the statement wrote before it,
+  and a lion path - a scan, `LionCount`, any of the custom scans - reads only indexes of relations
+  in its range table. An AFTER trigger's query, which runs from `ExecutorFinish()` before the
+  indexes are closed, is one of these;
+- a scan of the index (`lionbeginscan()`) and the direct readers no range table names
+  (`lion_open_index()`, `lion_reader_open()`, the count and facet functions). These, and the
+  writes below, take RowExclusiveLock on the index for the write and let it go after it, as the
+  executor lets its own go at the end of a statement: held to the end of the transaction, it would
+  have `lion_index_verify()` wait for a transaction that writes nothing more;
+- a utility command, which may truncate, rewrite or drop the table or the index (a
+  `ProcessUtility_hook`; not COMMIT, ROLLBACK or SAVEPOINT);
+- a row from another subtransaction than the rows the buffer holds;
+- PRE_COMMIT and PRE_PREPARE, for a caller of `index_insert()` that never calls
+  `index_insert_cleanup()`. After it, inserts go straight in.
+
+**When nothing is buffered** (`lion_defer_allowed()` and `lioninsert()`): PostgreSQL 16, which has
+no `aminsertcleanup`; the first row of a statement, so a one-row statement costs what it did; a
+column with stored positions, summaries or bit slices, whose inserts write more than the key's entry
+(each of those steps would have to be batched as well, and their posting sets queue less); the index
+of an exclusion constraint, whose check scans the index for the rows inserted before in the same
+statement; while an `INSERT ... ON CONFLICT` runs, anywhere in the backend (tracked from
+`ExecutorStart` to `ExecutorEnd` and dropped with the subtransaction it began in); and the rest of
+the transaction that loads the library when it is not preloaded, since its hooks can come too late
+for a statement already under way (an `ON CONFLICT DO NOTHING` with no conflict target opens its
+indexes, and so may load the library, only inside its `ExecutorStart`).
+
+**Why a buffered TID stays its row's.** A TID in a buffer must still be the row's when it is
+written, or the write files another row under this row's key. A row this transaction inserted
+becomes dead to every snapshot - and VACUUM may then remove it and hand its slot to another row -
+in two ways only. Its subtransaction aborts: the buffer is that subtransaction's, and
+SUBXACT_EVENT_ABORT_SUB drops it (a commit of the subtransaction hands it to the parent). Or it is
+an `ON CONFLICT` speculative insert that lost its race and was super-deleted
+(`heap_abort_speculative()`), which no buffer holds. A row deleted later by its own transaction is
+not dead to others until that transaction commits, by which time the buffer is written.
+
+**A write that fails** leaves every row in the buffer, and the rows are untouched but for their
+order: an insert of a TID the posting set already holds changes nothing, so the next write, or the
+pre-commit one, does them all again. An error in a write aborts the (sub)transaction it ran in,
+whose abort clears the buffer's `writing` flag; a flag still set at the next write means an error
+was swallowed without that, and the write refuses rather than guess what went in.
+
+`pg_lion.batch_inserts` is on by default; setting it to off turns batching off.
+`lion_debug_defer_pending(idx)` and
+`lion_debug_defer_cleanup(on)`, which tests create with `CREATE FUNCTION ... AS 'pg_lion'`, count a
+backend's buffered rows and leave them buffered past the end of a statement, as a caller that never
+calls `index_insert_cleanup()` would.
+
+**Measured** (PostgreSQL 18.7, release build, custom WAL resource manager, 4 cores; pgbench, each
+transaction one INSERT of 200 rows unless it says otherwise; thousands of rows a second, medians of
+three 10-second runs, and the milliseconds a statement took). An empty table with one lion index on
+a column of two values:
+
+| clients | main | batched | | per statement, main | batched | B-tree, main |
+|---|---|---|---|---|---|---|
+| 1 | 353 | 467 | 1.3× | 0.57 ms | 0.43 ms | 466 |
+| 2 | 160 | 802 | 5.0× | 2.5 ms | 0.50 ms | |
+| 4 | 124 | 916 | 7.4× | 6.4 ms | 0.87 ms | 579 |
+| 8 | 152 | 895 | 5.9× | 10.5 ms | 1.8 ms | |
+
+Four writers now load 2× what one does, where they loaded a third of it, and more than a B-tree on
+the same column. A table of a million rows with eight single-column lion indexes, from two values
+to a million (the same 200-row INSERTs into all eight): 1.08× at one client (48.7 → 52.6), 1.25× at
+two (64.1 → 80.2), 1.51× at four (76.8 → 115.9); its high-cardinality indexes, whose rows each find
+their own entry, gain nothing and bound it. No change past the noise: a key of ten million values
+at one and four clients (219 and 740, run to run ±5%), one-row INSERTs (16 and 111-119), and
+`batch_inserts = off` against main. Index sizes after the same 500 seeded statements, batched
+against row by row: ten million values 619 / 617 pages, a thousand values 57 / 62, ascending keys
+449 / 449; the two-value index 8 / 10 pages and the eight indexes 5,887 / 5,916 after 500 random
+statements each.
+
+**Not done.** Columns with positions, summaries and slices are written row by row; batching them
+needs their own posting-set steps sorted and held the same way. A one-row statement gains nothing,
+and many writers inserting one row each still take turns on the leaf. Each CHAIN row is still its
+own WAL record: a batch could put a key's rows for one container into one.
+
+Tests: `test/sql/insert_batch.sql` (every kind of key in one batch and across `work_mem`, COPY;
+a volatile function's query in the INSERT's own select list, BEFORE and AFTER triggers' queries,
+by the count pushdown first; rows left past their statement written by a query of the table, a
+direct reader and the commit, dropped with an aborted savepoint or PL/pgSQL block, written before
+TRUNCATE and DROP INDEX; `batch_inserts = off`; ON CONFLICT in the statement and in a WITH query;
+an exclusion constraint violated within one statement; columns with summaries, slices and
+positions beside batched ones; a partitioned table), each against sequential scans and
+`lion_index_verify()`; `test/isolation/insert_batch_race.spec` (a batch parked between two holds
+while another writer fills the same key and VACUUM empties part of it).

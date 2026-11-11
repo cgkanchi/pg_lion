@@ -83,6 +83,10 @@ INSERT INTO nc_nodes VALUES
 	('LionJoinAgg, grouping sets',
 	 'SELECT k, j, sum(j), count(*) FROM nc GROUP BY ROLLUP (k, j)', 'sum(int4)',
 	 'enable_seqscan enable_bitmapscan pg_lion.enable_plain_scan'),
+	('LionWindowCount',
+	 'SELECT id, count(*) OVER () FROM nc WHERE k = 3 ORDER BY o LIMIT 5', 'int4eq(int4,int4)', ''),
+	('LionWindowCount, its window function',
+	 'SELECT id, count(1) OVER () FROM nc WHERE k = 3 ORDER BY o LIMIT 5', 'count("any")', ''),
 	('LionSemiJoin',
 	 'SELECT d.pk FROM ncd d WHERE EXISTS (SELECT 1 FROM nc WHERE nc.k = d.pk AND nc.j = 3)',
 	 'int4eq(int4,int4)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
@@ -342,7 +346,17 @@ SELECT node, nc_hook(node) FROM nc_nodes ORDER BY node;
  LionSemiJoin                                     | plain EXPLAIN: as the ordinary plan
  LionSemiJoin                                     | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
  LionSemiJoin                                     | allowed again: the answer
-(125 rows)
+ LionWindowCount                                  | plan: planned
+ LionWindowCount                                  | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
+ LionWindowCount                                  | plain EXPLAIN: as the ordinary plan
+ LionWindowCount                                  | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
+ LionWindowCount                                  | allowed again: the answer
+ LionWindowCount, its window function             | plan: planned
+ LionWindowCount, its window function             | refused: ERROR: lion_hooktest: execution of count("any") denied, as the ordinary plan
+ LionWindowCount, its window function             | plain EXPLAIN: as the ordinary plan
+ LionWindowCount, its window function             | a cached plan: ERROR: lion_hooktest: execution of count("any") denied
+ LionWindowCount, its window function             | allowed again: the answer
+(135 rows)
 
 SHOW lion_hooktest.deny_execute;
  lion_hooktest.deny_execute 

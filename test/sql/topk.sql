@@ -156,6 +156,8 @@ SELECT lion_trun('SELECT g, count(*) FROM tk WHERE g <> 1020 GROUP BY g ORDER BY
 SELECT lion_tq('SELECT g, count(*) FROM tk WHERE g IS NOT NULL GROUP BY g ORDER BY count(*) DESC LIMIT 2');
 -- ... and are not priced as candidates: with one value holding most of the
 -- rows, leaving it out prices the top k below leaving out a value no row has.
+-- (Every other value has ten rows, so the counts are printed alone: which ten
+-- of the tied groups come out is the Limit's to pick.)
 CREATE TABLE tkd (g int) WITH (autovacuum_enabled = off);
 INSERT INTO tkd SELECT CASE WHEN i % 10 < 8 THEN 0 ELSE i % 20000 + 1 END
 FROM generate_series(1, 200000) i;
@@ -183,9 +185,9 @@ BEGIN
 	RETURN c;
 END
 $$;
-SELECT lion_tq('SELECT g, count(*) FROM tkd WHERE g <> 0 GROUP BY g ORDER BY count(*) DESC, g LIMIT 10');
-SELECT lion_tcost('SELECT g, count(*) FROM tkd WHERE g <> 0 GROUP BY g ORDER BY count(*) DESC, g LIMIT 10') <
-	   lion_tcost('SELECT g, count(*) FROM tkd WHERE g <> -1 GROUP BY g ORDER BY count(*) DESC, g LIMIT 10') / 2 AS cheaper;
+SELECT lion_tq('SELECT count(*) FROM tkd WHERE g <> 0 GROUP BY g ORDER BY count(*) DESC LIMIT 10');
+SELECT lion_tcost('SELECT count(*) FROM tkd WHERE g <> 0 GROUP BY g ORDER BY count(*) DESC LIMIT 10') <
+	   lion_tcost('SELECT count(*) FROM tkd WHERE g <> -1 GROUP BY g ORDER BY count(*) DESC LIMIT 10') / 2 AS cheaper;
 
 -- 6. Declined: an ORDER BY that is not the count descending, a HAVING, a
 --    DISTINCT, a window function, a LIMIT only known at run time, a count
@@ -270,7 +272,50 @@ SELECT lion_tq('SELECT count(*) FROM tkc GROUP BY c ORDER BY count(*) DESC LIMIT
 SELECT lion_tq('SELECT c::text, count(*) FROM tkc GROUP BY c, c::text ORDER BY count(*) DESC, 1 LIMIT 3');
 SELECT c::text, count(*) FROM tkc GROUP BY c, c::text ORDER BY count(*) DESC, 1 LIMIT 3;
 
+-- 10. The fallback, priced (DESIGN.md §36, "The fallback"): the walk counts
+--     every group when fewer than k of its candidates reach the bound of the
+--     first entry left out, and the top k is priced with that walk as often
+--     as it is expected, beside the walk itself as a path of its own.  tkr's
+--     g has 3,000 values of about ten rows each, put in at random, so the
+--     largest entries hold some twenty rows and the next ones nearly as
+--     many; h cuts across them, a fifth of the rows each, and f a twentieth.
+--     tke's g has 3,000 values of exactly ten rows.  ANALYZE reads all 30,000
+--     rows of each, so the statistics are the same at every run.
+CREATE TABLE tkr (g int, h int, f int) WITH (autovacuum_enabled = off);
+INSERT INTO tkr
+SELECT 1 + (hashint4(i) & 2147483647) % 3000, i % 5, i % 20
+FROM generate_series(1, 30000) i;
+CREATE INDEX tkr_g ON tkr USING lion (g);
+CREATE INDEX tkr_h ON tkr USING lion (h);
+CREATE INDEX tkr_f ON tkr USING lion (f);
+VACUUM ANALYZE tkr;
+CREATE TABLE tke (g int) WITH (autovacuum_enabled = off);
+INSERT INTO tke SELECT i % 3000 FROM generate_series(1, 30000) i;
+CREATE INDEX tke_g ON tke USING lion (g);
+VACUUM ANALYZE tke;
+-- With no WHERE every count is its bound: the top k.
+SELECT lion_tq('SELECT count(*) FROM tkr GROUP BY g ORDER BY count(*) DESC LIMIT 10');
+SELECT lion_trun('SELECT count(*) FROM tkr GROUP BY g ORDER BY count(*) DESC LIMIT 10');
+-- ... and the ties at the cut broken by g: the bounds differ, so the top k.
+SELECT lion_tq('SELECT g, count(*) FROM tkr GROUP BY g ORDER BY count(*) DESC, g LIMIT 10');
+-- A WHERE that takes a twentieth away: the top k still.
+SELECT lion_tq('SELECT count(*) FROM tkr WHERE f <> 3 GROUP BY g ORDER BY count(*) DESC LIMIT 10');
+SELECT lion_trun('SELECT count(*) FROM tkr WHERE f <> 3 GROUP BY g ORDER BY count(*) DESC LIMIT 10');
+-- A WHERE that keeps a fifth leaves each count a fifth of a bound that falls
+-- by far less after the k-th: every group, the walk the top k would make.
+SELECT lion_tq('SELECT g, count(*) FROM tkr WHERE h = 2 GROUP BY g ORDER BY count(*) DESC, g LIMIT 10');
+SELECT lion_trun('SELECT g, count(*) FROM tkr WHERE h = 2 GROUP BY g ORDER BY count(*) DESC, g LIMIT 10');
+-- Groups of exactly ten rows each have no k-th count larger than the next
+-- bound, so the top k counted with ties falls back even with no WHERE: every
+-- group.  Without the ties the k-th count is the next bound: the top k.
+SELECT lion_tq('SELECT g, count(*) FROM tke GROUP BY g ORDER BY count(*) DESC, g LIMIT 10');
+SELECT lion_trun('SELECT g, count(*) FROM tke GROUP BY g ORDER BY count(*) DESC, g LIMIT 10');
+SELECT lion_tq('SELECT count(*) FROM tke GROUP BY g ORDER BY count(*) DESC LIMIT 10');
+-- The heavy groups of tk under a WHERE on another column still pass the
+-- bounds after them by more than it takes away: the top k (section 4).
+SELECT lion_tq('SELECT g, count(*) FROM tk WHERE h = 3 GROUP BY g ORDER BY count(*) DESC, g LIMIT 5');
+
 DROP FUNCTION lion_trun(text);
 DROP FUNCTION lion_tq(text, boolean);
 DROP FUNCTION lion_tcost(text);
-DROP TABLE tk, tkc, tkd;
+DROP TABLE tk, tkc, tkd, tkr, tke;

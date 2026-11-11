@@ -256,6 +256,18 @@ lion_meta_count_bulkdelete(Relation index, const LionMetaNdistinct *nd)
 bool
 lion_read_meta_ndistinct(Relation index, LionMetaNdistinct *nd)
 {
+	return lion_read_meta_counts(index, nd, NULL);
+}
+
+/*
+ * ... and, with inline_limit, the INLINE limit the index's entries were
+ * written under, which the reloption may no longer say until a REINDEX: for
+ * the planner, which reads the page once a run (lion_nd_index()).
+ */
+bool
+lion_read_meta_counts(Relation index, LionMetaNdistinct *nd,
+					  uint32 *inline_limit)
+{
 	Buffer		buf;
 	Page		page;
 	bool		have = false;
@@ -275,6 +287,8 @@ lion_read_meta_ndistinct(Relation index, LionMetaNdistinct *nd)
 						RelationGetRelationName(index))));
 	}
 	lion_meta_check_version(index, LionPageGetMeta(page));
+	if (inline_limit != NULL)
+		*inline_limit = LionPageGetMeta(page)->inline_limit;
 	if (LionMetaHasNdistinct(page) &&
 		((PageHeader) page)->pd_lower <= ((PageHeader) page)->pd_upper)
 	{

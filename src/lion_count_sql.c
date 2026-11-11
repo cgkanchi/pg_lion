@@ -14,6 +14,7 @@
 #include "utils/regproc.h"
 
 #include "lion_count_int.h"
+#include "lion_defer.h"
 
 #include "pgstat.h"
 
@@ -88,8 +89,8 @@ lion_check_execute(Oid funcid)
  * it; it is here so that the node asks what the Agg it replaces asks, hooks
  * included.
  */
-void
-lion_check_aggregate_execute(Oid aggfnoid)
+static void
+lion_check_agg_execute_as(Oid aggfnoid, ObjectType objtype)
 {
 	AclResult	aclresult;
 	HeapTuple	tup;
@@ -100,7 +101,7 @@ lion_check_aggregate_execute(Oid aggfnoid)
 	aclresult = object_aclcheck(ProcedureRelationId, aggfnoid, GetUserId(),
 								ACL_EXECUTE);
 	if (aclresult != ACLCHECK_OK)
-		aclcheck_error(aclresult, OBJECT_AGGREGATE, get_func_name(aggfnoid));
+		aclcheck_error(aclresult, objtype, get_func_name(aggfnoid));
 	InvokeFunctionExecuteHook(aggfnoid);
 
 	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggfnoid));
@@ -129,6 +130,24 @@ lion_check_aggregate_execute(Oid aggfnoid)
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_FUNCTION, get_func_name(transfn));
 	InvokeFunctionExecuteHook(transfn);
+}
+
+void
+lion_check_aggregate_execute(Oid aggfnoid)
+{
+	lion_check_agg_execute_as(aggfnoid, OBJECT_AGGREGATE);
+}
+
+/*
+ * The same for an aggregate called as a window function, as
+ * ExecInitWindowAgg() asks it: EXECUTE on the function for the current user
+ * ("permission denied for function"), then on its final and transition
+ * functions for its owner, as its initialize_peragg() does.
+ */
+void
+lion_check_window_execute(Oid winfnoid)
+{
+	lion_check_agg_execute_as(winfnoid, OBJECT_FUNCTION);
 }
 
 /*
@@ -651,6 +670,8 @@ lion_count_open_indexes_ext(Snapshot snapshot, int nidx, const Oid *idxoid,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("index \"%s\" is not a lion index",
 							RelationGetRelationName(index))));
+		/* rows this backend has buffered for it go in first (§55) */
+		lion_defer_flush_index(index);
 		/*
 		 * wantcol = 0 means the caller names an index and a key but no COLUMN,
 		 * so a multicolumn index (DESIGN.md §24) has nothing to tell it which

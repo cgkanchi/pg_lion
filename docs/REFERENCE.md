@@ -272,7 +272,9 @@ match the query as a whole. A prefix lexeme (`foo:*`) cannot be ranked and is an
 NOT, where it does not score either. As in a search
 engine, the statistics count deleted rows until VACUUM removes them, and a backend keeps the mean
 row length it read until the row count moves by more than 1/64. Rows that cannot reach the top `k`
-are skipped (MaxScore), so a very common lexeme next to rarer ones costs little. Like the counts,
+are skipped: a lexeme's own maximum skips the rows of a very common lexeme next to rarer ones
+(MaxScore), and each block of a lexeme's rows records the most they can score, so blocks that
+cannot reach the top are stepped over even when every lexeme is common. Like the counts,
 `lion_bm25()` and `lion_bm25_score()` need SELECT on the table and refuse a table where row-level
 security applies to the caller: the statistics count every row, so a score would reveal what the
 hidden rows hold.
@@ -925,6 +927,17 @@ working around a bad choice:
   can be NULL (a NOT NULL column, or a filter that rules NULL out): 19 plans that one as the same
   anti join as `NOT EXISTS`, and it is counted as that is. Off, the pushdown does not count an anti
   join this way.
+- `pg_lion.enable_window_count`: answer `count(*) OVER ()` beside the rows of one table - `SELECT
+  *, count(*) OVER () FROM t WHERE ... ORDER BY ts DESC LIMIT 20`, a page with its total - with the
+  `LionWindowCount` node (DESIGN.md §10, "A count of every row beside the rows"): the pushdown's
+  count of the table under the same `WHERE`, made once before the first row, beside the rows of
+  any plan of the table, in its order, so that a `LIMIT` above stops it where PostgreSQL's
+  `WindowAgg` reads every row first. Every window function must be `count(*)` or `count(1)` with
+  no `FILTER`, over a window with no `PARTITION BY` or `ORDER BY` whose frame holds every row; not
+  under a `GROUP BY`, a join, `DISTINCT` or a set-returning function, nor with a volatile `WHERE`
+  clause or an `ORDER BY` of the window function. EXPLAIN shows the count as the node's first
+  child and prints the window function as `count(*)`. `pg_lion.enable_count_pushdown = off` turns
+  it off too.
 - `pg_lion.enable_probe_join`: group a join of a table to a dimension by the dimension's primary
   key with `LionProbeJoin` (DESIGN.md §46) - `SELECT CASE WHEN d.region IN ('north', 'east') THEN
   'ne' ELSE 'other' END, f.channel, count(*) FROM fact f JOIN dim d ON f.dim_id = d.id WHERE
@@ -1112,10 +1125,14 @@ working around a bad choice:
   aggregates over keys (`Aggregates Over Keys`, DESIGN.md §37) on price. On a partitioned table
   the one row is answered when every partition the planner keeps has a whole Lion index of its own
   slicing the column, each partition's answers added up in the node (DESIGN.md §52.13; EXPLAIN
-  names no index there). Not taken: a join, a partitioned table's `GROUP BY` or one partition
-  without such an index, a residual clause, `DISTINCT`, `FILTER` or `ORDER BY` in the aggregate, an
-  expression of the column, a filtered count beside a `GROUP BY`, three grouping columns, a float
-  column, and a hot standby, where the pushdown collects nothing. Off, these aggregates go to the
+  names no index there). An aggregate with a `FILTER` whose condition a filtered count could take
+  is answered over that filter's rows (`Aggregates From Slices: <index> (<column>, filter N:
+  ...)`, a range in it folded from the slices as `Range From Slices: ... (N slices, filter N)`;
+  DESIGN.md §52.14). A `GROUP BY` beside filters, or over a partitioned table, goes up as partial
+  rows below a Finalize Agg, so `avg` and an `int8` `sum` are not taken there (§52.15). Not taken:
+  a join, a partition without such an index, a residual clause, `DISTINCT` or `ORDER BY` in the
+  aggregate, a `FILTER` the posting sets do not answer, an expression of the column, three
+  grouping columns, a float column, and a hot standby, where the pushdown collects nothing. Off, these aggregates go to the
   aggregates over keys or to the ordinary plan.
 - `pg_lion.enable_slice_decode`: answer those aggregates of a `GROUP BY` of one column a batch of
   groups at a time (DESIGN.md §52, "The decode route"): one walk of the batch's groups and the
@@ -1274,6 +1291,20 @@ collect them part way through (DESIGN.md §27, "Probed, then collected"), and
 `pg_lion.vacuum_barrier_ranges` (superuser), how many visited-block ranges VACUUM batches in rmgr
 mode (DESIGN.md §25).
 `pg_lion.rmgr_id` is described under `wal_mode` above.
+
+Writes: `pg_lion.batch_inserts` (on), on PostgreSQL 17 and later, keeps the rows a statement
+inserts into a Lion index after its first and writes them at the end of the statement - or before
+anything in the session reads the index - sorted by key, a key's rows together: up to 256 of them
+per hold of the directory leaf that files the key when the key's entry is a CHAIN, one per hold for
+a new or INLINE entry (DESIGN.md §55). Concurrent statements inserting many rows into a column of a
+few values then stop taking turns on that leaf row by row. Not batched: columns with stored
+positions, summaries or slices, an exclusion constraint's index, any insert while an
+`INSERT ... ON CONFLICT` runs in the session, and, when pg_lion is not in
+`shared_preload_libraries`, the transaction that loads it, so a session's first bulk insert can go
+in row by row with the setting on. A buffer is written once its rows and keys reach `work_mem`;
+that is when it is written, not a hard cap, since its row array grows by doubling and the write
+needs a little more memory to sort the rows. Off, every row goes in when it is inserted, as on
+PostgreSQL 16.
 
 Cost settings, for calibrating Lion's cost model on your own workload the way `random_page_cost`
 calibrates core's (DESIGN.md §31, "The settings"). Each is the price of one operation as a multiple
@@ -1592,7 +1623,8 @@ query come from a covering B-tree instead, §40), no INCLUDE columns, no
 parallel index scan, so a plain lion scan, `LionBm25`, `LionOrderedJoin`, `LionOrderedSplit` and `LionOrdered`'s walk of a lion column run in one process, and a parallel bitmap heap scan builds its bitmap in one (a parallel build is supported from PostgreSQL 17, and `LionCount`, `LionSemiJoin`, `LionAntiJoin` and `LionOrdered`'s walk of a B-tree can use workers). VACUUM reclaims the pages it
 empties, as a B-tree does: directory leaves, and the leaves of a key's posting tree while the key
 still has rows; the internal pages of a posting tree go with its key. Inserts serialise on the directory
-leaf that holds the key; see the measured
+leaf that holds the key, though a statement's rows after its first go in as a batch, up to 256 of
+a key's rows per hold of the leaf (`pg_lion.batch_inserts`, PostgreSQL 17 and later); see the measured
 [write costs](BENCHMARKS.md#size-build-and-writes-5m-rows-all-seven-indexes). Count pushdown supports constants, parameters
 and stable expressions such as `now() - interval '30 days'` or `current_date - 30` (evaluated once
 per execution; a volatile one like `random()` goes to the ordinary plan) on any indexed column, enum

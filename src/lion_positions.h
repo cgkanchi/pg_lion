@@ -17,8 +17,15 @@
  *		type		= LION_CT_POSITIONS
  *		flags		= reserved, 0
  *
- *	  and the payload is a uint16 count of the member bytes that follow, then
- *	  the members, ascending by heap TID code and unique:
+ *	  and the payload is
+ *
+ *		uint16	used: the member bytes, which follow the rest of the header
+ *		uint32	last: the last member's code less lion_pos_block_base(block),
+ *				or LION_POS_LAST_UNKNOWN for a chunk without members or one
+ *				whose last member is that far from its block or further
+ *		8 bytes	impacts: what the members' rows can score (below)
+ *
+ *	  then the members, ascending by heap TID code and unique:
  *
  *		varint	code delta: from lion_pos_block_base(block) for the first
  *				member, and from the previous member's code for the others
@@ -27,6 +34,21 @@
  *				was stripped of positions
  *		npos varints	(pos delta << 2) | weight, the positions ascending
  *				strictly and below LION_POS_LIMIT, the first one's delta from 0
+ *
+ *	  IMPACTS (DESIGN.md §17, "Block bounds"): up to LION_POS_NIMPACTS pairs
+ *	  of bytes (tf - 1, length code), the unused ones 0xFF 0xFF, such that
+ *	  every member is dominated by a pair: its tf - npos, at least 1 - at
+ *	  most the pair's, and its row's length (the empty key's position,
+ *	  lion_bm25.c) at least the length the pair's code stands for
+ *	  (lion_pos_len_value()).  A BM25 term's score rises with tf and falls
+ *	  with the length, so the best the chunk's rows can score is the best of
+ *	  its pairs, for any k1 and b.  The pairs are kept as a Pareto front -
+ *	  tf descending, length code descending - and two neighbours are merged
+ *	  into the pair that dominates both when a fifth would not fit.  A member
+ *	  whose row's length the writer does not know adds the pair that
+ *	  dominates everything (tf 256, length 0).  A member removed leaves the
+ *	  pairs as they were, and a split gives both halves the whole chunk's:
+ *	  bounds that are no longer tight, never wrong.
  *
  *	  Varints are LEB128: seven bits a byte, least significant first, the
  *	  high bit set on every byte but the last.  A member decodes to the
@@ -86,9 +108,27 @@ lion_pos_block_base(uint32 block)
 #define LION_POS_WEIGHT(wep)	((uint16) ((wep) >> 14))
 #define LION_POS_MAKE(pos, weight)	((uint16) (((weight) << 14) | (pos)))
 
-/* The uint16 member-byte count that opens the payload. */
-#define LION_POS_HDRSZ			(LION_CONTAINER_HDRSZ + sizeof(uint16))	/* 10 */
-#define LION_POS_MAX_BYTES		((uint32) (LION_CONTAINER_MAX_SIZE - LION_POS_HDRSZ))	/* 4094 */
+/* The payload's own header: the member bytes, the last code, the impacts. */
+#define LION_POS_USED_OFF		LION_CONTAINER_HDRSZ	/* 8 */
+#define LION_POS_LAST_OFF		(LION_POS_USED_OFF + sizeof(uint16))	/* 10 */
+#define LION_POS_IMPACTS_OFF	(LION_POS_LAST_OFF + sizeof(uint32))	/* 14 */
+#define LION_POS_NIMPACTS		4
+#define LION_POS_HDRSZ			(LION_POS_IMPACTS_OFF + 2 * LION_POS_NIMPACTS)	/* 22 */
+#define LION_POS_MAX_BYTES		((uint32) (LION_CONTAINER_MAX_SIZE - LION_POS_HDRSZ))	/* 4082 */
+
+#define LION_POS_LAST_UNKNOWN	PG_UINT32_MAX
+
+/*
+ * The member bytes a position tree's chunk is filled to by the build and
+ * split at by an insert: small enough that its impacts bound a few dozen
+ * rows of a common lexeme (DESIGN.md §17, "Block bounds").  A chunk with
+ * one member may hold more, up to LION_POS_MAX_BYTES; an INLINE entry's
+ * one chunk is as big as the entry lets it be.
+ */
+#define LION_POS_TREE_BYTES		512
+
+/* The largest length code: the code of 65535, the longest length kept. */
+#define LION_POS_LEN_CODE_MAX	207
 
 /* A member is at least two bytes: a code delta and npos. */
 #define LION_POS_MAX_MEMBERS	(LION_POS_MAX_BYTES / 2)
@@ -103,8 +143,22 @@ typedef struct LionPosMember
 {
 	uint64		code;			/* lion_tid_to_code() of the heap TID */
 	uint16		npos;
+
+	/*
+	 * The row's length, for the chunk's impacts when the member is appended
+	 * or inserted: 0 when the writer does not know it (a row's length is at
+	 * least 1).  Never stored with the member, so a decoded one has 0.
+	 */
+	uint16		dl;
 	uint16		pos[LION_POS_MAX_NPOS];	/* weight << 14 | pos, ascending by pos */
 } LionPosMember;
+
+/* One impact pair, decoded: tf 1 .. LION_POS_MAX_NPOS and a row length. */
+typedef struct LionPosImpact
+{
+	uint16		tf;
+	uint16		len;
+} LionPosImpact;
 
 /* A forward reader over a chunk's members. */
 typedef struct LionPosIter
@@ -128,8 +182,34 @@ lion_poschunk_used(const LionContainer *c)
 {
 	uint16		used;
 
-	memcpy(&used, (const char *) c + LION_CONTAINER_HDRSZ, sizeof(uint16));
+	memcpy(&used, (const char *) c + LION_POS_USED_OFF, sizeof(uint16));
 	return Min((uint32) used, LION_POS_MAX_BYTES);
+}
+
+/* The last member's code, when the header records it: false when not. */
+static inline bool
+lion_poschunk_last(const LionContainer *c, uint64 *code)
+{
+	uint32		last;
+
+	memcpy(&last, (const char *) c + LION_POS_LAST_OFF, sizeof(uint32));
+	if (last == LION_POS_LAST_UNKNOWN || c->cardinality == 0)
+		return false;
+	*code = lion_pos_block_base(c->ckey) + last;
+	return true;
+}
+
+/*
+ * The length a length code stands for: 0 .. 15 as they are, then sixteen
+ * steps an octave, (16 + m) << e for code (e + 1) << 4 | m - so a length
+ * coded is at most a sixteenth more than the length the code gives back.
+ */
+static inline uint32
+lion_pos_len_value(uint32 code)
+{
+	if (code < 16)
+		return code;
+	return (16 + (code & 15)) << ((code >> 4) - 1);
 }
 
 /* Size of the chunk (header, byte count and members), never above 4104. */
@@ -187,5 +267,8 @@ extern bool lion_poschunk_split(const LionContainer *c, LionContainer *left,
 
 extern bool lion_poschunk_check(const LionContainer *c, Size itemsz,
 								char *errbuf, Size errlen);
+
+extern uint32 lion_pos_len_code(uint32 len);
+extern int	lion_poschunk_impacts(const LionContainer *c, LionPosImpact *imp);
 
 #endif							/* LION_POSITIONS_H */

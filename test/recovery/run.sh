@@ -1603,7 +1603,11 @@ phase1g() {
 	# Two keys on alternate wide rows, 65 to a heap page: 66000 rows are 16
 	# container keys, which a build at posting_fillfactor 10 makes a leaf
 	# each, so each key has 16 leaves and no internal level.  The insert below
-	# fills the last leaf with containers, and its split is the 17th.
+	# fills the last leaf with containers, and its split is the 17th.  The
+	# inserts go in row by row, the two keys' rows alternating: a batch
+	# (DESIGN.md §55) writes one key's rows before the other's, so the crash
+	# would leave the other set without the rows that bring it to its 17th
+	# leaf after the restart.
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1g: fixture failed"
 		SET synchronous_commit = on;
 		DROP TABLE IF EXISTS lion_promo;
@@ -1621,7 +1625,7 @@ phase1g() {
 
 	off=$(stat -c %s "$PRIMARY_LOG")
 	"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres -d "$DBNAME" \
-		-c "SET synchronous_commit = on;
+		-c "SET synchronous_commit = on; SET pg_lion.batch_inserts = off;
 		    INSERT INTO lion_promo SELECT 100000 + i, i % 2
 		      FROM generate_series(1, 30000) i" >>"$RUNLOG" 2>&1 &
 	parked=$!
@@ -1677,6 +1681,7 @@ phase1g() {
 	# the other key's set on the way.
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1g: inserting after the crash failed"
 		SET synchronous_commit = on;
+		SET pg_lion.batch_inserts = off;
 		INSERT INTO lion_promo SELECT 200000 + i, i % 2
 		  FROM generate_series(1, 20000) i;
 		VACUUM lion_promo;
@@ -2217,19 +2222,20 @@ standby_build_replay() {
 # "Position trees"): a standby compares a position tree with its posting set
 # only from a walk that read every page as it was at one replay position, so
 # a quiet standby must report damage the primary's check would.  The index is
-# verify.sql's seventeenth case - 600 rows of 'alpha:5 beta:6', keys that are
+# verify.sql's seventeenth case - 150 rows of 'alpha:5 beta:6', keys that are
 # CHAIN entries with a position tree of one leaf, one chunk of three bytes a
-# row after a 10-byte header - built on the primary and replayed, checked on
+# row after a 22-byte header - built on the primary and replayed, checked on
 # the standby while it is sound, and then, with the standby stopped, the first
-# member's delta (at 10 of 'alpha''s chunk) goes from 1 to 2 in the standby's
-# file: every member moves one offset on, and the first row of each of the
-# five heap blocks has no positions.  The checkpoint on the primary and the
+# member's delta (at 22 of 'alpha''s chunk) goes from 1 to 2 and the chunk's
+# last code (the uint32 at 10) one up with it in the standby's file: every
+# member moves one offset on, and the first row of each of the two heap
+# blocks has no positions.  The checkpoint on the primary and the
 # restartpoint on the standby put the replayed build on disk and replay's
 # starting point after it, so nothing replays the leaf back over the damage.
 # The page's checksum is wrong after that, which ignore_checksum_failure lets
 # through.
 standby_position_damage() {
-	local pos rel out rc=0
+	local pos last rel out rc=0
 	log ""
 	log "-- standby: a damaged position tree"
 
@@ -2238,7 +2244,7 @@ standby_position_damage() {
 		DROP TABLE IF EXISTS lion_posdmg;
 		CREATE TABLE lion_posdmg (id int NOT NULL, d tsvector NOT NULL)
 		  WITH (autovacuum_enabled = off);
-		INSERT INTO lion_posdmg SELECT i, 'alpha:5 beta:6' FROM generate_series(1, 600) i;
+		INSERT INTO lion_posdmg SELECT i, 'alpha:5 beta:6' FROM generate_series(1, 150) i;
 		CREATE INDEX lion_posdmg_d ON lion_posdmg USING lion (d)
 		  WITH (store_positions = true, inline_limit = 64);
 		CHECKPOINT;
@@ -2254,7 +2260,7 @@ standby_position_damage() {
 	# at level 0 (24) whose first chunk starts with 'alpha''s first member.
 	rel=$(psql_p -tAc "select pg_relation_filepath('lion_posdmg_d')")
 	pos=$(psql_p -tAc "
-		select b * c.bs + l.lp + 10
+		select b * c.bs + l.lp
 		  from (select current_setting('block_size')::int8 as bs,
 					   pg_relation_filepath('lion_posdmg_d') as path) c,
 			   generate_series(1, pg_relation_size('lion_posdmg_d') /
@@ -2263,15 +2269,25 @@ standby_position_damage() {
 						  from pg_read_binary_file(c.path, b * c.bs + 24, 4) x) l
 		 where get_byte(pg_read_binary_file(c.path, b * c.bs + c.bs - 32 + 26, 1), 0) & 128 <> 0
 		   and pg_read_binary_file(c.path, b * c.bs + c.bs - 32 + 24, 2) = '\x0000'
-		   and pg_read_binary_file(c.path, b * c.bs + l.lp + 10, 3) = '\x010114'")
+		   and pg_read_binary_file(c.path, b * c.bs + l.lp + 22, 3) = '\x010114'")
 	[ -n "$rel" ] && [ -n "$pos" ] && [ "$(wc -l <<<"$pos")" = 1 ] ||
 		die "standby_position_damage: no single position leaf of 'alpha' in $rel (found: $pos)"
+	last=$(psql_p -tAc "
+		select get_byte(x, 0) + get_byte(x, 1) * 256 + get_byte(x, 2) * 65536 +
+			   get_byte(x, 3)::int8 * 16777216 + 1
+		  from pg_read_binary_file(pg_relation_filepath('lion_posdmg_d'), $pos + 10, 4) x")
+	[ -n "$last" ] && [ "$last" -lt 4294967295 ] ||
+		die "standby_position_damage: 'alpha''s chunk has no last code (found: $last)"
 
 	psql_s -c "CHECKPOINT" >>"$RUNLOG" 2>&1 ||
 		die "standby_position_damage: the restartpoint failed"
 	as_server "$PGBIN/pg_ctl" -D "$STANDBY_DATA" stop -m fast -w -t 60 >>"$RUNLOG" 2>&1 ||
 		die "could not stop the standby"
-	printf '\002' | as_server dd of="$STANDBY_DATA/$rel" bs=1 seek="$pos" conv=notrunc \
+	printf '\002' | as_server dd of="$STANDBY_DATA/$rel" bs=1 seek=$((pos + 22)) conv=notrunc \
+		2>>"$RUNLOG" || die "standby_position_damage: could not damage $STANDBY_DATA/$rel"
+	printf "$(printf '\\%03o\\%03o\\%03o\\%03o' $((last & 255)) $(((last >> 8) & 255)) \
+				$(((last >> 16) & 255)) $(((last >> 24) & 255)))" |
+		as_server dd of="$STANDBY_DATA/$rel" bs=1 seek=$((pos + 10)) conv=notrunc \
 		2>>"$RUNLOG" || die "standby_position_damage: could not damage $STANDBY_DATA/$rel"
 	start_node "$STANDBY_DATA" "$STANDBY_PORT" "$STANDBY_LOG"
 	verify_node psql_s "$STANDBY_DATA"
@@ -2282,8 +2298,8 @@ standby_position_damage() {
 		select lion_index_verify('lion_posdmg_d'::regclass)" 2>&1) || rc=$?
 	echo "---- standby_position_damage: $out" >>"$RUNLOG"
 	[ "$rc" != 0 ] ||
-		die "BUG: standby_position_damage: the standby's check passed a position tree without positions for five of its TIDs"
-	grep -q 'lion index "lion_posdmg_d": 5 TIDs of chain entry [0-9]* on block [0-9]* have no positions, the first (0,1)' <<<"$out" ||
+		die "BUG: standby_position_damage: the standby's check passed a position tree without positions for two of its TIDs"
+	grep -q 'lion index "lion_posdmg_d": 2 TIDs of chain entry [0-9]* on block [0-9]* have no positions, the first (0,1)' <<<"$out" ||
 		die "standby_position_damage: the standby's check failed with something else: $out"
 
 	psql_p -c "DROP TABLE lion_posdmg" >>"$RUNLOG" 2>&1

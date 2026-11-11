@@ -5239,6 +5239,7 @@ typedef struct LionNdistinctIndex
 	Oid			indexoid;
 	bool		have;			/* the meta page carries counts at all */
 	LionMetaNdistinct nd;
+	uint32		inline_limit;	/* the meta page's (lion_index_inline_limit()) */
 } LionNdistinctIndex;
 
 /*
@@ -5314,10 +5315,26 @@ lion_nd_index(LionNdistinctCache *cache, Oid indexoid)
 	MemoryContextSwitchTo(oldcxt);
 
 	index = index_open(indexoid, NoLock);
-	ent->have = lion_read_meta_ndistinct(index, &ent->nd);
+	ent->have = lion_read_meta_counts(index, &ent->nd, &ent->inline_limit);
 	index_close(index, NoLock);
 
 	return ent;
+}
+
+/*
+ * The INLINE limit idx's entries were written under, in bytes: its meta
+ * page's, as this planner run read it - the reloption may say another until
+ * a REINDEX - or LION_DEFAULT_INLINE_LIMIT for a hypothetical index, which
+ * has no page to read.
+ */
+double
+lion_index_inline_limit(PlannerInfo *root, IndexOptInfo *idx)
+{
+	LionNdistinctCache *cache = lion_nd_cache_for(root);
+
+	if (idx == NULL || idx->relam != cache->amoid || idx->hypothetical)
+		return (double) LION_DEFAULT_INLINE_LIMIT;
+	return (double) lion_nd_index(cache, idx->indexoid)->inline_limit;
 }
 
 /*
@@ -7070,6 +7087,8 @@ typedef struct LionSkewCol
 	AttrNumber	attnum;
 	double		rows;			/* the rows a probed key meets, 0 unknown */
 	double		keyrows;		/* core's rows per key, 0 without statistics */
+	LionKeyTail tail;			/* the keys outside the MCV list, nkeys < 0
+								 * unknown */
 } LionSkewCol;
 
 /* lion_debug_skew_rows(): the figures worked out while it plans, or not */
@@ -7083,29 +7102,49 @@ static MemoryContext lion_skew_collect_cxt = NULL;
 /*
  * The figure for key column col of an index whose meta page holds nd, for a
  * table of tuples rows now, the null fraction, and the MCV list's rows (their
- * sum and the sum of their squares, hasmcv when it has any); keyrows, core's
- * rows per key, when it says nothing more.
+ * sum and the sum of their squares, nmcv values of it); keyrows, core's rows
+ * per key, when it says nothing more.
+ *
+ * ... and, into *tail, the keys outside the list the same counts give: the
+ * index's keys less the list's, scaled as the sum is - kept where they are a
+ * fixed number, grown with the table where not - their rows on average, and
+ * the spread of those, the square root of Σn² over the keys less the mean's
+ * square.  nkeys -1 where the counts say nothing of them.
  */
 static double
 lion_skew_rows_of(const LionMetaNdistinct *nd, int col, double tuples,
-				  double nullfrac, bool hasmcv, double mcvrows, double mcvsq,
-				  double keyrows)
+				  double nullfrac, int nmcv, double mcvrows, double mcvsq,
+				  double keyrows, LionKeyTail *tail)
 {
 	double		growth = tuples / (double) nd->rows;
 	double		sumsq = (double) nd->sumsq[col] * growth;
+	double		keys = (double) nd->ndistinct[col];
 	double		rest;
+
+	tail->nkeys = -1.0;
+	tail->mean = 0.0;
+	tail->sd = 0.0;
 
 	/* a fixed number of keys: each grew with the table */
 	if ((double) nd->ndistinct[col] <= 0.1 * (double) nd->rows)
 		sumsq *= growth;
+	else
+		keys *= growth;
 	rest = tuples * (1.0 - nullfrac);
-	if (hasmcv)
+	if (nmcv > 0)
 	{
 		rest -= mcvrows;
 		sumsq -= mcvsq;
+		keys -= nmcv;
 	}
 	if (rest < 1.0 || sumsq <= 0.0)
 		return keyrows;
+	if (keys >= 1.0)
+	{
+		tail->nkeys = keys;
+		tail->mean = rest / keys;
+		tail->sd = sqrt(Max(sumsq / keys - tail->mean * tail->mean, 0.0));
+	}
 	return Min(Max(sumsq / rest, keyrows), tuples);
 }
 
@@ -7127,6 +7166,7 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 
 	col->rows = 0;
 	col->keyrows = 0;
+	col->tail.nkeys = -1.0;
 	if (tuples < 1.0)
 		return;
 
@@ -7193,7 +7233,7 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 		double		mcvsq = 0;
 		double		freqrows = 0;
 		double		freqsq = 0;
-		bool		hasmcv = false;
+		int			nmcv = 0;
 		bool		allmcv = false;
 		AttStatsSlot sslot;
 
@@ -7245,9 +7285,9 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 				mcvrows = freqrows;
 				mcvsq = freqsq;
 			}
-			hasmcv = (sslot.nnumbers > 0);
-			allmcv = (hasmcv && ndist <= (double) sslot.nnumbers);
-			if (hasmcv && keysel > sslot.numbers[0])
+			nmcv = sslot.nnumbers;
+			allmcv = (nmcv > 0 && ndist <= (double) nmcv);
+			if (nmcv > 0 && keysel > sslot.numbers[0])
 				keysel = sslot.numbers[0];
 			free_attstatsslot(&sslot);
 		}
@@ -7262,10 +7302,66 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 			col->rows = col->keyrows;
 		else
 			col->rows = lion_skew_rows_of(best, bestcol, tuples, nullfrac,
-										  hasmcv, mcvrows, mcvsq,
-										  col->keyrows);
+										  nmcv, mcvrows, mcvsq,
+										  col->keyrows, &col->tail);
 	}
 	ReleaseVariableStats(vardata);
+}
+
+/*
+ * Column var of rel's figure (above), worked out once per planner run and
+ * column; NULL where none can be.
+ */
+static LionSkewCol *
+lion_skew_col_for(PlannerInfo *root, RelOptInfo *rel, Var *var)
+{
+	LionNdistinctCache *cache;
+	RangeTblEntry *rte;
+	LionSkewCol *col = NULL;
+	MemoryContext oldcxt;
+	ListCell   *lc;
+
+	if (root == NULL || root->glob == NULL ||
+		rel == NULL || var == NULL || !IS_SIMPLE_REL(rel) ||
+		rel->rtekind != RTE_RELATION || rel->indexlist == NIL ||
+		var->varlevelsup != 0 || (Index) var->varno != rel->relid ||
+		var->varattno <= 0)
+		return NULL;
+	rte = planner_rt_fetch(rel->relid, root);
+	if (rte->rtekind != RTE_RELATION || rte->inh ||
+		rte->relkind == RELKIND_PARTITIONED_TABLE)
+		return NULL;
+
+	cache = lion_nd_cache_for(root);
+	foreach(lc, cache->skews)
+	{
+		LionSkewCol *c = (LionSkewCol *) lfirst(lc);
+
+		if (c->relid == rte->relid && c->attnum == var->varattno)
+			return c;
+	}
+	oldcxt = MemoryContextSwitchTo(cache->run.cxt);
+	col = (LionSkewCol *) palloc0(sizeof(LionSkewCol));
+	col->relid = rte->relid;
+	col->attnum = var->varattno;
+	cache->skews = lappend(cache->skews, col);
+	MemoryContextSwitchTo(oldcxt);
+	lion_skew_compute(root, rel, var, col);
+	if (col->rows > 0.0)
+		elog(DEBUG2, "lion: a probed key of column %d of \"%s\" meets %.1f rows, %.1f per key",
+			 (int) col->attnum, get_rel_name(col->relid), col->rows,
+			 col->keyrows);
+	if (lion_skew_collecting)
+	{
+		LionSkewCol *copy;
+
+		oldcxt = MemoryContextSwitchTo(lion_skew_collect_cxt);
+		copy = (LionSkewCol *) palloc(sizeof(LionSkewCol));
+		memcpy(copy, col, sizeof(LionSkewCol));
+		lion_skew_collected = lappend(lion_skew_collected, copy);
+		MemoryContextSwitchTo(oldcxt);
+	}
+	return col;
 }
 
 /*
@@ -7276,62 +7372,32 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 static double
 lion_skew_param_factor(PlannerInfo *root, RelOptInfo *rel, Var *var)
 {
-	LionNdistinctCache *cache;
-	RangeTblEntry *rte;
-	LionSkewCol *col = NULL;
-	MemoryContext oldcxt;
-	ListCell   *lc;
+	LionSkewCol *col;
 
-	if (!lion_enable_skew_estimate ||
-		root == NULL || root->glob == NULL ||
-		rel == NULL || var == NULL || !IS_SIMPLE_REL(rel) ||
-		rel->rtekind != RTE_RELATION || rel->indexlist == NIL ||
-		var->varlevelsup != 0 || (Index) var->varno != rel->relid ||
-		var->varattno <= 0)
+	if (!lion_enable_skew_estimate)
 		return 1.0;
-	rte = planner_rt_fetch(rel->relid, root);
-	if (rte->rtekind != RTE_RELATION || rte->inh ||
-		rte->relkind == RELKIND_PARTITIONED_TABLE)
-		return 1.0;
-
-	cache = lion_nd_cache_for(root);
-	foreach(lc, cache->skews)
-	{
-		LionSkewCol *c = (LionSkewCol *) lfirst(lc);
-
-		if (c->relid == rte->relid && c->attnum == var->varattno)
-		{
-			col = c;
-			break;
-		}
-	}
-	if (col == NULL)
-	{
-		oldcxt = MemoryContextSwitchTo(cache->run.cxt);
-		col = (LionSkewCol *) palloc0(sizeof(LionSkewCol));
-		col->relid = rte->relid;
-		col->attnum = var->varattno;
-		cache->skews = lappend(cache->skews, col);
-		MemoryContextSwitchTo(oldcxt);
-		lion_skew_compute(root, rel, var, col);
-		if (col->rows > 0.0)
-			elog(DEBUG2, "lion: a probed key of column %d of \"%s\" meets %.1f rows, %.1f per key",
-				 (int) col->attnum, get_rel_name(col->relid), col->rows,
-				 col->keyrows);
-		if (lion_skew_collecting)
-		{
-			LionSkewCol *copy;
-
-			oldcxt = MemoryContextSwitchTo(lion_skew_collect_cxt);
-			copy = (LionSkewCol *) palloc(sizeof(LionSkewCol));
-			memcpy(copy, col, sizeof(LionSkewCol));
-			lion_skew_collected = lappend(lion_skew_collected, copy);
-			MemoryContextSwitchTo(oldcxt);
-		}
-	}
-	if (col->rows <= 0.0 || col->keyrows <= 0.0)
+	col = lion_skew_col_for(root, rel, var);
+	if (col == NULL || col->rows <= 0.0 || col->keyrows <= 0.0)
 		return 1.0;
 	return Max(col->rows / col->keyrows, 1.0);
+}
+
+/*
+ * The keys outside column var's MCV list, as a lion index on the column
+ * counted them (lion_skew_rows_of()): false where none did.  The top k's
+ * fallback reads them (lion_plan_count.c, DESIGN.md §36), whatever
+ * pg_lion.enable_skew_estimate says, which is about the probes' prices.
+ */
+bool
+lion_key_tail_counted(PlannerInfo *root, RelOptInfo *rel, Var *var,
+					  LionKeyTail *tail)
+{
+	LionSkewCol *col = lion_skew_col_for(root, rel, var);
+
+	if (col == NULL || col->tail.nkeys < 0.0)
+		return false;
+	*tail = col->tail;
+	return true;
 }
 
 static bool
