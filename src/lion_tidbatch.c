@@ -17,14 +17,16 @@
  * (the 64 heap blocks of one container at 8K, DESIGN.md §2), appended as the
  * uint16 lo values of an array, and go into the bitmap a heap block at a time
  * when the walk is over - or before, whenever what is kept outgrows work_mem,
- * the TIDBitmap's own budget.  That bound is the arena blocks handed out, so
- * it is passed by at most one item's slots and array; a sparse item whose new
- * directory chunks would pass it flushes what is kept first, and one that
- * could not fit at all goes at once.  A container key's slot is found
- * through a two-level directory of slots, not a hash: container keys are
- * small and dense, and so are the slots, a 5M-row table's in 21 kB.  All of
- * it is in an arena of anonymous memory, outside malloc's heap
- * (lion_tid_batch_map() says why).
+ * the TIDBitmap's own budget.  That bound is the arena blocks handed out.
+ * What an item takes before its members are stored - the directory chunks it
+ * has no slots in yet, the directory as it grows, the scratch - is checked
+ * first: when it would pass the bound, what is kept is flushed, and an item
+ * that could not fit even then goes at once.  Only what an item's members add
+ * to their slots' arrays can pass it.  A container key's slot is found through
+ * a two-level directory of slots, not a hash: container keys are small and
+ * dense, and so are the slots, a 5M-row table's in 21 kB.  All of it is in an
+ * arena of anonymous memory, outside malloc's heap (lion_tid_batch_map() says
+ * why).
  *
  * An array that would outgrow LION_ARRAY_MAX_CARD members, the size of a 4 KB
  * bitset of the container's TIDs, is FOLDED into one, and from then on the
@@ -115,11 +117,6 @@ typedef struct LionTidSlot
 	uint16	   *lo;				/* members not folded into bits[] yet */
 	uint64	   *bits;			/* LION_BITSET_WORDS, or NULL: none folded */
 } LionTidSlot;
-
-/* What one directory chunk of slots takes from the arena. */
-#define LION_TID_BATCH_CHUNK \
-	lion_arena_class_size(lion_arena_class(sizeof(LionTidSlot) * \
-										   LION_TID_BATCH_DIR_SIZE))
 
 /* What a flush and an item's members are put through; in the arena. */
 typedef struct LionTidScratch
@@ -222,6 +219,13 @@ lion_tid_batch_map(LionTidBatch *b)
 	b->ta = ta;
 }
 
+/* What an allocation of size bytes takes from the arena. */
+static inline Size
+lion_tid_class_bytes(Size size)
+{
+	return lion_arena_class_size(lion_arena_class(size));
+}
+
 /* size bytes from the arena, or the ERROR palloc() would raise */
 static void *
 lion_tid_alloc(LionTidBatch *b, Size size)
@@ -234,7 +238,7 @@ lion_tid_alloc(LionTidBatch *b, Size size)
 				 errmsg("out of memory"),
 				 errdetail("Failed to map memory for the TIDs of lion index \"%s\": %m.",
 						   b->name)));
-	b->held += lion_arena_class_size(lion_arena_class(size));
+	b->held += lion_tid_class_bytes(size);
 	return p;
 }
 
@@ -243,7 +247,7 @@ static void
 lion_tid_free(LionTidBatch *b, void *p, Size size)
 {
 	lion_arena_free(&b->ta->arena, p, size);
-	b->held -= lion_arena_class_size(lion_arena_class(size));
+	b->held -= lion_tid_class_bytes(size);
 }
 
 /* The slot of ckey. */
@@ -276,33 +280,61 @@ lion_tid_slot(LionTidBatch *b, uint32 ckey)
 	return &b->dir[hi][ckey & LION_TID_BATCH_DIR_MASK];
 }
 
-/*
- * The directory chunks sparse item c has pairs in: all of them in *all, and
- * as the result those b has no slots in yet.  Its pairs come sorted by code,
- * so a chunk's come together; a damaged item counts what iterating it yields.
- */
-static uint32
-lion_tid_sparse_chunks(const LionTidBatch *b, const LionContainer *c,
-					   uint32 *all)
+/* lion_tid_item_bytes()'s count of directory chunk hi */
+static inline void
+lion_tid_item_chunk(const LionTidBatch *b, uint32 hi, uint32 *nd,
+					uint32 *fresh)
 {
-	LionSparseIter it;
-	uint32		last = PG_UINT32_MAX;
+	if (hi >= b->ndir || b->dir[hi] == NULL)
+		(*fresh)++;
+	/* as lion_tid_slot() grows the directory */
+	if (hi >= *nd)
+		*nd = Max(hi + 1, *nd * 2);
+}
+
+/*
+ * What keeping item c takes from the arena before its first member is stored:
+ * the scratch if b has none, the directory chunks it has no slots in yet, and
+ * the directory when it grows for them, a pointer for each 65,536 heap blocks
+ * at 8K.  *ndir is what the directory will have grown to.  A sparse item's
+ * pairs come sorted by code, so a chunk's come together; a damaged one counts
+ * what iterating it yields, a chunk perhaps twice.
+ */
+static Size
+lion_tid_item_bytes(const LionTidBatch *b, const LionContainer *c,
+					uint32 *ndir)
+{
+	uint32		nd = b->ndir;
 	uint32		fresh = 0;
+	Size		bytes = 0;
 
-	*all = 0;
-	lion_sparse_iter_init(&it, c);
-	while (lion_sparse_iter_next(&it))
+	if (c->type == LION_CT_SPARSE)
 	{
-		uint32		hi = lion_sparse_iter_ckey(&it) >> LION_TID_BATCH_DIR_BITS;
+		LionSparseIter it;
+		uint32		last = PG_UINT32_MAX;
 
-		if (hi == last)
-			continue;
-		last = hi;
-		(*all)++;
-		if (hi >= b->ndir || b->dir[hi] == NULL)
-			fresh++;
+		lion_sparse_iter_init(&it, c);
+		while (lion_sparse_iter_next(&it))
+		{
+			uint32		hi;
+
+			hi = lion_sparse_iter_ckey(&it) >> LION_TID_BATCH_DIR_BITS;
+			if (hi != last)
+				lion_tid_item_chunk(b, hi, &nd, &fresh);
+			last = hi;
+		}
 	}
-	return fresh;
+	else
+		lion_tid_item_chunk(b, c->ckey >> LION_TID_BATCH_DIR_BITS, &nd, &fresh);
+
+	if (b->scratch == NULL)
+		bytes += lion_tid_class_bytes(sizeof(LionTidScratch));
+	bytes += fresh * lion_tid_class_bytes(sizeof(LionTidSlot) *
+										  LION_TID_BATCH_DIR_SIZE);
+	if (nd != b->ndir)
+		bytes += lion_tid_class_bytes(sizeof(LionTidSlot *) * nd);
+	*ndir = nd;
+	return bytes;
 }
 
 /*
@@ -529,6 +561,8 @@ lion_tid_batch_add(LionTidBatch *b, const LionContainer *c)
 {
 	int64		n = 0;
 	bool		big;
+	Size		need;
+	uint32		ndir;
 
 	if (b->head.direct)
 		return lion_container_to_tbm(c, b->tbm, b->recheck);
@@ -557,22 +591,20 @@ lion_tid_batch_add(LionTidBatch *b, const LionContainer *c)
 		return lion_container_to_tbm(c, b->tbm, b->recheck);
 
 	/*
-	 * A sparse item can span directory chunks it has no slots in yet, each of
-	 * them LION_TID_BATCH_CHUNK bytes.  When they would take what is kept past
-	 * maxbytes, flush first; an item that could not fit even then goes at once.
+	 * When what the item takes up front would take what is kept past maxbytes,
+	 * flush first; an item that could not fit even then goes at once.  Only
+	 * what its members add to their slots' arrays is left to the check below.
 	 */
-	if (c->type == LION_CT_SPARSE)
+	need = lion_tid_item_bytes(b, c, &ndir);
+	if (need > 0 && b->held + need > b->maxbytes)
 	{
-		uint32		all;
-		uint32		fresh = lion_tid_sparse_chunks(b, c, &all);
-
-		if (fresh > 0 && b->held + fresh * LION_TID_BATCH_CHUNK > b->maxbytes)
-		{
-			if (b->pending > 0)
-				lion_tid_batch_flush(b, false);
-			if (b->head.direct || all * LION_TID_BATCH_CHUNK > b->maxbytes)
-				return lion_container_to_tbm(c, b->tbm, b->recheck);
-		}
+		if (b->pending > 0)
+			lion_tid_batch_flush(b, false);
+		if (b->head.direct)
+			return lion_container_to_tbm(c, b->tbm, b->recheck);
+		need = lion_tid_item_bytes(b, c, &ndir);
+		if (b->held + need > b->maxbytes)
+			return lion_container_to_tbm(c, b->tbm, b->recheck);
 	}
 
 	if (b->ta == NULL)
@@ -606,6 +638,7 @@ lion_tid_batch_add(LionTidBatch *b, const LionContainer *c)
 								   b->scratch->members, k);
 		n = k;
 	}
+	Assert(n == 0 || b->ndir == ndir);
 
 	b->pending += n;
 	b->nkept += n;

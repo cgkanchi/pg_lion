@@ -17189,8 +17189,9 @@ The walk emits entry by entry: an INLINE payload from the leaf's private copy, a
 `lion_emit_chain()` one page at a time, with nothing pinned between entries. A range of any width
 therefore holds at most one index pin at a time and draws nothing from §15's pin budget - the bitmap
 scan needs no §9 interlock at all, since the executor visits every TID it emits - and its memory is
-the TIDBitmap's own `work_mem` budget, which goes lossy rather than growing, and as much again for
-the TIDs it gathers by heap block on their way into the bitmap ("Many keys into one bitmap" below).
+about the TIDBitmap's own `work_mem` budget, which turns pages lossy to stay within it and is raised
+only when lossy pages cannot get it there, and about as much again for the TIDs it gathers by heap
+block on their way into the bitmap ("Many keys into one bitmap" below).
 
 On a column with SUMMARY posting sets (§32) the walk is the summed walk of a count
 (`lion_entry_scan_begin_summed()`, from `lion_walk_begin()`): the keys of the buckets at the range's
@@ -17303,12 +17304,14 @@ them to the bitmap a heap block at a time:
   directory indexed by container key, not a hash.
 - What is kept goes to the bitmap when the walk is over, or whenever it outgrows `work_mem`: one
   `tbm_add_tuples()` a heap block, an array counting-sorted by block first. The bound is
-  approximate: it counts the arena blocks handed out, checked after each item, so one item's slots
-  and array can pass it. A sparse item can touch several directory chunks of 1,024 slots (24 KB
-  each); when its new chunks would pass `work_mem`, what is kept is flushed first, and an item that
-  could not fit at all goes to the bitmap at once. The arena maps regions of 1 MB and more and keeps
-  them across flushes; only the pages written to take memory. The bitmap's own memory is the
-  TIDBitmap's, as in any bitmap scan.
+  approximate: it counts the arena blocks handed out. What an item takes before its members are
+  stored is checked first - the directory chunks of 1,024 slots (24 KB each) it has no slots in yet,
+  several for a sparse item, and the directory itself as it grows, a pointer for each 65,536 heap
+  blocks (512 KB at 2^32 blocks) - and when that would pass `work_mem`, what is kept is flushed
+  first; an item that could not fit even then goes to the bitmap at once. Only what an item's
+  members add to the arrays of their slots, checked after it, can pass the bound. The arena maps
+  regions of 1 MB and more and keeps them across flushes; only the pages written to take memory.
+  The bitmap's own memory is the TIDBitmap's, as in any bitmap scan.
 - It is kept in an arena of anonymous memory (`lion_arena.c` without a file), unmapped when the walk
   ends or with the query's memory if it fails, not in palloc's. glibc's malloc gives the top of its
   heap back to the kernel once it is free and larger than twice the largest block malloc has
