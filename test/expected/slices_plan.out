@@ -1190,7 +1190,9 @@ SELECT slp_q('SELECT g, h, sum(b) FILTER (WHERE r < 10), max(c) FILTER (WHERE r 
 (1 row)
 
 -- ... but not an average or an int8 sum, whose states are a count beside a
--- sum
+-- sum: no path is made for them, so none comes up even with lion's price
+-- cut a thousandfold
+SET pg_lion.pushdown_margin = 1000;
 SELECT slp_q('SELECT g, avg(b) FILTER (WHERE h = 1) FROM slp GROUP BY g');
         slp_q         
 ----------------------
@@ -1209,6 +1211,7 @@ SELECT slp_q('SELECT g, avg(b), count(*) FILTER (WHERE h = 1) FROM slp GROUP BY 
  no pushdown, 10 rows
 (1 row)
 
+RESET pg_lion.pushdown_margin;
 -- ---------- 9. declined ----------
 -- a column that is not sliced, and a float column, which no slice takes
 SELECT slp_q('SELECT sum(r), max(r) FROM slp WHERE g = 3');

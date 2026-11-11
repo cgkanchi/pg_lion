@@ -409,10 +409,14 @@ SELECT spt_q('SELECT sum(v), max(w) FROM spd WHERE g = 2');
 SELECT spt_q('SELECT sum(v), avg(w), min(v), max(w), count(*) FROM spd');
 -- a GROUP BY over a partitioned table goes up as partial rows, which a sum
 -- of an int4 and a maximum are the partial states of (DESIGN.md §52,
--- "Partial rows"); an average or an int8 sum would need serialized ones
+-- "Partial rows"); an average or an int8 sum would need serialized ones, so
+-- no path is made for them, and none comes up even with lion's price cut a
+-- thousandfold
 SELECT spt_q('SELECT g, sum(v), max(w) FROM spd GROUP BY g');
+SET pg_lion.pushdown_margin = 1000;
 SELECT spt_q('SELECT g, avg(v) FROM spd GROUP BY g');
 SELECT spt_q('SELECT g, sum(w) FROM spd GROUP BY g');
+RESET pg_lion.pushdown_margin;
 -- a residual clause, as on one table
 SELECT spt_q('SELECT sum(v) FROM spd WHERE g = 2 AND w % 3 = 0');
 -- the switch

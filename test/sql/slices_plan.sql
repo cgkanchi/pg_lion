@@ -431,10 +431,13 @@ SELECT * FROM slp_plan('SELECT g, count(*), sum(b) FILTER (WHERE h = 1), max(tz)
 SELECT slp_q('SELECT g, sum(a) FILTER (WHERE h = 1), min(d) FILTER (WHERE h = 1) FROM slp WHERE r < 500 GROUP BY g HAVING sum(a) FILTER (WHERE h = 1) > 0');
 SELECT slp_q('SELECT g, h, sum(b) FILTER (WHERE r < 10), max(c) FILTER (WHERE r < 10), count(*) FROM slp WHERE tags @> ''{3}'' GROUP BY g, h');
 -- ... but not an average or an int8 sum, whose states are a count beside a
--- sum
+-- sum: no path is made for them, so none comes up even with lion's price
+-- cut a thousandfold
+SET pg_lion.pushdown_margin = 1000;
 SELECT slp_q('SELECT g, avg(b) FILTER (WHERE h = 1) FROM slp GROUP BY g');
 SELECT slp_q('SELECT g, sum(c) FILTER (WHERE h = 1) FROM slp GROUP BY g');
 SELECT slp_q('SELECT g, avg(b), count(*) FILTER (WHERE h = 1) FROM slp GROUP BY g');
+RESET pg_lion.pushdown_margin;
 
 -- ---------- 9. declined ----------
 -- a column that is not sliced, and a float column, which no slice takes
