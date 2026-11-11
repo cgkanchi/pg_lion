@@ -70,12 +70,31 @@ SELECT u.id, e.n FROM hk_u u
 SELECT count(*), sum(e.n) FROM hk_u u
   JOIN (SELECT uid, count(*) AS n FROM hk_e GROUP BY uid) e ON e.uid = u.id
  WHERE u.r = 7;
-BEGIN;
-SET LOCAL lion_hooktest.refuse_lateral = on;
-EXPLAIN (COSTS OFF)
+-- With the other hook refusing, the plan is the query as written - which of
+-- its plans the costs pick does not matter here, only that it does not
+-- count uid per outer row as the LATERAL form does
+CREATE FUNCTION hk_per_outer_row(q text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Lion Indexes: .*\(uid = u\.id\)' THEN
+			RETURN true;
+		END IF;
+	END LOOP;
+	RETURN false;
+END $$;
+SELECT hk_per_outer_row($$
 SELECT u.id, e.n FROM hk_u u
   JOIN (SELECT uid, count(*) AS n FROM hk_e GROUP BY uid) e ON e.uid = u.id
- WHERE u.r = 7;
+ WHERE u.r = 7$$) AS per_outer_row;
+BEGIN;
+SET LOCAL lion_hooktest.refuse_lateral = on;
+SELECT hk_per_outer_row($$
+SELECT u.id, e.n FROM hk_u u
+  JOIN (SELECT uid, count(*) AS n FROM hk_e GROUP BY uid) e ON e.uid = u.id
+ WHERE u.r = 7$$) AS per_outer_row;
 SELECT count(*), sum(e.n) FROM hk_u u
   JOIN (SELECT uid, count(*) AS n FROM hk_e GROUP BY uid) e ON e.uid = u.id
  WHERE u.r = 7;
@@ -88,3 +107,4 @@ SELECT count(*) FROM hk_u u
  WHERE u.r = 7;
 RESET lion_hooktest.refuse_lateral;
 DROP TABLE hk_u, hk_e;
+DROP FUNCTION hk_per_outer_row(text);
