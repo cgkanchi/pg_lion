@@ -7399,6 +7399,8 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   then written with whatever growth slack (§4) still fits beside the chunk, none if none does:
   the area the last rewrite gave the payload is kept only while it does, since an entry built at
   that area beside a grown chunk can be over LION_MAX_ENTRY_SIZE although the payload itself fits.
+  A statement's rows go in a key's run at a time (§55, "A column with stored positions"), the
+  run's positions before its TIDs, under the same rules.
 - **VACUUM** takes a TID's positions out after the TID (V1), and asks the callback about every
   member (V2).  INLINE: the chunk is filtered in the same rewrite as the payload.  CHAIN: after
   the posting set's leaves, every leaf of the position tree is filtered under an EXCLUSIVE lock
@@ -35298,6 +35300,22 @@ with a sliced index took 692 ms row by row and takes 227 ms (126 without slices)
 inserting 200 rows a statement loaded 45,000 rows a second, a third of what one did, and load
 300,000.
 
+**A column with stored positions** (§17) is batched too: `lioninsert()` keeps each row's
+positions after its key in the buffer (`LionDeferPos`: the member's position count, data length and
+positions), and the steps above put a key's positions in before its TIDs, as one row's insert does
+(W1). A CHAIN entry's run goes into its position tree by `lion_postree_put_rows()`: members above
+everything the tree holds - rows added at the end of the table - are appended to the tree's last
+chunk, which is decoded once to find where its members end (`lion_poschunk_append_tail()`, as the
+build appends) and written in one record, up to the size at which a chunk splits; a member below
+the tree's last, or one the chunk has no room for, goes in by `lion_postree_put()` as a row's does.
+An INLINE entry takes as many rows as its payload and inline chunk hold together under the limit,
+in one rewrite (`lion_insert_inline_pos_rows()`): the chunk is read and checked once, rows above
+its last member are appended to it and a row below is merged in; a row that would take the two past
+the limit spills the entry as a row's insert does. A new entry is made by its first row alone and
+takes the rest as an INLINE one. A 2,000-row `INSERT ... SELECT` of 80-word documents into a
+20,000-row table took 1,740 ms row by row and takes 565 ms (335 without positions); most of what
+went was the decoding of chunks, which a row's insert did two or three times for its chunk.
+
 A key of many rows - the case that queued - is a CHAIN entry after its first few hundred, so its
 rows go in 256 to a lock handoff and a record to a container; a key of one row costs what it did,
 plus the sort.
@@ -35327,8 +35345,8 @@ covered is this backend reading the index before they are written, and the commi
 
 **When nothing is buffered** (`lion_defer_allowed()` and `lioninsert()`): PostgreSQL 16, which has
 no `aminsertcleanup`; the first row of a statement, so a one-row statement costs what it did; a
-column with stored positions or summaries, whose inserts write more than the key's entry and its
-slices (each of those steps would have to be batched as well); the index
+column with summaries, whose inserts write more than the key's entry and its slices (the bucket's
+steps would have to be batched as well); the index
 of an exclusion constraint, whose check scans the index for the rows inserted before in the same
 statement; while an `INSERT ... ON CONFLICT` runs, anywhere in the backend (tracked from
 `ExecutorStart` to `ExecutorEnd` and dropped with the subtransaction it began in); and the rest of
@@ -35386,8 +35404,9 @@ A record to a container rather than to a row, and a new or INLINE entry's rows i
 38% less time on two values and 20% less on 20,000; none on a million values or on statements
 whose keys have a row each.
 
-**Not done.** Columns with positions and summaries are written row by row; batching them needs
-their own steps sorted and held the same way. A one-row statement gains nothing,
+**Not done.** Columns with summaries are written row by row; batching them needs their own steps
+sorted and held the same way. A positions key's rows that land below what its position tree holds
+(room a VACUUM freed) go into the tree one at a time. A one-row statement gains nothing,
 and many writers inserting one row each still take turns on the leaf (each turn shorter since §21's
 "A leaf already known").
 
@@ -35395,12 +35414,14 @@ Tests: `test/sql/insert_batch.sql` (every kind of key in one batch and across `w
 a key's rows into a new, an INLINE and a CHAIN entry, spilling in the middle of the batch, and the
 records 400 rows of one CHAIN key write counted; a sliced column whose batch makes its slices and
 spills them, and an UPDATE that hands a slice its rows out of TID order, against
-`lion_index_slice_agg()`;
+`lion_index_slice_agg()`; a column with stored positions whose batch appends to position trees and
+inline chunks, spills INLINE entries, and then merges rows below them in, against the rows'
+tsvectors and phrase queries;
 a volatile function's query in the INSERT's own select list, BEFORE and AFTER triggers' queries,
 by the count pushdown first; rows left past their statement written by a query of the table, a
 direct reader and the commit, dropped with an aborted savepoint or PL/pgSQL block, written before
 TRUNCATE and DROP INDEX; `batch_inserts = off`; ON CONFLICT in the statement and in a WITH query;
 an exclusion constraint violated within one statement; columns with summaries, slices and
-positions beside batched ones; a partitioned table), each against sequential scans and
+positions in one statement; a partitioned table), each against sequential scans and
 `lion_index_verify()`; `test/isolation/insert_batch_race.spec` (a batch parked between two holds
 while another writer fills the same key and VACUUM empties part of it).

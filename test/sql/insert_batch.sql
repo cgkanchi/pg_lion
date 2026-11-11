@@ -399,6 +399,63 @@ SELECT lb_slcmp('lb_sl_vw', 1::int2), lb_slcmp('lb_sl_vw', 2::int2);
 SELECT lb_cmp('lb_sl', 'w = -3');
 
 -- ---------------------------------------------------------------------
+-- A column that stores positions (DESIGN.md §17).  A CHAIN key's rows go
+-- into its position tree a run at a time, appended to the tree's last
+-- chunk, which splits as it fills; an INLINE key's go into the entry's own
+-- chunk with their TIDs in one rewrite, and inline_limit = 256 spills keys
+-- in the middle of the batch; a key of one row is a new entry.  Then rows
+-- that land below the ones the index has, in room a VACUUM freed, which are
+-- merged in rather than appended - the m keys' into INLINE entries, the
+-- common key's into its position tree.  What the index stores for every
+-- key is compared with the rows' tsvectors.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION lion_debug_key_positions(regclass, text,
+	OUT tid tid, OUT positions int2[], OUT weights text[]) RETURNS SETOF record
+	AS '$libdir/pg_lion' LANGUAGE C STRICT;
+CREATE FUNCTION lb_doc(g int4) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$
+	SELECT setweight(to_tsvector('simple',
+		repeat('common ', 1 + g % 4) || 'w' || g % 40 || ' p' || g / 3 ||
+		' r' || g || ' common m' || g % 400),
+		(ARRAY['A', 'B', 'C', 'D'])[1 + g % 4]::"char")
+$$;
+CREATE TABLE lb_pos (i int4, d tsvector) WITH (autovacuum_enabled = off);
+CREATE INDEX lb_pos_d ON lb_pos USING lion (d)
+	WITH (store_positions = true, inline_limit = 256);
+CREATE VIEW lb_pos_compare AS
+WITH idx AS (
+	SELECT l.lexeme, p.tid, p.positions, p.weights
+	FROM (SELECT DISTINCT unnest(tsvector_to_array(d)) AS lexeme FROM lb_pos) l,
+		 lion_debug_key_positions('lb_pos_d', l.lexeme) p),
+heap AS (
+	SELECT u.lexeme, lb_pos.ctid AS tid, u.positions, u.weights
+	FROM lb_pos, unnest(d) u)
+SELECT (SELECT count(*) FROM heap) AS heap_rows,
+	   (SELECT count(*) FROM (SELECT * FROM idx EXCEPT ALL SELECT * FROM heap) x) AS only_index,
+	   (SELECT count(*) FROM (SELECT * FROM heap EXCEPT ALL SELECT * FROM idx) x) AS only_heap;
+
+INSERT INTO lb_pos SELECT g, lb_doc(g) FROM generate_series(1, 3000) g;
+SELECT entries, inline_entries, ntids, position_pages > 2 AS position_pages
+  FROM lion_index_stats('lb_pos_d');
+SELECT lion_index_verify('lb_pos_d', true);
+SELECT * FROM lb_pos_compare;
+SELECT lb_cmp('lb_pos', $$d @@ 'common <-> w7'$$);
+SELECT lb_cmp('lb_pos', $$d @@ 'common <2> common'$$);
+SELECT lb_cmp('lb_pos', $$d @@ 'p100 <-> r301'$$);
+
+-- room near the start of the table, which the next rows take first
+DELETE FROM lb_pos WHERE i % 3 = 0 AND i <= 1500;
+VACUUM lb_pos;
+INSERT INTO lb_pos SELECT g, lb_doc(g) FROM generate_series(3001, 3800) g;
+SELECT count(*) FILTER (WHERE ctid < '(5,0)') > 0 AS some_below,
+	   count(*) FILTER (WHERE ctid > (SELECT max(ctid) FROM lb_pos WHERE i <= 3000)) > 0 AS some_above
+  FROM lb_pos WHERE i > 3000;
+SELECT lion_index_verify('lb_pos_d', true);
+SELECT * FROM lb_pos_compare;
+SELECT lb_cmp('lb_pos', $$d @@ 'common <-> w7'$$);
+SELECT lb_cmp('lb_pos', $$d @@ 'w23 <-> p1101'$$);
+SELECT lb_cmp('lb_pos', $$d @@ 'common <-> m5'$$);
+
+-- ---------------------------------------------------------------------
 -- A partitioned table: one buffer per partition's index.
 -- ---------------------------------------------------------------------
 CREATE TABLE lb_part (i int4, k int4) PARTITION BY RANGE (i);
@@ -409,7 +466,10 @@ INSERT INTO lb_part SELECT (g * 7919) % 10000, g % 5 FROM generate_series(1, 999
 SELECT lion_index_verify('lb_part_1_k_idx', true), lion_index_verify('lb_part_2_k_idx', true);
 SELECT lb_cmp('lb_part', 'k = 4');
 
-DROP TABLE lb, lb_mid, lb_log, lb_left, lb_ex, lb_mix, lb_rows, lb_sl, lb_part;
+DROP VIEW lb_pos_compare;
+DROP TABLE lb, lb_mid, lb_log, lb_left, lb_ex, lb_mix, lb_rows, lb_sl, lb_pos,
+	lb_part;
 DROP FUNCTION lb_probe(int4), lb_trig(), lb_after(), lb_cmp(text, text), batched(int8),
-	lb_slcmp(regclass, int2);
+	lb_slcmp(regclass, int2), lb_doc(int4),
+	lion_debug_key_positions(regclass, text);
 DROP FUNCTION lion_debug_defer_pending(regclass), lion_debug_defer_cleanup(bool);
