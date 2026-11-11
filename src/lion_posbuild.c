@@ -33,6 +33,8 @@ struct LionPosBuild
 	const LionPageWriter *w;
 	uint32		hash;			/* the entry's owner stamp */
 	LionContainer *chunk;		/* the members, while they fit one chunk */
+	uint16	   *dls;			/* ... and their rows' lengths, which the
+								 * chunk's impacts only bound */
 	LionPosTail tail;
 	struct LionPosLoader *ld;	/* ... else the tree they make */
 	uint64		n;				/* members so far */
@@ -72,6 +74,8 @@ lion_posbuild_begin(Relation index, LionIndexState *ix)
 	pb->cxt = cxt;
 	pb->chunk = (LionContainer *) MemoryContextAllocZero(cxt,
 														 LION_CONTAINER_MAX_SIZE);
+	pb->dls = (uint16 *) MemoryContextAlloc(cxt, sizeof(uint16) *
+											LION_POS_MAX_MEMBERS);
 	return pb;
 }
 
@@ -80,14 +84,13 @@ lion_posbuild_begin(Relation index, LionIndexState *ix)
  * --------------------------------------------------------------------- */
 
 /*
- * The member bytes a written chunk holds at most: half a page, so that a
- * leaf takes two.  An insert later appends to the last chunk and splits it
- * when it is full, as for any chunk.
+ * The member bytes a written chunk holds at most, LION_POS_TREE_BYTES: few
+ * enough rows that its impacts say something of each (lion_positions.h).
+ * A member bigger than that alone gets a chunk of its own, as big as it
+ * needs.  An insert later appends to the last chunk and splits it when it
+ * is full, as for any chunk.
  */
-#define LION_POS_LOAD_BYTES \
-	Min((Size) LION_POS_MAX_BYTES, \
-		(Size) MAXALIGN_DOWN(LION_PAGE_CAPACITY / 2 - sizeof(ItemIdData)) - \
-		LION_POS_HDRSZ)
+#define LION_POS_LOAD_BYTES		((Size) LION_POS_TREE_BYTES)
 
 typedef struct LionPosLoader
 {
@@ -215,7 +218,8 @@ lion_posload_add(LionPosLoader *ld, const LionPosMember *m)
 		lion_poschunk_init(ld->chunk, lion_pos_block(m->code));
 		ld->chunkopen = true;
 		ld->tail.valid = false;
-		if (!lion_poschunk_append_tail(ld->chunk, cap, m, &ld->tail))
+		if (!lion_poschunk_append_tail(ld->chunk, LION_CONTAINER_MAX_SIZE, m,
+									   &ld->tail))
 			elog(ERROR, "lion index: a position member does not fit an empty chunk");
 	}
 }
@@ -352,6 +356,8 @@ lion_posbuild_key_add(LionPosBuild *pb, uint64 code,
 		lion_posload_add(pb->ld, m);
 		return;
 	}
+	if (pb->n <= LION_POS_MAX_MEMBERS)
+		pb->dls[pb->n - 1] = m->dl;
 	if (pb->n == 1)
 	{
 		memset(pb->chunk, 0, LION_CONTAINER_MAX_SIZE);
@@ -367,6 +373,7 @@ lion_posbuild_key_add(LionPosBuild *pb, uint64 code,
 		LionPosLoader *ld = (LionPosLoader *) palloc0(sizeof(LionPosLoader));
 		LionPosMember *cm = (LionPosMember *) palloc(sizeof(LionPosMember));
 		LionPosIter it;
+		uint32		i = 0;
 
 		ld->w = w;
 		ld->hash = pb->hash;
@@ -379,7 +386,12 @@ lion_posbuild_key_add(LionPosBuild *pb, uint64 code,
 		lion_posload_newleaf(ld);
 		lion_poschunk_iter_init(&it, pb->chunk);
 		while (lion_poschunk_iter_next(&it, cm))
+		{
+			/* the length each had: a decoded member's is not known */
+			cm->dl = (i < LION_POS_MAX_MEMBERS) ? pb->dls[i] : 0;
+			i++;
 			lion_posload_add(ld, cm);
+		}
 		lion_posload_add(ld, m);
 		pfree(cm);
 		pb->ld = ld;

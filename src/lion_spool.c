@@ -74,8 +74,10 @@
  *
  * A column that STORES POSITIONS (DESIGN.md §17) keeps them in the same
  * streams: each of its keys' codes is followed by the positions the row has
- * for the key, a varbyte count and that many WordEntryPos values, and a
- * code and its positions - a MEMBER - travel together through every spill,
+ * for the key, a varbyte count and that many WordEntryPos values - the last
+ * of them the row's length, which the position chunks' impacts are made of
+ * (lion_positions.h), so the count is one more than the key's positions -
+ * and a code and its positions - a MEMBER - travel together through every spill,
  * merge and export, so they come out of the merge together and in code
  * order, and the budget counts them as it counts the codes.  The reserved
  * entries of such a column have no positions.
@@ -116,8 +118,12 @@
 /* A code a stream holds out of order: a zero delta, then the code. */
 #define LION_ESCAPED_MAX	(1 + LION_VARBYTE_MAX)
 
-/* A member's positions (see the file header): a count, then the values. */
-#define LION_POSDATA_MAX	(LION_VARBYTE_MAX + sizeof(uint16) * LION_POS_MAX_NPOS)
+/*
+ * A member's positions (see the file header): a count, then the values, the
+ * row's length last.
+ */
+#define LION_SPOOL_NPOS_MAX	(LION_POS_MAX_NPOS + 1)
+#define LION_POSDATA_MAX	(LION_VARBYTE_MAX + sizeof(uint16) * LION_SPOOL_NPOS_MAX)
 
 /* The most bytes one code takes in a stream, its positions included. */
 #define LION_MEMBER_MAX		(LION_ESCAPED_MAX + LION_POSDATA_MAX)
@@ -403,7 +409,7 @@ struct LionSpoolGroup
 
 	/* the positions of the code handed out last (see the file header) */
 	uint16		npos;
-	uint16	   *pos;			/* LION_POS_MAX_NPOS of them */
+	uint16	   *pos;			/* LION_SPOOL_NPOS_MAX of them, the length last */
 
 	/*
 	 * A hash collision: (code, distinct key) pairs through a sort, and the
@@ -495,11 +501,28 @@ lion_posdata_put(uint8 *p, uint32 npos, const void *pos)
 	return n + sizeof(uint16) * npos;
 }
 
-/* The npos a row's key positions are kept with: as many as a member holds. */
+/*
+ * The count a row's key positions are kept with: as many as a member holds,
+ * and the row's length.
+ */
 static inline uint32
 lion_kp_npos(const LionKeyPositions *kp)
 {
-	return Min((uint32) kp->npos, (uint32) LION_POS_MAX_NPOS);
+	return Min((uint32) kp->npos, (uint32) LION_POS_MAX_NPOS) + 1;
+}
+
+/* A row's key positions as a stream holds them: npos of lion_kp_npos(). */
+static inline Size
+lion_posdata_put_kp(uint8 *p, uint32 npos, const LionKeyPositions *kp)
+{
+	Size		n = lion_varbyte_put(p, npos);
+
+	Assert(npos >= 1);
+	if (npos > 1)
+		memcpy(p + n, kp->pos, sizeof(uint16) * (npos - 1));
+	n += sizeof(uint16) * (npos - 1);
+	memcpy(p + n, &kp->dl, sizeof(uint16));
+	return n + sizeof(uint16);
 }
 
 static int
@@ -630,7 +653,7 @@ lion_acc_new_entry(LionAccCol *col, int kind, Datum key, uint32 hash,
 		e->cap = Max((Size) 32, LION_VARBYTE_MAX + lion_posdata_size(npos));
 		e->buf = MemoryContextAlloc(col->cxt, e->cap);
 		e->len = lion_varbyte_put(e->buf, code);
-		e->len += lion_posdata_put(e->buf + e->len, npos, kp->pos);
+		e->len += lion_posdata_put_kp(e->buf + e->len, npos, kp);
 	}
 	col->nentries++;
 	return e;
@@ -707,7 +730,7 @@ lion_acc_append(LionAccCol *col, LionAccEntry *e, uint64 code,
 	}
 	e->lastcode = code;
 	if (kp != NULL)
-		e->len += lion_posdata_put(e->buf + e->len, npos, kp->pos);
+		e->len += lion_posdata_put_kp(e->buf + e->len, npos, kp);
 }
 
 static void
@@ -1254,7 +1277,7 @@ lion_cursor_raw_next(LionRunCursor *c, uint64 *code, uint16 *npos,
 	{
 		uint64		n = lion_varbyte_get(&c->p, c->end);
 
-		if (n > LION_POS_MAX_NPOS ||
+		if (n == 0 || n > LION_SPOOL_NPOS_MAX ||
 			(Size) (c->end - c->p) < sizeof(uint16) * n)
 			elog(ERROR, "lion index build: malformed positions in a spilled run");
 		*npos = (uint16) n;
@@ -1598,7 +1621,10 @@ lion_spool_group_positions(const LionSpoolGroup *group, LionKeyPositions *kp)
 {
 	if (group->materialised || group->ncurs == 0 || !group->curs[0]->haspos)
 		elog(ERROR, "lion index build: positions asked of a group that has none");
-	kp->npos = group->npos;
+	if (group->npos == 0)
+		elog(ERROR, "lion index build: a member without the row's length");
+	kp->npos = group->npos - 1;
+	kp->dl = group->pos[group->npos - 1];
 	kp->pos = group->pos;
 }
 
@@ -2064,7 +2090,7 @@ lion_merge_column(LionMerge *m, LionRunCursor **in, int nin,
 	heap = binaryheap_allocate(nin, lion_merge_heap_cmp, m);
 	grp = palloc(sizeof(LionRunCursor *) * nin);
 	pos = m->state->positions ?
-		palloc(sizeof(uint16) * LION_POS_MAX_NPOS) : NULL;
+		palloc(sizeof(uint16) * LION_SPOOL_NPOS_MAX) : NULL;
 	for (i = 0; i < nin; i++)
 	{
 		if (!in[i]->eos)

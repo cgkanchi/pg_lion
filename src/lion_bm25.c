@@ -106,16 +106,34 @@ PG_FUNCTION_INFO_V1(lion_bm25);
 PG_FUNCTION_INFO_V1(lion_bm25_score);
 
 /*
- * One query lexeme in a walk: a cursor over its members in TID order, the member it
- * stands on (NULL once past the last), its idf, and the most it can add to a
- * score.
+ * One query lexeme in a walk: a cursor over its members in TID order, the
+ * member it stands on, its idf, the most it can add to any row's score
+ * (ub), and the chunk the walk's window is in with the most its rows can
+ * add (lion_bm25_topk()).
  */
+typedef enum LionBm25MState
+{
+	LION_BM25_M_UNREAD,			/* m is not to be trusted: read again */
+	LION_BM25_M_AT,				/* m is the member the last read found */
+	LION_BM25_M_END				/* no member left */
+} LionBm25MState;
+
 typedef struct LionBm25Term
 {
 	LionPosCursor *cur;
 	const LionPosMember *m;
+	LionBm25MState mstate;
 	double		idf;
 	double		ub;
+
+	/* the chunk at or after the window's start, from lion_poscursor_chunk() */
+	bool		chunkset;
+	uint64		chunkid;
+	uint64		first;			/* no member of it below this */
+	uint64		last;			/* ... nor above this, when haslast */
+	bool		haslast;
+	double		bound;			/* the most a row of it can add */
+	double		wmax;			/* the most a row of the window can add */
 } LionBm25Term;
 
 /* N and the sum of the lengths, per index column, for this backend. */
@@ -902,25 +920,82 @@ lion_bm25_score_row(const LionBm25Query *q, TSVector doc)
 }
 
 /*
- * The best L rows into best[], unsorted; returns how many.  MaxScore (Turtle
- * and Flood): the terms in ascending order of the most they can add, the
- * first nlow of them "non-essential" while those maxima sum to no more than
- * the worst score the heap holds once it is full.  A row with none of the
- * other, essential, terms then cannot get in, so only the essential terms'
- * members are candidates, merged in TID order; each non-essential term is
- * sought only for a candidate, best first, and only while what is left of
- * them could still lift it past the heap's worst.  The heap's worst only
- * rises, so nlow only grows.  A row's score is the same sum the full merge
- * would make, in the same term order.
+ * The most a row of chunk c of a term of idf idf can add: the best of its
+ * impact pairs (lion_positions.h), each a tf at least a member's and a length
+ * at most its row's - a term's score rises with tf and falls with the length,
+ * for every k1 and b the functions take.
+ */
+static double
+lion_bm25_chunk_bound(const LionBm25Query *q, double idf,
+					  const LionContainer *c)
+{
+	LionPosImpact imp[LION_POS_NIMPACTS];
+	int			n = lion_poschunk_impacts(c, imp);
+	double		best = 0;
+	int			i;
+
+	for (i = 0; i < n; i++)
+	{
+		double		s = lion_bm25_tf_score(idf, (double) imp[i].tf, q->k1,
+										   lion_bm25_norm(q, (double) imp[i].len));
+
+		best = Max(best, s);
+	}
+	return best;
+}
+
+/*
+ * A walk ranks by windows of chunks (below) for at most this many lexemes;
+ * past it, the window is the whole walk, as a walk without chunk bounds.
+ */
+#define LION_BM25_WINDOW_TERMS	16
+
+/*
+ * Is a sum of maxima no more than the heap's worst score, so that no row
+ * whose terms those maxima bound can get in?  The sum is nudged up a
+ * relative 1e-9 first: far more than what rounding - of the maxima, of
+ * the sum, of a row's score added up in another order - can take off it,
+ * and far less than any two scores that differ do.
+ */
+static inline bool
+lion_bm25_cannot(double sum, double worst)
+{
+	return sum * (1.0 + 1e-9) <= worst;
+}
+
+/*
+ * The best L rows into best[], unsorted; returns how many.
  *
- * A term adds less than idf * (k1 + 1) to any row, since tf / (tf + norm) is
- * below 1 (and at most 1 when k1 is 0); that, nudged up so a sum of maxima
- * rounded down cannot pass for a score, is its maximum.  For a k1 near the
- * largest double it is infinite: then no term is ever non-essential, and
- * every candidate is scored in full.  Equal scores rank by
- * TID and a candidate's TID is above every TID the heap holds, so a candidate
- * gets in only with a score above the heap's worst: at a bound no higher than
- * that, a row is not scored on.
+ * MaxScore (Turtle and Flood) over windows of the key space, block-max
+ * style: a window ends where the chunk of one of the query's lexemes does
+ * (lion_poscursor_chunk(), the last code a chunk's header records), so that
+ * within it every lexeme's rows are in one chunk of its own, whose impacts
+ * say the most a row of it can add (lion_bm25_chunk_bound()) - a chunk with
+ * no row in the window adds nothing.  In each window the lexemes in
+ * ascending order of those maxima, the first nlow of them "non-essential"
+ * while their maxima sum to no more than the worst score the heap holds
+ * once it is full: a row with none of the other, essential, lexemes cannot
+ * get in, so only the essential lexemes' members are candidates, merged in
+ * TID order, and each non-essential lexeme is sought only for a candidate,
+ * the one that can add most first, and only while what is left of them
+ * could still lift it past the heap's worst.  A window whose maxima all sum
+ * to no more than that is stepped over without a member read.  The heap's
+ * worst only rises, so within a window nlow only grows.  A lexeme whose
+ * chunk does not record its last code bounds nothing past it: its maximum
+ * is ub, the most it adds to any row, and it does not end a window.  With
+ * more than LION_BM25_WINDOW_TERMS lexemes, one window is the whole walk
+ * and every lexeme's maximum is ub.
+ *
+ * ub is idf * (k1 + 1): a term adds less to any row, since tf / (tf + norm)
+ * is below 1 (and at most 1 when k1 is 0).  For a k1 near the largest
+ * double it is infinite: then no lexeme is non-essential while chunks do
+ * not bound it.  Equal scores rank by TID and a candidate's TID is above
+ * every TID the heap holds, so a candidate gets in only with a score above
+ * the heap's worst: at a bound no higher than that, a row is not scored on.
+ *
+ * A row's score is the sum lion_bm25_score_row() makes, in its order -
+ * every lexeme's part, highest idf first - whatever lexemes were essential
+ * in its window; a row some lexeme was not sought for cannot get in.
  *
  * With after given, only the rows ranked below it count: the walk goes on
  * from where an earlier one with the same LionBm25Query stopped.  A row's
@@ -938,16 +1013,20 @@ lion_bm25_topk(const LionBm25Query *q, int64 L, const LionBm25Cand *after,
 	Relation	index = q->index;
 	int			nterms = q->nterms;
 	LionBm25Term *terms = (LionBm25Term *) palloc0(sizeof(LionBm25Term) * nterms);
-	double	   *below;			/* below[i]: the maxima of terms[0, i) */
+	int		   *wo;				/* the window's lexemes, ascending wmax */
+	double	   *below;			/* below[i]: the wmax of wo[0, i) */
+	double	   *part;			/* a candidate's part of each lexeme */
+	bool		windows = nterms <= LION_BM25_WINDOW_TERMS;
 	Datum		lenkey = PointerGetDatum(cstring_to_text_with_len("", 0));
 	LionPosCursor *lencur;
 	int64		nbest = 0;
-	int			nlow = 0;
 	int64		nscored = 0;
+	uint64		wstart = 0;
 	int			t;
 
+	wo = (int *) palloc(sizeof(int) * nterms);
 	below = (double *) palloc(sizeof(double) * (nterms + 1));
-	below[0] = 0;
+	part = (double *) palloc(sizeof(double) * nterms);
 	for (t = 0; t < nterms; t++)
 	{
 		LionBm25Term *term = &terms[t];
@@ -955,75 +1034,198 @@ lion_bm25_topk(const LionBm25Query *q, int64 L, const LionBm25Cand *after,
 
 		term->cur = lion_bm25_open(index, q->col,
 								   PointerGetDatum(q->lexemes[l]), true);
-		term->m = lion_poscursor_next(index, term->cur, 0);
+		term->mstate = LION_BM25_M_UNREAD;
 		term->idf = q->idfs[l];
-		term->ub = q->idfs[l] * (q->k1 + 1.0) * (1.0 + 1e-9);
-		below[t + 1] = below[t] + term->ub;
+		term->ub = q->idfs[l] * (q->k1 + 1.0);
 	}
 
 	lencur = lion_bm25_open(index, q->col, lenkey, false);
 	for (;;)
 	{
-		uint64		code = PG_UINT64_MAX;
-		const LionPosMember *m;
-		double		norm;
-		double		score = 0;
-		LionBm25Cand c;
+		uint64		wend = PG_UINT64_MAX;
+		uint64		next = PG_UINT64_MAX;
+		int			nlow = 0;
+		int			i;
 
-		for (t = nlow; t < nterms; t++)
-			if (terms[t].m != NULL && terms[t].m->code < code)
-				code = terms[t].m->code;
-		if (code == PG_UINT64_MAX)
+		/* each lexeme's chunk at or after the window's start */
+		for (t = 0; t < nterms; t++)
+		{
+			LionBm25Term *term = &terms[t];
+			const LionContainer *c;
+			uint64		id;
+
+			if (term->mstate == LION_BM25_M_END)
+				continue;
+			if (!windows)
+			{
+				next = 0;
+				continue;
+			}
+			c = lion_poscursor_chunk(index, term->cur, wstart, &id);
+			if (c == NULL)
+			{
+				term->mstate = LION_BM25_M_END;
+				continue;
+			}
+			if (!term->chunkset || id != term->chunkid)
+			{
+				term->chunkset = true;
+				term->chunkid = id;
+				term->first = lion_pos_block_base(c->ckey);
+				term->haslast = lion_poschunk_last(c, &term->last);
+				term->bound = term->haslast ?
+					lion_bm25_chunk_bound(q, term->idf, c) : term->ub;
+				/* the cursor has left the member it stood on */
+				term->mstate = LION_BM25_M_UNREAD;
+			}
+			else if (term->mstate == LION_BM25_M_AT && term->m->code < wstart)
+				term->mstate = LION_BM25_M_UNREAD;
+			next = Min(next, Max(wstart, term->first));
+		}
+		if (next == PG_UINT64_MAX)
 			break;
 
-		m = lion_poscursor_next(index, lencur, code);
-		norm = lion_bm25_norm(q, (m != NULL && m->code == code) ?
-							  lion_bm25_length(m) : q->avgdl);
+		/*
+		 * Where every chunk starts past the window's start, the window starts
+		 * at the first of them; each chunk's last code is at or above it.
+		 */
+		wstart = next;
+		for (t = 0; t < nterms && windows; t++)
+		{
+			if (terms[t].mstate != LION_BM25_M_END && terms[t].haslast)
+				wend = Min(wend, terms[t].last);
+		}
 
-		/* the essential terms, then the rest from the one that can add most */
-		for (t = nterms - 1; t >= nlow; t--)
+		/* the window's maxima, and its lexemes in ascending order of them */
+		for (t = 0; t < nterms; t++)
 		{
 			LionBm25Term *term = &terms[t];
 
-			if (term->m != NULL && term->m->code == code)
+			if (term->mstate == LION_BM25_M_END)
+				term->wmax = 0;
+			else if (!windows)
+				term->wmax = term->ub;
+			else
+				term->wmax = (term->first > wend) ? 0 : term->bound;
+			for (i = t; i > 0 && terms[wo[i - 1]].wmax > term->wmax; i--)
+				wo[i] = wo[i - 1];
+			wo[i] = t;
+		}
+		below[0] = 0;
+		for (i = 0; i < nterms; i++)
+			below[i + 1] = below[i] + terms[wo[i]].wmax;
+		while (nbest == L && nlow < nterms &&
+			   lion_bm25_cannot(below[nlow + 1], best[0].score))
+			nlow++;
+
+		/* the window's candidates, from its essential lexemes */
+		while (nlow < nterms)
+		{
+			uint64		code = PG_UINT64_MAX;
+			const LionPosMember *m;
+			double		norm;
+			double		sum = 0;
+			double		score = 0;
+			bool		whole = true;
+			LionBm25Cand c;
+
+			for (i = nlow; i < nterms; i++)
 			{
-				score += lion_bm25_tf_score(term->idf,
-											(double) Max(term->m->npos, 1),
-											q->k1, norm);
-				term->m = lion_poscursor_next(index, term->cur, code + 1);
-			}
-		}
-		for (t = nlow - 1; t >= 0; t--)
-		{
-			LionBm25Term *term = &terms[t];
+				LionBm25Term *term = &terms[wo[i]];
 
-			if (nbest == L && score + below[t + 1] <= best[0].score)
+				if (term->mstate == LION_BM25_M_UNREAD)
+				{
+					term->m = lion_poscursor_next(index, term->cur, wstart);
+					term->mstate = (term->m != NULL) ?
+						LION_BM25_M_AT : LION_BM25_M_END;
+				}
+				if (term->mstate == LION_BM25_M_AT && term->m->code < code)
+					code = term->m->code;
+			}
+			if (code == PG_UINT64_MAX || code > wend)
 				break;
-			if (term->m != NULL && term->m->code < code)
-				term->m = lion_poscursor_next(index, term->cur, code);
-			if (term->m != NULL && term->m->code == code)
-				score += lion_bm25_tf_score(term->idf,
-											(double) Max(term->m->npos, 1),
-											q->k1, norm);
+
+			m = lion_poscursor_next(index, lencur, code);
+			norm = lion_bm25_norm(q, (m != NULL && m->code == code) ?
+								  lion_bm25_length(m) : q->avgdl);
+
+			/* the essential lexemes, then the rest from the one that can add most */
+			for (i = nterms - 1; i >= nlow; i--)
+			{
+				LionBm25Term *term = &terms[wo[i]];
+
+				part[wo[i]] = 0;
+				if (term->mstate == LION_BM25_M_AT && term->m->code == code)
+				{
+					part[wo[i]] = lion_bm25_tf_score(term->idf,
+													 (double) Max(term->m->npos, 1),
+													 q->k1, norm);
+					sum += part[wo[i]];
+					term->m = lion_poscursor_next(index, term->cur, code + 1);
+					term->mstate = (term->m != NULL) ?
+						LION_BM25_M_AT : LION_BM25_M_END;
+				}
+			}
+			for (i = nlow - 1; i >= 0; i--)
+			{
+				LionBm25Term *term = &terms[wo[i]];
+
+				if (nbest == L && lion_bm25_cannot(sum + below[i + 1],
+												   best[0].score))
+				{
+					whole = false;
+					break;
+				}
+				part[wo[i]] = 0;
+				if (term->wmax == 0)
+					continue;	/* no member in the window */
+				if (term->mstate == LION_BM25_M_UNREAD ||
+					(term->mstate == LION_BM25_M_AT && term->m->code < code))
+				{
+					term->m = lion_poscursor_next(index, term->cur, code);
+					term->mstate = (term->m != NULL) ?
+						LION_BM25_M_AT : LION_BM25_M_END;
+				}
+				if (term->mstate == LION_BM25_M_AT && term->m->code == code)
+				{
+					part[wo[i]] = lion_bm25_tf_score(term->idf,
+													 (double) Max(term->m->npos, 1),
+													 q->k1, norm);
+					sum += part[wo[i]];
+				}
+			}
+			if (whole)
+			{
+				/* lion_bm25_score_row()'s sum: highest idf first */
+				for (t = nterms - 1; t >= 0; t--)
+					score += part[t];
+				c.code = code;
+				c.score = score;
+				if ((nbest < L || score > best[0].score) &&
+					(after == NULL || lion_bm25_better(after, &c)))
+				{
+					lion_bm25_heap_add(best, &nbest, L, &c);
+					while (nbest == L && nlow < nterms &&
+						   lion_bm25_cannot(below[nlow + 1], best[0].score))
+						nlow++;
+				}
+			}
+			if ((++nscored & 0xfff) == 0)
+				CHECK_FOR_INTERRUPTS();
 		}
-		c.code = code;
-		c.score = score;
-		if (t < 0 && (nbest < L || score > best[0].score) &&
-			(after == NULL || lion_bm25_better(after, &c)))
-		{
-			lion_bm25_heap_add(best, &nbest, L, &c);
-			while (nbest == L && nlow < nterms &&
-				   below[nlow + 1] <= best[0].score)
-				nlow++;
-		}
-		if ((++nscored & 0xfff) == 0)
-			CHECK_FOR_INTERRUPTS();
+
+		if (wend == PG_UINT64_MAX)
+			break;
+		wstart = wend + 1;
+		CHECK_FOR_INTERRUPTS();
 	}
 	lion_poscursor_close(lencur);
 	for (t = 0; t < nterms; t++)
 		lion_poscursor_close(terms[t].cur);
 	pfree(terms);
+	pfree(wo);
 	pfree(below);
+	pfree(part);
 	return nbest;
 }
 

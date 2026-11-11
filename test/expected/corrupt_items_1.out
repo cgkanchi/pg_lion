@@ -330,7 +330,7 @@ SELECT lion_di_try($$SELECT count(*) FROM lion_di_s WHERE d @@ 'k007'$$);
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_s_i')$$);
 DROP TABLE lion_di_s;
 -- ---------- 10. an index of another format version ----------
--- An index with its meta page's version (at byte 28) made 0, 2, 14 and 15,
+-- An index with its meta page's version (at byte 28) made 0, 1, 14 and 15,
 -- versions this build does not write: an index of another format may hold
 -- what this build would read wrongly, so lion_index_verify() reports it and
 -- a reader refuses it, asking for a REINDEX - which makes it whole again.
@@ -352,7 +352,7 @@ SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(0));
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
 SELECT lion_di_hint($$SELECT lion_index_count('lion_di_old_i', 1)$$);
 SELECT lion_di_evict('lion_di_old_i');
-SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(2));
+SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(1));
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
 SELECT lion_di_hint($$SELECT lion_index_count('lion_di_old_i', 1)$$);
 SELECT lion_di_evict('lion_di_old_i');
@@ -373,7 +373,7 @@ SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
 -- that state there (lion_meta_check_version()).
 SELECT lion_index_count('lion_di_old_i', 1) > 0 AS warm;
 SELECT lion_di_evict('lion_di_old_i');
-SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(2));
+SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(1));
 SELECT lion_di_hint($$SELECT ntids FROM lion_index_stats('lion_di_old_i')$$);
 VACUUM lion_di;
 -- To the planner such an index is not there (DESIGN.md §21, "An index of

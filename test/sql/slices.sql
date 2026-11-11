@@ -377,7 +377,7 @@ END $$;
 CREATE TABLE slc_f (k int);
 INSERT INTO slc_f SELECT generate_series(1, 100);
 CREATE INDEX slc_f_k ON slc_f USING lion (k) WITH (slices = on);
-SELECT slc_poke('slc_f_k', 28, 2);
+SELECT slc_poke('slc_f_k', 28, 1);
 SELECT slc_err($$SELECT lion_index_verify('slc_f_k')$$);
 DROP TABLE slc_f;
 
