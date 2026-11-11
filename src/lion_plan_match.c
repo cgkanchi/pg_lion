@@ -17,6 +17,7 @@
 #include "catalog/pg_type.h"
 #include "mb/pg_wchar.h"
 #include "nodes/miscnodes.h"
+#include "regex/regex.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
@@ -2695,16 +2696,15 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
  * <> 'x' AND 12 / z > 1` where only kind 'x' has a z of 0 - and the most
  * common values the cost model folds it on, before any row is read.  So
  * every function it calls is leakproof, which promises as much, or one of
- * the few that can fail only on their constant arguments, which a sequential
- * scan fails on too: lower(), upper(), LIKE, ILIKE and the regular
- * expressions of the column against a constant or a parameter, a division
- * of it by a constant other than 0 and -1 (lion_keytest_fn_safe()).
+ * the few that fail on nothing or only on their other arguments, which are
+ * then constants checked here: lower(), upper(), LIKE, ILIKE and the regular
+ * expressions of the column against a constant pattern, a division of it by
+ * a constant other than 0 and -1 (lion_keytest_fn_safe()).  A pattern known
+ * only at run time - a parameter's, an outer row's - may fail on some keys
+ * or on all, and is declined.
  *
- * Even those fail on any key where a parameter does (`c LIKE $1` with a
- * pattern ending in its escape character), and a sequential scan of a table
- * whose rows are all deleted would not.  So a key only deleted or updated
- * rows still hold is not tested at all: the walk asks whether a row the
- * snapshot sees holds it first.
+ * Nor is a key that only deleted or updated rows still hold tested at all:
+ * the walk asks whether a row the snapshot sees holds it first.
  *
  * The leaf is an ARRAY clause on the column, under the type's own equality,
  * whose value is the clause itself (LionLeafInfo.keytest).  Its cost clause
@@ -2763,8 +2763,14 @@ lion_keytest_costclause(PlannerInfo *root, Var *var, Node *clause, Oid eqop,
 	int			nkept = 0;
 	int			i;
 
+	/*
+	 * The clause is folded on the column's most common values only where the
+	 * user may read every row of the column, as core's estimates ask before
+	 * they hand a function that is not leakproof a value of the statistics
+	 * (statistic_proc_security_check())
+	 */
 	examine_variable(root, (Node *) var, 0, &vardata);
-	if (!HeapTupleIsValid(vardata.statsTuple))
+	if (!HeapTupleIsValid(vardata.statsTuple) || !vardata.acl_ok)
 	{
 		ReleaseVariableStats(vardata);
 		return NULL;
@@ -2853,12 +2859,13 @@ lion_keytest_costclause(PlannerInfo *root, Var *var, Node *clause, Oid eqop,
  *	- a division by a constant other than 0 and -1, the one divisor that
  *	  overflows (INT_MIN / -1), and a remainder by one other than 0;
  *	- LIKE, ILIKE and the regular expressions of the column against a
- *	  pattern, under a deterministic collation (the others refuse ILIKE and
- *	  regular expressions, and LIKE before PostgreSQL 18), where a constant
- *	  LIKE pattern does not end in its escape character.  A regular
- *	  expression that does not compile fails at plan time already, where core
- *	  estimates the clause; a parameter's pattern fails on every row the
- *	  clause is evaluated on.
+ *	  constant pattern that cannot fail, under a deterministic collation (the
+ *	  others refuse ILIKE and regular expressions, and LIKE before PostgreSQL
+ *	  18): a LIKE pattern that does not end in its escape character, a
+ *	  regular expression that compiles.  Not a pattern known only at run
+ *	  time, which may be either: `c LIKE $1` with 'a\' fails on a key 'ab'
+ *	  and not on 'ba', which a sequential scan may never test it on, and
+ *	  `CASE WHEN c = 'a' THEN c ~ '(' END` fails where c is 'a' alone.
  */
 static bool
 lion_keytest_divisor_ok(Oid funcid, List *args, bool division)
@@ -2888,6 +2895,7 @@ lion_keytest_divisor_ok(Oid funcid, List *args, bool division)
 	return v != 0 && !(division && v == -1);
 }
 
+/* a LIKE or ILIKE pattern that does not end in its escape character */
 static bool
 lion_keytest_like_text_ok(Datum d)
 {
@@ -2904,9 +2912,44 @@ lion_keytest_like_text_ok(Datum d)
 	return n % 2 == 0;
 }
 
-/* the pattern, or under `LIKE ANY (array)` every one of the array's */
+/*
+ * ... a regular expression that compiles, under the flags and collation the
+ * operator compiles it with (textregexeq(), texticregexeq()): pg_regcomp()
+ * returns what RE_compile_and_cache() would raise, and allocates in a
+ * context of its own here, let go of whatever it returns.
+ */
 static bool
-lion_keytest_like_pattern_ok(Node *pattern, bool array)
+lion_keytest_regex_text_ok(Datum d, int cflags, Oid collation)
+{
+	text	   *t = DatumGetTextPP(d);
+	int			len = VARSIZE_ANY_EXHDR(t);
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	pg_wchar   *w;
+	int			wlen;
+	regex_t		re;
+	int			rc;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "lion key test regex",
+								ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+	w = (pg_wchar *) palloc((len + 1) * sizeof(pg_wchar));
+	wlen = pg_mb2wchar_with_len(VARDATA_ANY(t), w, len);
+	rc = pg_regcomp(&re, w, wlen, cflags, collation);
+	if (rc == REG_OKAY)
+		pg_regfree(&re);
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
+	return rc == REG_OKAY;
+}
+
+/*
+ * The pattern - or under `op ANY (array)` every one of the array's - is a
+ * constant that cannot fail: LIKE's, or a regular expression's under cflags.
+ */
+static bool
+lion_keytest_pattern_ok(Node *pattern, bool array, bool like, int cflags,
+						Oid collation)
 {
 	Const	   *c;
 	ArrayType  *arr;
@@ -2919,12 +2962,13 @@ lion_keytest_like_pattern_ok(Node *pattern, bool array)
 	int			i;
 
 	if (!IsA(pattern, Const))
-		return !array;
+		return false;
 	c = (Const *) pattern;
 	if (c->constisnull)
 		return true;
 	if (!array)
-		return lion_keytest_like_text_ok(c->constvalue);
+		return like ? lion_keytest_like_text_ok(c->constvalue) :
+			lion_keytest_regex_text_ok(c->constvalue, cflags, collation);
 
 	arr = DatumGetArrayTypeP(c->constvalue);
 	get_typlenbyvalalign(ARR_ELEMTYPE(arr), &elmlen, &elmbyval, &elmalign);
@@ -2932,7 +2976,10 @@ lion_keytest_like_pattern_ok(Node *pattern, bool array)
 					  &elems, &nulls, &nelems);
 	for (i = 0; i < nelems; i++)
 	{
-		if (!nulls[i] && !lion_keytest_like_text_ok(elems[i]))
+		if (nulls[i])
+			continue;
+		if (like ? !lion_keytest_like_text_ok(elems[i]) :
+			!lion_keytest_regex_text_ok(elems[i], cflags, collation))
 			return false;
 	}
 	return true;
@@ -2944,6 +2991,7 @@ lion_keytest_fn_safe(Oid funcid, List *args, Oid inputcollid, bool array)
 	ListCell   *lc;
 	bool		pattern = false;
 	bool		like = false;
+	int			cflags = 0;
 
 	if (!OidIsValid(funcid))
 		return false;
@@ -3010,9 +3058,13 @@ lion_keytest_fn_safe(Oid funcid, List *args, Oid inputcollid, bool array)
 			break;
 		case F_TEXTREGEXEQ:
 		case F_TEXTREGEXNE:
+			pattern = true;
+			cflags = REG_ADVANCED;
+			break;
 		case F_TEXTICREGEXEQ:
 		case F_TEXTICREGEXNE:
 			pattern = true;
+			cflags = REG_ADVANCED | REG_ICASE;
 			break;
 		default:
 			return false;
@@ -3028,11 +3080,11 @@ lion_keytest_fn_safe(Oid funcid, List *args, Oid inputcollid, bool array)
 	{
 		if (list_length(args) != 2)
 			return false;
-		if (OidIsValid(inputcollid) &&
+		if (!OidIsValid(inputcollid) ||
 			!get_collation_isdeterministic(inputcollid))
 			return false;
-		if (like && !lion_keytest_like_pattern_ok((Node *) lsecond(args),
-												   array))
+		if (!lion_keytest_pattern_ok((Node *) lsecond(args), array, like,
+									 cflags, inputcollid))
 			return false;
 	}
 	return true;
@@ -3156,6 +3208,13 @@ lion_keytest_table_rows(PlannerInfo *root, RelOptInfo *rel)
  * WHERE leaves of its rows (which estimate_num_groups() would scale them
  * by); *isdefault where the column has no statistics and this is core's
  * guess.
+ *
+ * get_variable_numdistinct() scales a relative estimate - a column whose keys
+ * grow with its rows, a unique one - and the guess for a table of fewer rows
+ * than DEFAULT_NUM_DISTINCT by rel->tuples, which of an inherited table
+ * before PostgreSQL 18 is the rows the WHERE leaves of it
+ * (lion_keytest_table_rows()).  Those are made of its members' rows here, as
+ * 18 makes them.
  */
 double
 lion_keytest_keys(PlannerInfo *root, Var *var, bool *isdefault)
@@ -3165,6 +3224,40 @@ lion_keytest_keys(PlannerInfo *root, Var *var, bool *isdefault)
 
 	examine_variable(root, (Node *) var, 0, &vardata);
 	nd = get_variable_numdistinct(&vardata, isdefault);
+#if PG_VERSION_NUM < 180000
+	if (!*isdefault && vardata.rel != NULL && vardata.rel->tuples > 0.0)
+	{
+		double		rows = lion_keytest_table_rows(root, vardata.rel);
+		double		stadistinct = 0.0;
+		double		stanullfrac = 0.0;
+
+		if (HeapTupleIsValid(vardata.statsTuple))
+		{
+			Form_pg_statistic stats;
+
+			stats = (Form_pg_statistic) GETSTRUCT(vardata.statsTuple);
+			stadistinct = stats->stadistinct;
+			stanullfrac = stats->stanullfrac;
+		}
+		else if (vardata.vartype == BOOLOID)
+			stadistinct = 2.0;
+		if (vardata.isunique)
+			stadistinct = -1.0 * (1.0 - stanullfrac);
+
+		if (rows > vardata.rel->tuples && stadistinct < 0.0)
+			nd = clamp_row_est(-stadistinct * rows);
+		else if (rows > vardata.rel->tuples && stadistinct == 0.0)
+		{
+			if (rows < DEFAULT_NUM_DISTINCT)
+				nd = clamp_row_est(rows);
+			else
+			{
+				nd = DEFAULT_NUM_DISTINCT;
+				*isdefault = true;
+			}
+		}
+	}
+#endif
 	ReleaseVariableStats(vardata);
 	return Max(nd, 1.0);
 }

@@ -4310,6 +4310,9 @@ typedef struct LionDriveInfo
  * sought there too - what every participant pays whole (whole) - the WHERE's
  * lookups, and the ranges taken as sources it collects - and the pages the
  * count reads (pages), which decide its workers.
+ *
+ * Both make the tests of each key (§10, "A test of each key") whole in every
+ * participant, before its first range (keys, in whole too).
  */
 typedef struct LionRangeCost
 {
@@ -4317,6 +4320,7 @@ typedef struct LionRangeCost
 	Cost		perrange;
 	Cost		countrange;
 	Cost		whole;
+	Cost		keys;
 	double		pages;
 	double		reads;			/* every page the count reads: its directory
 								 * leaves, posting pages and heap recheck, for

@@ -203,6 +203,10 @@ SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE coalesce(s, ''none'') = ''non
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE k <> 0 AND 100 / k > 10');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE k / -1 = -3');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE ''c12'' LIKE c');
+-- ... a regular expression that does not compile, which fails where c is
+-- 'c1' alone: a sequential scan that tests k first never evaluates it, nor
+-- may the planner fold it on the most common values
+SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE CASE WHEN c = ''c1'' THEN c ~ ''('' ELSE false END AND k = 99');
 -- not immutable
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE (''c1'' || to_char(now(), ''""''))');
 -- numeric: 1.0 and 1.00 are one entry, and print differently; char(n),
@@ -227,8 +231,12 @@ SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE c LIKE ''%1%''');
 SELECT lion_kt('SELECT count(*) FROM lion_kt WHERE upper(s) = ''S1''');
 SELECT lion_kt('SELECT s, count(*) FROM lion_kt WHERE c ~ ''^c1.$'' GROUP BY 1');
 -- ---- 6. parameters, and a rescan per outer row ---------------------------
-SELECT lion_kt_prep('SELECT count(*) FROM lion_kt WHERE c LIKE $1', '''c1%''');
 SELECT lion_kt_prep('SELECT count(*) FROM lion_kt WHERE lower(s) = $1 AND k < $2', '''s0'', 12');
+SELECT lion_kt('SELECT x, s.* FROM (VALUES (''c1''), (''c2''), (''zz'')) v(x), LATERAL (SELECT count(*) FROM lion_kt WHERE lower(c) = v.x) s');
+-- a pattern known only at run time is not tested: it may fail on some keys
+-- (c LIKE 'c1\' on 'c10', not on 'c2'), or on every one
+SELECT lion_kt_prep('SELECT count(*) FROM lion_kt WHERE c LIKE $1', '''c1%''');
+SELECT lion_kt_prep('SELECT count(*) FROM lion_kt WHERE k > $2 AND c LIKE $1', '''c1\'', 99');
 SELECT lion_kt_prep('SELECT k / 5, count(*) FROM lion_kt WHERE c ~ $1 GROUP BY 1', '''^c[13]''');
 SELECT lion_kt('SELECT x, s.* FROM (VALUES (''c1''), (''c2''), (''zz'')) v(x), LATERAL (SELECT count(*) FROM lion_kt WHERE c LIKE v.x || ''%'') s');
 -- ---- 7. a partitioned table ---------------------------------------------
@@ -242,6 +250,15 @@ VACUUM (FREEZE, ANALYZE) lion_ktp;
 SELECT lion_kt('SELECT count(*) FROM lion_ktp WHERE c LIKE ''%1%''');
 SELECT lion_kt('SELECT s, count(*) FROM lion_ktp WHERE c ILIKE ''C1%'' GROUP BY 1');
 SELECT lion_kt('SELECT count(*) FROM lion_ktp WHERE lower(s) = ''s1'' AND c ~ ''^c1''');
+-- a column of many keys: before PostgreSQL 18 the planner scales them by the
+-- rows the WHERE leaves of the members, and here by the members' own
+CREATE TABLE lion_ktu (id int NOT NULL, u text NOT NULL) PARTITION BY RANGE (id);
+CREATE TABLE lion_ktu1 PARTITION OF lion_ktu FOR VALUES FROM (0) TO (2000);
+CREATE TABLE lion_ktu2 PARTITION OF lion_ktu FOR VALUES FROM (2000) TO (4000);
+INSERT INTO lion_ktu SELECT i, 'u' || i FROM generate_series(0, 3999) i;
+CREATE INDEX ON lion_ktu USING lion (u);
+VACUUM (FREEZE, ANALYZE) lion_ktu;
+SELECT lion_kt('SELECT count(*) FROM lion_ktu WHERE lower(u) = ''u7''');
 -- a partition whose bounds imply the test leaves it out, and walks nothing:
 -- the one of s1 has no index on s
 CREATE TABLE lion_ktl (id int NOT NULL, s text, c text) PARTITION BY LIST (s);
@@ -301,5 +318,5 @@ RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET pg_lion.enable_plain_scan;
 RESET pg_lion.enable_ordered_scan;
-DROP TABLE lion_kt, lion_ktp, lion_ktl;
+DROP TABLE lion_kt, lion_ktp, lion_ktl, lion_ktu;
 DROP FUNCTION lion_kt(text), lion_kt_prep(text, text), lion_kt_explain(text);

@@ -4039,26 +4039,33 @@ table.
 
 - it reads one user column of the table and nothing else of it - no system column, no expression
   column (§41) - and is immutable, with no subplan: a key's answer is every row's of that key,
-  however often and wherever it is evaluated. Parameters are allowed, and evaluated with it;
+  however often and wherever it is evaluated. Parameters are allowed as values (`lower(s) = $1`),
+  and evaluated with it, but not as patterns (below);
 - the index holds the rows' own values (`lion_index_can_emit_value()`, the value-representation
   rule above, checked where the index is matched): numeric's 1.0 and 1.00 are one entry, and
   `n::text = '1.00'` is true of one of them only;
 - it is NULL or false where the column is NULL, proved by folding it with a NULL in the column's
   place: the NULL entry, which the list never holds, holds no row it selects;
-- it can raise no error on any value of the column (`lion_keytest_cannot_fail()`): every function
-  it calls is leakproof, or one that fails only on its other, constant arguments, which are checked
-  - text's case mapping, lengths, trims, `left()`, `right()`, two-argument `substr()` and `||`;
-  LIKE, ILIKE and the regular expressions of the column against a pattern under a deterministic
-  collation, a constant LIKE pattern not ending in its escape character; a division by a constant
-  other than 0 and -1 (`INT_MIN / -1` overflows), a remainder by one other than 0; a value's text.
-  The walk tests keys a sequential scan may never evaluate the clause on: one whose every row
-  another clause rejects, which the scan tests first because it orders a row's clauses by their
-  cost, so that `z <> 0 AND 12 / z > 1` raises nothing there. A clause that cannot fail does not
-  depend on that order, nor does the cost model's fold of it on the most common values (below),
-  which runs before any row is read;
+- it can raise no error on any value of the column (`lion_keytest_cannot_fail()`): every function it
+  calls is leakproof, or one that fails on nothing or only on its other, constant arguments, which
+  are checked - text's case mapping, lengths, trims, `left()`, `right()`, two-argument `substr()`
+  and `||`; LIKE, ILIKE and the regular expressions of the column against a constant pattern under a
+  deterministic collation, a LIKE pattern not ending in its escape character, a regular expression
+  that compiles (`pg_regcomp()`, which returns the error `RE_compile_and_cache()` raises); a
+  division by a constant other than 0 and -1 (`INT_MIN / -1` overflows), a remainder by one other
+  than 0; a value's text. The walk tests keys a sequential scan may never evaluate the clause on:
+  one whose every row another clause rejects, which the scan tests first because it orders a row's
+  clauses by their cost, so that `z <> 0 AND 12 / z > 1` raises nothing there. A clause that cannot
+  fail does not depend on that order, nor does the cost model's fold of it on the most common values
+  (below), which runs before any row is read, and may meet a value no row holds any more. So a
+  pattern known only at run time - a parameter's, an outer row's - is declined: it may fail on some
+  keys and not on others (`c LIKE $1` with `'a\'` fails on `'ab'`, not on `'ba'`), or on every one;
 - the column has few keys by its statistics: no more than a hundredth of the table's rows
-  (`LION_KEYTEST_MAX_KEY_SHARE`). The list is held whole, as a parameter's of any length is, and
-  every key is tested.
+  (`LION_KEYTEST_MAX_KEY_SHARE`), a partitioned table's being its members' rows. Before PostgreSQL
+  18 the planner gives a partitioned table the rows its WHERE leaves of them instead, and scales a
+  column's keys by those where its statistics are relative to the rows, so
+  `lion_keytest_table_rows()` and `lion_keytest_keys()` make both of the members' rows, as 18 does.
+  The list is held whole, as a parameter's of any length is, and every key is tested.
 
 An OR of the one column is one test, taken whole (`upper(c) = 'C1' OR c = 'c5'`); an OR across
 columns is not. A LIKE prefix is the range it spells ("Other spellings of answered clauses", above)
@@ -4075,11 +4082,9 @@ test, it is made once more with the clause left to what else would take it - res
 ordinary plan - and add_path() keeps the cheaper: a few rows the other clauses select are fetched
 for less than every key is tested, and a shape that takes no test may take a residual clause.
 
-**A key no visible row holds** is not tested. The clause cannot fail on the column's value, but it
-fails on any key where its constant does (`c LIKE $1` with a pattern ending in its escape
-character), where a sequential scan over rows that are all deleted never evaluates it. So the walk
-first asks whether a row the snapshot sees holds the key - the existence test of a count(DISTINCT)
-walk (§26), against the key's set alone - and releases the set before the clause runs.
+**A key no visible row holds** is not tested either: the walk first asks whether a row the snapshot
+sees holds the key (the existence test of a count(DISTINCT) walk, §26, against the key's set alone)
+and releases the set before the clause runs. So the keys tested are those a sequential scan sees.
 
 **How it is carried.** The leaf is an ARRAY clause on the column under the type's own equality, its
 value the clause itself, flagged `LION_CLAUSE_KEYTEST` in CLAUSEKINDS (shape 35).
@@ -4094,10 +4099,13 @@ items are tested: a partition whose bounds imply the clause (§16) leaves it out
 
 **The price** (`lion_count_path_keytest_price()`): per key of the column, by its statistics, in each
 relation counted, the entry's read (`LION_RANGE_ENTRY_COST`), the existence test
-(`LION_DISTINCT_TEST_COST`) and the clause's evaluation, all at startup. The rows it selects are
-priced as the IN list of the most common values that pass it, folded on each at plan time
-(`lion_keytest_costclause()`), where those hold all but a hundredth of the column's non-NULL rows,
-and by core's estimate of the clause otherwise.
+(`LION_DISTINCT_TEST_COST`) and the clause's evaluation, all at startup, and whole in each
+participant of a parallel count or GROUP BY, which each make the list (`LionRangeCost.keys`). The
+rows it selects are priced as the IN list of the most common values that pass it, folded on each at
+plan time (`lion_keytest_costclause()`), where those hold all but a hundredth of the column's
+non-NULL rows and the user may read every row of the column (`acl_ok`, as core's estimates ask
+before a function that is not leakproof sees a value of the statistics), and by core's estimate of
+the clause otherwise.
 
 Measured on 2M rows (PostgreSQL 18.7 release build, warm, `status` of 5 values, `country` of 50,
 `kind` of 20), against the plan with `pg_lion.enable_key_tests` off and a sequential scan: `count(*)
@@ -4109,7 +4117,7 @@ EXPLAIN prints the clause as itself, `t_c ((c ~~* 'C1%'::text))`, and ANALYZE co
 and `Keys Passed` over every relation, run and participant. `pg_lion.enable_key_tests` turns it
 off. `test/sql/where_keytest.sql` checks the shapes against the sequential plan, with a key only
 deleted rows hold, updated rows, partitions, generic plans, a LATERAL rescan and the clauses
-declined.
+declined, run-time patterns among them.
 
 ### Filtered counts, residual clauses and complements beside the other shapes
 

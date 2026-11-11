@@ -2020,9 +2020,9 @@ lion_ingroup_item(LionCountScanState *st)
  * no row of - lion_keytest_leaf()).  An entry is tested only when a row the
  * snapshot sees holds it: the existence test of a count(DISTINCT) walk
  * (§26), against the entry's set alone, under its pin - so a key only
- * deleted rows hold is never handed to the clause, which might fail on it
- * where a sequential scan would never evaluate it.  The set is released
- * before the clause runs, which may take any time.  The key goes into the
+ * deleted rows hold is never handed to the clause, and the keys tested are
+ * those a sequential scan sees.  The set is released before the clause runs,
+ * which may take any time.  The key goes into the
  * one column of keyslot the clause reads, and the clause is evaluated as a
  * qual, in keyecxt, whose per-tuple memory holds the key and is reset for
  * the next.

@@ -32,10 +32,11 @@
  *
  * COST, one participant's: its share of the serial walk (`serialrun`, the
  * serial node's price before its HAVING) - the collection and the groups'
- * containers divide by key, the pages each range reads being its own - plus
- * what each of its ranges pays again (rc->perrange: the entry walk, each
- * group's set set up and sought to the range, each WHERE source sought
- * there), plus a cpu_tuple_cost a partial row.  The rows are a group's per
+ * containers divide by key, the pages each range reads being its own - but
+ * for the tests of each key, which it makes whole (rc->keys), plus what each
+ * of its ranges pays again (rc->perrange: the entry walk, each group's set
+ * set up and sought to the range, each WHERE source sought there), plus a
+ * cpu_tuple_cost a partial row.  The rows are a group's per
  * range it has rows in, at most the WHERE's rows.  The Gather prices its
  * rows and set-up, core's Finalize Agg its own work.
  */
@@ -88,8 +89,9 @@ lion_add_parallel_group_path(PlannerInfo *root, RelOptInfo *rel,
 	cpath->path.pathkeys = NIL;
 	cpath->path.rows = rows;
 	cpath->path.startup_cost = 0;
-	cpath->path.total_cost = serialrun / divisor +
-		((double) nranges / divisor) * rc->perrange + rows * cpu_tuple_cost;
+	cpath->path.total_cost = Max(serialrun - rc->keys, 0.0) / divisor +
+		rc->keys + ((double) nranges / divisor) * rc->perrange +
+		rows * cpu_tuple_cost;
 #if PG_VERSION_NUM >= 180000
 	cpath->path.disabled_nodes = 0;
 #endif
@@ -166,8 +168,8 @@ lion_anti_parallel_child(RelOptInfo *innerrel)
  *
  * COST, one participant's: its share of the serial count (`serialrun`, the
  * serial node's price before its HAVING) but for what every participant pays
- * whole (rc->whole: the lookups that locate the WHERE, and the ranges taken
- * as sources it collects), that whole, and what each range it counts pays
+ * whole (rc->whole: the lookups that locate the WHERE, the tests of each
+ * key, and the ranges taken as sources it collects), that whole, and what each range it counts pays
  * again (rc->countrange, every run's: each set sought to the range, a walk's
  * entries counted again), plus a cpu_tuple_cost for its one row.  The Gather
  * prices its rows and set-up, core's Finalize Agg its own work.
@@ -6060,7 +6062,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	/*
 	 * The tests of each key (DESIGN.md §10, "A test of each key"), made
 	 * before the first row: every key of the column walked, asked for a
-	 * visible row and tested, in each relation counted.
+	 * visible row and tested, in each relation counted - and in each
+	 * participant of a parallel count or GROUP BY, whole.
 	 */
 	if (cx->nkeytest > 0)
 	{
@@ -6068,6 +6071,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 
 		cpath->path.startup_cost += keys;
 		cpath->path.total_cost += keys;
+		rangeprice.whole += keys;
+		rangeprice.keys = keys;
 	}
 
 	/*
@@ -6107,6 +6112,7 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	rangeprice.perrange = lion_units_price(&units, rangeprice.perrange);
 	rangeprice.countrange = lion_units_price(&units, rangeprice.countrange);
 	rangeprice.whole = lion_units_price(&units, rangeprice.whole);
+	rangeprice.keys = lion_units_price(&units, rangeprice.keys);
 	serialrun = cpath->path.total_cost;
 
 	/* the anti join over a small inner side (DESIGN.md §27) */

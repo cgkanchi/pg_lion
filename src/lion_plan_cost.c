@@ -5698,6 +5698,7 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 		rc->perrange = 0;
 		rc->countrange = 0;
 		rc->whole = 0;
+		rc->keys = 0;
 		rc->pages = 0;
 		rc->reads = 0;
 	}
