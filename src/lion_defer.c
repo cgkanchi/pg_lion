@@ -46,8 +46,8 @@
  *	  under this row's key;
  *	- for the first row of a statement, so that a one-row statement costs
  *	  what it did;
- *	- for a column with stored positions, summaries or bit slices, whose
- *	  inserts write more than the key's entry;
+ *	- for a column with stored positions or summaries, whose inserts write
+ *	  more than the key's entry and its slices;
  *	- in the rest of the transaction that loads the library, when it is not
  *	  preloaded (lion_defer_init()).
  *
