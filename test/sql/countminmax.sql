@@ -205,5 +205,5 @@ GRANT EXECUTE ON FUNCTION max(int4) TO PUBLIC;
 REVOKE ALL ON cm, cmrls FROM lion_cm_user;
 DROP ROLE lion_cm_user;
 
-DROP TABLE cm, cmpt, cmrls;
+DROP TABLE cm, cmpt, cmrls, cms;
 DROP FUNCTION cm_q(text), cm_plan(text), cm_loops(text);

@@ -4023,14 +4023,18 @@ scrollable cursor's plan has a Material above it.
 
 **Exact.** The count is the number of rows the LIMIT's scan would have found, under the same
 snapshot (§9, §11). A volatile clause, which core's plan evaluates for as many rows as the LIMIT
-needs and the count for every row, declines.
+needs and the count for every row, declines. So does the count's plan with a residual clause (§10)
+that can raise an error: one that hands a column to a function not marked leakproof, such as
+`100 / w > 20`, whose division by zero may be in a row past the ones the LIMIT reads
+(`lion_residual_ok()` under `lion_try_count_path_leakproof()`). Clauses a posting set answers
+evaluate nothing per row and are unaffected.
 
 `pg_lion.enable_count_rows` turns it off, as `enable_count_pushdown` does. `test/sql/countrows.sql`
 compares each shape with the LIMIT's answer over NULLs and dead and updated rows: LIMIT past the
 count, OFFSET alone and past the count, NULL and subquery LIMIT and OFFSET, FETCH FIRST, a subquery
-that selects columns nobody reads, a constant target read above, the declines, the negative LIMIT
-and OFFSET errors, LIMIT 0 with the count never run, generic plans, rescans, a scrollable cursor and
-a partitioned table. 2M rows, vacuumed, PostgreSQL 18 (release build), against the LIMIT:
+that selects columns nobody reads, a constant target read above, the declines (a residual clause
+that divides by zero past the LIMIT among them), the negative LIMIT and OFFSET errors, LIMIT 0 with
+the count never run, generic plans, rescans, a scrollable cursor and a partitioned table. 2M rows, vacuumed, PostgreSQL 18 (release build), against the LIMIT:
 `... WHERE status = 'paid' AND country = 'c7' LIMIT 10001` 40 ms to 0.9 ms; with a third filter 34
 ms to 1.0 ms; with `status = 'paid'` alone (400,000 rows) 2.8 ms to 0.7 ms. Most of what is left
 is the Aggregate counting the rows the node returns.

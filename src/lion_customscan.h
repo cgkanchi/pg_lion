@@ -4821,6 +4821,10 @@ extern void lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 								RelOptInfo *output_rel,
 								GroupPathExtraData *extra,
 								const LionFkJoin *fj);
+extern void lion_try_count_path_leakproof(PlannerInfo *root,
+										  RelOptInfo *input_rel,
+										  RelOptInfo *output_rel,
+										  GroupPathExtraData *extra);
 extern void lion_try_distinct_path(PlannerInfo *root, RelOptInfo *input_rel,
 								   RelOptInfo *output_rel);
 extern void lion_try_count_anti_path(PlannerInfo *root, RelOptInfo *input_rel,
@@ -4839,7 +4843,8 @@ extern void lion_try_distinct_agg_path(PlannerInfo *root,
 
 /* lion_window.c */
 extern Path *lion_count_child_path(PlannerInfo *root, RelOptInfo *input_rel,
-								   RelOptInfo *upper_rel, List *aggs);
+								   RelOptInfo *upper_rel, List *aggs,
+								   bool leakproofresid);
 extern void lion_try_window_count_path(PlannerInfo *root,
 									   RelOptInfo *input_rel,
 									   RelOptInfo *window_rel);

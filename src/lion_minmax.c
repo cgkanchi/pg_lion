@@ -425,7 +425,8 @@ lion_try_count_minmax_path(PlannerInfo *root, RelOptInfo *input_rel,
 	if (!w.ok || w.others == NIL)
 		return;
 
-	count = lion_count_child_path(root, input_rel, grouped_rel, w.others);
+	count = lion_count_child_path(root, input_rel, grouped_rel, w.others,
+								  false);
 	if (count == NULL)
 		return;
 	foreach(lc, minmax)

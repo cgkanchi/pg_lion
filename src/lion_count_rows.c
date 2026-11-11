@@ -158,14 +158,17 @@ lion_try_count_rows_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 * Each row the LIMIT takes is the same row, which is only how many there
 	 * are when no column of it reads the relation.  A volatile clause is
 	 * evaluated for as many rows as the LIMIT needs by core's plan, and for
-	 * every row by a count.
+	 * every row by a count; so is a clause the count tests on the heap
+	 * (DESIGN.md §10, "Residual clauses"), which here may only be one that
+	 * raises no error - not `100 / w > 20`, whose division by zero may be in
+	 * a row past the ones the LIMIT reads.
 	 */
 	if (!lion_count_rows_target_fixed(target))
 		return;
 	if (contain_volatile_functions((Node *) input_rel->baserestrictinfo))
 		return;
 
-	count = lion_count_child_path(root, input_rel, final_rel, NIL);
+	count = lion_count_child_path(root, input_rel, final_rel, NIL, true);
 	if (count == NULL)
 		return;
 

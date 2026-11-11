@@ -238,10 +238,13 @@ lion_window_count_agg(void)
  * or NULL when the node does not count the relation.  For a node of whatever
  * stage puts the count beside something else: LionWindowCount here,
  * LionCountRows (lion_count_rows.c) and LionCountMinMax (lion_minmax.c).
+ * With leakproofresid, a clause tested on the heap may only be one that
+ * raises no error (lion_try_count_path_leakproof()): the count reads rows
+ * the competitor, a LIMIT, stops short of.
  */
 Path *
 lion_count_child_path(PlannerInfo *root, RelOptInfo *input_rel,
-					  RelOptInfo *upper_rel, List *aggs)
+					  RelOptInfo *upper_rel, List *aggs, bool leakproofresid)
 {
 	Query	   *parse = root->parse;
 	RelOptInfo *inner;
@@ -297,7 +300,10 @@ lion_count_child_path(PlannerInfo *root, RelOptInfo *input_rel,
 	root->processed_tlist = tlist;
 	PG_TRY();
 	{
-		lion_try_count_path(root, input_rel, inner, &extra, NULL);
+		if (leakproofresid)
+			lion_try_count_path_leakproof(root, input_rel, inner, &extra);
+		else
+			lion_try_count_path(root, input_rel, inner, &extra, NULL);
 	}
 	PG_FINALLY();
 	{
@@ -481,7 +487,7 @@ lion_try_window_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	if (!w.ok || w.fnoids == NIL)
 		return;
 
-	count = lion_count_child_path(root, input_rel, window_rel, NIL);
+	count = lion_count_child_path(root, input_rel, window_rel, NIL, false);
 	if (count == NULL)
 		return;
 

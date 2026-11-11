@@ -98,6 +98,10 @@ SELECT q, cr_q(q) FROM (VALUES
 	('SELECT count(*) FROM (SELECT 1 FROM cr LIMIT 5000) s'),
 	('SELECT count(*), max(s.x) FROM (SELECT 7 AS x FROM cr WHERE a = 3 LIMIT 1000) s'),
 	('SELECT s.x, s.y FROM (SELECT ''k'' AS x, NULL::int AS y FROM cr WHERE a = 3 AND b = 2 LIMIT 1000) s'),
+	-- a clause no posting set answers, tested on the heap, that raises no
+	-- error ...
+	('SELECT count(*) FROM (SELECT 1 FROM cr WHERE a = 3 AND t = ''v3'' LIMIT 1000) s'),
+	-- ... and one that might (int4mod): core's LIMIT
 	('SELECT count(*) FROM (SELECT 1 FROM cr WHERE a = 3 AND id % 3 = 1 LIMIT 1000) s'),
 	-- a window nothing reads is gone from the subquery before it is planned
 	('SELECT count(*) FROM (SELECT 1, count(*) OVER () FROM cr WHERE a = 3 LIMIT 1000) s'),
@@ -113,6 +117,13 @@ SELECT q, cr_q(q) FROM (VALUES
 	('SELECT count(*) FROM (SELECT 1 FROM cr c JOIN cr d ON d.id = c.id + 1 WHERE c.a = 3 LIMIT 1000) s'),
 	('SELECT count(*) FROM (SELECT 1 FROM cr WHERE a = 3 LIMIT 1000 FOR UPDATE) s')
 ) v(q);
+
+-- a clause tested on the heap that raises an error on a row past the ones
+-- the LIMIT reads - id 19995, of a = 3, divides by zero - is left to core's
+-- LIMIT, which stops at the 1000th row and never reaches it
+SELECT cr_plan('SELECT count(*) FROM (SELECT 1 FROM cr WHERE a = 3 AND 100 / (id - 19995) = 0 LIMIT 1000) s');
+SELECT count(*) FROM (SELECT 1 FROM cr WHERE a = 3 AND 100 / (id - 19995) = 0 LIMIT 1000) s;
+SELECT a FROM cr WHERE id = 19995;
 
 -- LIMIT and OFFSET checked as a Limit checks them, before anything is read
 SELECT count(*) FROM (SELECT 1 FROM cr WHERE a = 3 LIMIT -1) s;
