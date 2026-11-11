@@ -35333,15 +35333,19 @@ sorted already, which is checked first), and takes them a bucket's run at a time
 - a row above a full open bucket closes it (`lion_summary_close_last()`), opening the next with
   that row, and the rows after it go on from there.
 
-A run's later holds land on the summary they started on: no bucket boundary appears below the open
-bucket's key, and a bucket that holds the run's first rows is not emptied by VACUUM, so the lookup
-by the run's largest key finds it - closed meanwhile, if another writer filled the open bucket and
-went past it. One that finds anything else leaves the rest of the run to `lion_summary_insert()`,
-a row at a time. The buckets the batch makes are not the ones the same rows would make one at a
-time in TID order: the open bucket's key, raised by the largest key of the rows it takes, is not
-raised past it by a row that came earlier in the table, so keys that arrive in no order fill
-bucket after bucket rather than joining one open bucket raised by its first high key. Each bucket
-still holds just the keys in (the key before it, its own key], which is what a count asks.
+A run's end is found by halving the sorted rows, and a run whose rows are not in TID order is sorted
+with the leaf released, so that the leaf is held for one hold's rows at a time, as for a key. A
+run's later holds, and its first when it was sorted, look its summary up again by the run's largest
+key: no bucket boundary appears below the open bucket's key, and a bucket emptied and deleted before
+the run's first rows went in leaves its keys to the next one, which reaches down over them (§32), so
+the lookup finds the bucket the keys are in - closed meanwhile, if another writer filled the open
+bucket and went past it. One that finds anything else leaves the rest of the run to
+`lion_summary_insert()`, a row at a time. The buckets the batch makes are not the ones the same rows
+would make one at a time in TID order: the open bucket's key, raised by the largest key of the rows
+it takes, is not raised past it by a row that came earlier in the table, so keys that arrive in no
+order fill bucket after bucket rather than joining one open bucket raised by its first high key.
+Each bucket still holds just the keys in (the key before it, its own key], which is what a count
+asks.
 A 50,000-row `INSERT ... SELECT` into a million-row table with summaries took 120 ms row by row
 and takes 95 (no summaries: 70) when the keys are appended, and 280 against 155 (no summaries:
 110) for random keys.

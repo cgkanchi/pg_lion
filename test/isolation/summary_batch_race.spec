@@ -66,6 +66,10 @@ setup
 		bitmap int8;
 		seq int8;
 	BEGIN
+		/* every call from the same settings: a step may call it twice */
+		PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+		PERFORM set_config('enable_indexscan', 'on', true);
+		PERFORM set_config('enable_bitmapscan', 'on', true);
 		PERFORM set_config('enable_seqscan', 'off', true);
 		PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 		SELECT count(*) INTO pushed FROM sbr WHERE t BETWEEN lo AND hi;

@@ -3469,10 +3469,13 @@ lion_insert_summary_cmp(const void *pa, const void *pb, void *arg)
  * one rewrite (lion_insert_inline_rows()), a CHAIN one's up to
  * LION_APPLY_HOLD a hold, a record to a container (lion_insert_chain_rows()),
  * and the summary is looked up again for the next hold.  buf, when valid,
- * holds that summary at off EXCLUSIVE already, for the first hold.  A lookup
- * that lands anywhere but on a summary of the column at or above segkey - its
- * bucket emptied and removed meanwhile, say - leaves the rest to
- * lion_summary_insert(), a row at a time.
+ * holds that summary at off EXCLUSIVE already, for the first hold; rows that
+ * have to be sorted first are sorted with it released, so that a hold of the
+ * leaf stays one hold's rows long, and the first hold looks it up too.  A
+ * lookup lands on the bucket the keys are in even if theirs was emptied and
+ * deleted meanwhile, the next one's reaching down (DESIGN.md §32); one that
+ * lands anywhere but on a summary of the column at or above segkey leaves the
+ * rest to lion_summary_insert(), a row at a time.
  */
 static void
 lion_summary_put_rows(Relation index, Relation heaprel, LionState *state,
@@ -3485,7 +3488,14 @@ lion_summary_put_rows(Relation index, Relation heaprel, LionState *state,
 		if (rows[i - 1].code > rows[i].code)
 			break;
 	if (i < n)
+	{
+		if (BufferIsValid(buf))
+		{
+			UnlockReleaseBuffer(buf);
+			buf = InvalidBuffer;
+		}
 		qsort(rows, n, sizeof(LionInsertRow), lion_insert_code_cmp);
+	}
 
 	i = 0;
 	while (i < n)
@@ -3555,6 +3565,30 @@ lion_summary_put_rows(Relation index, Relation heaprel, LionState *state,
 }
 
 /*
+ * The first of rows[lo .. n), which are sorted by key, whose key is above
+ * key, or n: found by halving, so that a bucket's run costs a few comparisons
+ * under its leaf's lock however many rows it has.
+ */
+static int
+lion_summary_run_end(LionState *state, const LionInsertRow *rows, int lo,
+					 int n, Datum key)
+{
+	int			hi = n;
+
+	while (lo < hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (DatumGetInt32(FunctionCall2Coll(&state->cmpproc, state->collation,
+											rows[mid].key, key)) <= 0)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/*
  * lion_summary_insert() for a batch (DESIGN.md §55, "A column with
  * summaries"): rows[0 .. n) are the summary rows of one column, which the
  * batch writes after the column's keys, so each row is under its key's entry
@@ -3617,13 +3651,8 @@ lion_summary_insert_rows(Relation index, Relation heaprel, LionState *state,
 		if (kind == LION_KIND_SUMMARY)
 		{
 			/* lion_dir_search_first() found its key at or above the row's */
-			Datum		key = lion_entry_key(state, e);
-
-			for (j = i + 1; j < n; j++)
-				if (DatumGetInt32(FunctionCall2Coll(&state->cmpproc,
-													state->collation,
-													rows[j].key, key)) > 0)
-					break;
+			j = lion_summary_run_end(state, rows, i + 1, n,
+									 lion_entry_key(state, e));
 			lion_summary_put_rows(index, heaprel, state, holdcxt, &rows[i],
 								  j - i, rows[j - 1].key, buf, off);
 			i = j;
@@ -3639,17 +3668,21 @@ lion_summary_insert_rows(Relation index, Relation heaprel, LionState *state,
 			/* SERIALIZABLE (DESIGN.md §9), as lion_summary_insert() checks */
 			lion_writer_check(index, buf, off, true);
 
-			/* the run it takes, its rows counted as they come */
-			for (j = i; j < n; j++, ntids++)
+			/*
+			 * The run it takes: the rows up to its key, then while it holds
+			 * fewer than bucket_tids each key above, with that key's rows.
+			 */
+			j = lion_summary_run_end(state, rows, i, n, top);
+			ntids += j - i;
+			while (j < n && ntids < (uint64) bucket_tids)
 			{
-				if (DatumGetInt32(FunctionCall2Coll(&state->cmpproc,
-													state->collation,
-													rows[j].key, top)) <= 0)
-					continue;
-				if (ntids >= (uint64) bucket_tids)
-					break;
+				int			k;
+
 				top = rows[j].key;
 				raise = j;
+				k = lion_summary_run_end(state, rows, j + 1, n, top);
+				ntids += k - j;
+				j = k;
 			}
 
 			if (j == i)
