@@ -2651,6 +2651,8 @@ extern void lion_meta_record_ndistinct(Page metapage,
 extern void lion_meta_write_ndistinct(Relation index,
 									  const LionMetaNdistinct *nd);
 extern bool lion_read_meta_ndistinct(Relation index, LionMetaNdistinct *nd);
+extern bool lion_read_meta_counts(Relation index, LionMetaNdistinct *nd,
+								  uint32 *inline_limit);
 
 /*
  * The end of an ambulkdelete call (DESIGN.md §37): add one to the meta page's
