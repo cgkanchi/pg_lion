@@ -2497,7 +2497,7 @@ extern int64 lion_container_to_tbm_runs(const LionContainer *c,
  * the same way) while lion_tid_batch_keeps() says so, and emit it with
  * lion_container_to_tbm() once it does not; and end, told how many TIDs the
  * walk emitted, which emits what is left and frees the batch.  What it keeps
- * is bounded by work_mem.
+ * is held to about work_mem.
  */
 typedef struct LionTidBatch LionTidBatch;
 

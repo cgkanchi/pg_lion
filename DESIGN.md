@@ -17302,7 +17302,13 @@ them to the bitmap a heap block at a time:
   writes to the cache line at the array's end. The keys' slots are found through a two-level
   directory indexed by container key, not a hash.
 - What is kept goes to the bitmap when the walk is over, or whenever it outgrows `work_mem`: one
-  `tbm_add_tuples()` a heap block, an array counting-sorted by block first.
+  `tbm_add_tuples()` a heap block, an array counting-sorted by block first. The bound is
+  approximate: it counts the arena blocks handed out, checked after each item, so one item's slots
+  and array can pass it. A sparse item can touch several directory chunks of 1,024 slots (24 KB
+  each); when its new chunks would pass `work_mem`, what is kept is flushed first, and an item that
+  could not fit at all goes to the bitmap at once. The arena maps regions of 1 MB and more and keeps
+  them across flushes; only the pages written to take memory. The bitmap's own memory is the
+  TIDBitmap's, as in any bitmap scan.
 - It is kept in an arena of anonymous memory (`lion_arena.c` without a file), unmapped when the walk
   ends or with the query's memory if it fails, not in palloc's. glibc's malloc gives the top of its
   heap back to the kernel once it is free and larger than twice the largest block malloc has
@@ -17322,7 +17328,9 @@ them to the bitmap a heap block at a time:
   whose rows the walk spreads thinner than that between two flushes - stops the batching, and the
   rest of the walk goes to the bitmap at once.
 
-The TIDs and the bitmap are the same either way; only the order of `tbm_add_tuples()` calls changes.
+A scan returns the same rows either way; only the order of `tbm_add_tuples()` calls changes. A
+bitmap that passes `work_mem` and turns pages lossy does so at a different moment, so other pages
+can end up lossy and a different number of rows is rechecked.
 Each walk's DEBUG1 line says how many TIDs went through the batch and in how many flushes
 (`test/sql/bitmap_heaporder.sql`, which checks every answer against a sequential scan: ranges above
 and below `relpages`, a list, `IS NOT NULL`, a multi-key fallback rechecked, a walk in heap order,
