@@ -391,8 +391,12 @@ SELECT lion_sj('SELECT avg(d.attr) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM li
 -- dimension, which may repeat its rows (fkjoin_anydim.sql)
 SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3) AND EXISTS (SELECT 1 FROM lion_sdn n WHERE n.k = d.pk)');
 SELECT lion_sj('SELECT count(*) FROM lion_sd d JOIN lion_sdn n ON n.k = d.pk WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)');
--- a subquery the planner cannot pull up
+-- a subquery the planner cannot pull up (with the capped count of its rows
+-- off: that is a LionCount in the SubPlan, not the semi join pushed down, and
+-- countrows.sql tests it)
+SET pg_lion.enable_count_rows = off;
 SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3 LIMIT 1 OFFSET 0)');
+RESET pg_lion.enable_count_rows;
 
 -- row-level security: a policy on the dimension is applied by the child plan
 -- and changes the answer as it changes the ordinary plan's; one on the fact

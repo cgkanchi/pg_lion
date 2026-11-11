@@ -6,7 +6,8 @@ Building, testing and finding your way around the source. Section numbers (§) r
 
 Builds against PostgreSQL 16, 17, 18, 19 and master (20devel); the version differences live in
 `src/lion_compat.h`.  It needs a POSIX `mmap()`: LionOrdered's set, past `hash_mem`, lives in a
-temporary file mapped into memory (`src/lion_arena.c`, DESIGN.md §30.4, "Spilling").  CI (`.github/workflows/ci.yml`) builds and tests, on
+temporary file mapped into memory (`src/lion_arena.c`, DESIGN.md §30.4, "Spilling"), and a bitmap
+scan's TIDs gathered by heap block in anonymous memory mapped the same way (§28).  CI (`.github/workflows/ci.yml`) builds and tests, on
 each pull request, 16 to 19 as the PGDG packages and 18 built from source
 with assertions and injection points, and on every one of them
 runs the unit tests (as built, and under ASan and UBSan), the SQL regression files in `test/sql`
@@ -213,6 +214,7 @@ database's files from the OS cache and starts it - before each timed run.
     src/lion_amcost.c       amcostestimate: the cost of plain and bitmap scans
     src/lion_build.c        ambuild via tuplesort (hash, key, tid code); INLINE entries or per-key posting trees
     src/lion_scan.c         amgetbitmap, and amgettuple for plain index scans
+    src/lion_tidbatch.c     a bitmap scan's walk of many keys, its TIDs given to the bitmap by heap block
     src/lion_insert.c       aminsert (serialised on the directory leaf; bitset in-place fast path; a row's
                             bit slices a walk of the leaf a column, their in-place adds several to a record)
     src/lion_vacuum.c       ambulkdelete with cleanup locks on every page, two-pass cancellable protocol
@@ -237,7 +239,8 @@ database's files from the OS cache and starts it - before each timed run.
     src/lion_slice_decode.c a sliced column's aggregates for a batch of groups, decoded key by key
     src/lion_customscan.h   the LionCount custom scan's private header, shared by its planner half:
     src/lion_plan_*.c       create_upper_paths_hook -> CustomPath/CustomScan "LionCount"; set_join_pathlist_hook
-                            -> "LionSemiJoin"/"LionAntiJoin"; index matching, partitions, the cost model
+                            -> "LionSemiJoin"/"LionAntiJoin"; index matching, partitions, the cost model;
+                            lion_plan_lateral.c's planner_hook plans a grouped subquery joined in as LATERAL
     src/lion_exec_*.c       and its executor half: begin, locating the WHERE sets, counting, the FK-side
                             join, the run and parallel DSM, EXPLAIN
     src/lion_costs.[ch]     the cost model's constants as planner settings (pg_lion.*_cost)

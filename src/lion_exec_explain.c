@@ -219,7 +219,15 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 										 st->join != NULL &&
 										 cl == &st->clause[st->join->clause],
 										 false);
-				if (cl->kind == LION_CLAUSE_ARRAY)
+
+				/*
+				 * A test of each key (DESIGN.md §10, "A test of each key")
+				 * prints as the clause it tests, `lower(status) = 'paid'`:
+				 * its keys are the list, which the plan does not have.
+				 */
+				if (cl->keytest)
+					appendStringInfoString(buf, val);
+				else if (cl->kind == LION_CLAUSE_ARRAY)
 					appendStringInfo(buf, "%s %s ANY (%s)", attname, opname,
 									 val);
 				else if (cl->kind == LION_CLAUSE_DISTINCT)
@@ -1606,8 +1614,8 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 
 /*
  * EXPLAIN ANALYZE's counters of a GROUP BY's WHERE sets, batches and key
- * ranges, of the decoded walk, of an IN list's batches and of a
- * count(DISTINCT)'s tests - the leader's and, under a Gather, its workers'
+ * ranges, of the decoded walk, of an IN list's batches, of the tests of each
+ * key and of a count(DISTINCT)'s tests - the leader's and, under a Gather, its workers'
  * (st->worker).
  */
 static void
@@ -1615,6 +1623,7 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 {
 	LionRangedState *rs = st->ranged;
 	const LionScanWorkerSums *w = &st->worker;
+	int			i;
 
 	/*
 	 * The WHERE items of a GROUP BY collected into one set that the groups
@@ -1700,6 +1709,26 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 
 		if (batches > 0)
 			ExplainPropertyInteger("List Batches", NULL, batches, es);
+	}
+
+	/*
+	 * The tests of each key (DESIGN.md §10, "A test of each key"): the keys
+	 * a row the snapshot sees holds that the clauses were evaluated on, once
+	 * per relation and run, and those that passed, the lists the clauses were
+	 * counted as.
+	 */
+	if (st->keyecxt != NULL)
+	{
+		int64		tested = w->keystested;
+		int64		passed = w->keyspassed;
+
+		for (i = 0; i < st->nclause; i++)
+		{
+			tested += st->clause[i].keystested;
+			passed += st->clause[i].keyspassed;
+		}
+		ExplainPropertyInteger("Keys Tested", NULL, tested, es);
+		ExplainPropertyInteger("Keys Passed", NULL, passed, es);
 	}
 
 	/*
