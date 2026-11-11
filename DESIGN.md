@@ -670,7 +670,8 @@ Lock ordering:
 INSERT (`lion_insert.c`: `lioninsert()` calls `lion_insert_one()` once per key column and, for a
 multi-key opclass, once per extracted key; a statement's rows after its first are kept and written
 as a batch by the same steps, a CHAIN entry's up to 256 rows per hold of its leaf and a new or
-INLINE entry's one row per hold, with other writers and VACUUM free to run between holds - §55)
+INLINE entry's as many as its payload holds under the limit, with other writers and VACUUM free to
+run between holds - §55)
 1. Hash the key and build the search key - kind VALUE, or a reserved entry: NULL, or one of the
    key-less entries of §17 (EMPTY, EMPTYDIM, EMPTYINNER, NULLELEMS) (§14, §17). Descend the directory (`lion_dir_find()`) and take the LEAF EXCLUSIVE; a write descent that
    lands on an INCOMPLETE_SPLIT page finishes that split first (§21, the repair rule). The leaf is
@@ -35242,8 +35243,8 @@ lock. Shortening the hold does not help (§5, step 6), and filing the keys on se
 2.2× where batching gave 9× (both measured on throwaway prototypes). So a statement's rows now go in
 as a batch (`lion_defer.c`): after its first row, each row's (key, TID) pairs are kept per index, in
 the backend, and written sorted, a key's rows together: a CHAIN entry's up to 256 per hold of its
-leaf, a new or INLINE entry's one per hold, with other writers and VACUUM free to run between
-holds.
+leaf, a new or INLINE entry's as many as its payload holds under the limit, with other writers and
+VACUUM free to run between holds.
 
 **The batch.** `lioninsert()` hands the pairs of every eligible column to `lion_defer_add()`: the
 key as `lion_key_prepare()` made it, copied, with its bucket hash, or a reserved entry's flag for a
@@ -35258,13 +35259,24 @@ writer's SERIALIZABLE check (§9), as `lion_insert_one()` makes - or none, from 
 writer remembers for the key or the one the key before it ended on (§21, "A leaf already known") -
 and
 
-- a CHAIN entry takes up to `LION_APPLY_HOLD` (256) rows under that one hold, each through
-  `lion_insert_chain()`, which rewrites the entry in place at its size, so its offset stays good;
-- a new entry or an INLINE one takes one row per descent, since either may move the entry; an
-  INLINE entry that spills is a CHAIN one from the next descent on.
+- a CHAIN entry takes up to `LION_APPLY_HOLD` (256) rows under that one hold, and the entry is
+  rewritten in place at its size, so its offset stays good. The rows come in TID order, so each
+  container's are adjacent, and `lion_insert_chain_rows()` puts a container's run in with ONE
+  record: it works out on a copy of the container which members go in in place (the test
+  `lion_container_inplace_check()` makes for one), then writes a `CONTAINER_ADD` for each and the
+  entry's counter once. A member that does not go in in place - the container has to be rewritten,
+  converted or split - and a sparse segment or a container not there yet go through
+  `lion_insert_chain()` one row at a time, as before;
+- a new entry takes as many of its rows as its payload holds under `inline_limit`, built with them
+  in it, in the one record that adds it (`lion_insert_new_entry_rows()`); an INLINE entry the same,
+  in one rewrite (`lion_insert_inline_rows()`), and a row that would take the payload past the
+  limit spills the entry through `lion_insert_inline()`, after which it is a CHAIN one. A new entry
+  of more than one row gets the growth slack an insert's rewrite gives (§4, "Growth slack inside an
+  INLINE payload"), where the leaf has room. Either may move the entry, so each is one hold.
 
 A key of many rows - the case that queued - is a CHAIN entry after its first few hundred, so its
-rows go in 256 to a lock handoff; a key of one row costs what it did, plus the sort.
+rows go in 256 to a lock handoff and a record to a container; a key of one row costs what it did,
+plus the sort.
 
 **When the rows go in.** Nobody else can see them before the transaction commits, so what has to be
 covered is this backend reading the index before they are written, and the commit:
@@ -35344,13 +35356,20 @@ against row by row: ten million values 619 / 617 pages, a thousand values 57 / 6
 449 / 449; the two-value index 8 / 10 pages and the eight indexes 5,887 / 5,916 after 500 random
 statements each.
 
+A record to a container rather than to a row, and a new or INLINE entry's rows in one rewrite
+(2026-11-11, measured against the build before them, the leaf hints of §21 in both): the two-value
+200-row INSERTs 1.43× at one client and 2.2× at four; a 50,000-row INSERT into five million rows
+38% less time on two values and 20% less on 20,000; none on a million values or on statements
+whose keys have a row each.
+
 **Not done.** Columns with positions, summaries and slices are written row by row; batching them
 needs their own posting-set steps sorted and held the same way. A one-row statement gains nothing,
 and many writers inserting one row each still take turns on the leaf (each turn shorter since §21's
-"A leaf already known"). Each CHAIN row is still its
-own WAL record: a batch could put a key's rows for one container into one.
+"A leaf already known").
 
 Tests: `test/sql/insert_batch.sql` (every kind of key in one batch and across `work_mem`, COPY;
+a key's rows into a new, an INLINE and a CHAIN entry, spilling in the middle of the batch, and the
+records 400 rows of one CHAIN key write counted;
 a volatile function's query in the INSERT's own select list, BEFORE and AFTER triggers' queries,
 by the count pushdown first; rows left past their statement written by a query of the table, a
 direct reader and the commit, dropped with an aborted savepoint or PL/pgSQL block, written before
