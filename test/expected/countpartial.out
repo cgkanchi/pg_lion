@@ -63,12 +63,17 @@ SELECT c.relname, c.reltuples::int8 =
 -- dead rows, and rows moved into and out of the predicates, since the VACUUM:
 -- on the first pages, which the visibility map no longer vouches for, and
 -- one beyond them
+-- (row by row: some plans below are near ties that the indexes' page counts
+-- decide, and a batch of inserts (DESIGN.md §55, PostgreSQL 17 and later)
+-- splits leaves at other points than the same rows one at a time)
+SET pg_lion.batch_inserts = off;
 DELETE FROM pc WHERE id <= 5000 AND id % 17 = 0;
 UPDATE pc SET act = NOT act WHERE id <= 5000 AND id % 13 = 0;
 UPDATE pc SET st = 'off', a = (a + 1) % 20 WHERE id <= 5000 AND id % 11 = 0;
 UPDATE pc SET x = CASE WHEN x > 10 THEN 3 ELSE 50 END WHERE id <= 5000 AND id % 7 = 0;
 UPDATE pc SET kind = 'k0', w = 9 WHERE id <= 5000 AND id % 5 = 2;
 UPDATE pc SET act = true, st = 'on', kind = 'k0', x = NULL WHERE id = 29000;
+RESET pg_lion.batch_inserts;
 CREATE FUNCTION cp_q(q text, nojoins boolean DEFAULT false,
 					 anynode boolean DEFAULT false) RETURNS text
 LANGUAGE plpgsql AS $$

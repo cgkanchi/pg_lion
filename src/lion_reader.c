@@ -62,6 +62,7 @@
 
 #include "lion.h"
 #include "lion_count.h"
+#include "lion_defer.h"
 
 /*
  * Row-level security: the policies would have to be evaluated per row, and a
@@ -186,6 +187,9 @@ lion_reader_open(Oid indexoid, LionReadPolicy policy, Snapshot snapshot,
 					 errmsg("cannot %s through index \"%s\" because %s",
 							action, RelationGetRelationName(index), why)));
 	}
+
+	/* rows this backend has buffered for the index go in first (§55) */
+	lion_defer_flush_index(index);
 
 	/* not given: still locked until the transaction ends, as the index is */
 	if (heap != NULL)

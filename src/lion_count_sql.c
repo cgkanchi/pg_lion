@@ -14,6 +14,7 @@
 #include "utils/regproc.h"
 
 #include "lion_count_int.h"
+#include "lion_defer.h"
 
 #include "pgstat.h"
 
@@ -669,6 +670,8 @@ lion_count_open_indexes_ext(Snapshot snapshot, int nidx, const Oid *idxoid,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("index \"%s\" is not a lion index",
 							RelationGetRelationName(index))));
+		/* rows this backend has buffered for it go in first (§55) */
+		lion_defer_flush_index(index);
 		/*
 		 * wantcol = 0 means the caller names an index and a key but no COLUMN,
 		 * so a multicolumn index (DESIGN.md §24) has nothing to tell it which
