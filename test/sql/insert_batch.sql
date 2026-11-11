@@ -338,13 +338,17 @@ SELECT lb_cmp('lb_rows', 'k = 1002');
 -- 400 rows of one CHAIN key, adjacent on the heap: a record for each
 -- container they go into, not one for each row (on 16, which writes row
 -- by row, the count is not asked).  The start is the insert position, not
--- the write position, which lags while earlier commits are unflushed.
+-- the write position, which lags while earlier commits are unflushed; only
+-- the insert's own transaction's records count, not another session's.
 SET synchronous_commit = on;	-- the commit flushes what is read back
 SELECT pg_current_wal_insert_lsn() AS lb_lsn0 \gset
+BEGIN;
 INSERT INTO lb_rows SELECT g, 1000 FROM generate_series(14001, 14400) g;
-SELECT batched(1) = 0 OR count(*) < 40 AS a_record_a_container
+SELECT xid(pg_current_xact_id()) AS lb_xid \gset
+COMMIT;
+SELECT batched(1) = 0 OR count(*) BETWEEN 1 AND 39 AS a_record_a_container
   FROM pg_get_wal_records_info(:'lb_lsn0', pg_current_wal_lsn())
- WHERE resource_manager IN ('Generic', 'pg_lion');
+ WHERE resource_manager IN ('Generic', 'pg_lion') AND xid = :'lb_xid';
 RESET synchronous_commit;
 SELECT lion_index_verify('lb_rows_k', true);
 SELECT lb_cmp('lb_rows', 'k = 1000');
