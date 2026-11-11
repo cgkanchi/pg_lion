@@ -2,7 +2,7 @@
  *
  * lion_plan_lateral.c
  *		A grouped subquery joined in, planned again as a LATERAL subquery
- *		(DESIGN.md §55).
+ *		(DESIGN.md §56).
  *
  *	  SELECT u.id, s.n
  *	    FROM users u

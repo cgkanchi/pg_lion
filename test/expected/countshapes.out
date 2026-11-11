@@ -365,12 +365,13 @@ UPDATE cs SET a = 41, t = 'moved' WHERE id = 900001;
 DELETE FROM cs WHERE id > 900000;
 INSERT INTO cs VALUES (900100, 42, 1, NULL, NULL, 0);
 SELECT cs_plan('SELECT DISTINCT a FROM cs');
-         cs_plan          
---------------------------
+               cs_plan               
+-------------------------------------
  Custom Scan (LionCount)
    Lion Indexes: cs_a (a)
    Group Key: a
-(3 rows)
+   Group Strategy: First Visible Row
+(4 rows)
 
 SELECT cs_plan('SELECT a, b FROM cs GROUP BY 1, 2');
               cs_plan               
@@ -381,14 +382,15 @@ SELECT cs_plan('SELECT a, b FROM cs GROUP BY 1, 2');
 (3 rows)
 
 SELECT cs_plan('SELECT DISTINCT a FROM cs ORDER BY a DESC');
-            cs_plan             
---------------------------------
+                  cs_plan                  
+-------------------------------------------
  Sort
    Sort Key: a DESC
    ->  Custom Scan (LionCount)
          Lion Indexes: cs_a (a)
          Group Key: a
-(5 rows)
+         Group Strategy: First Visible Row
+(6 rows)
 
 SELECT q, cs_q(q) FROM (VALUES
 	('SELECT DISTINCT a FROM cs'),

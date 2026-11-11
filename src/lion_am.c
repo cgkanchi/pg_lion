@@ -58,6 +58,7 @@
 #include "lion_bm25.h"
 #include "lion_costs.h"
 #include "lion_count.h"
+#include "lion_defer.h"
 #include "lion_vec.h"
 
 #if PG_VERSION_NUM >= 180000
@@ -442,6 +443,22 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §10, "A count of every row beside the rows": whether
+	 * count(*) OVER () beside a relation's rows may come from lion's count of
+	 * the relation (the LionWindowCount node) instead of a WindowAgg that
+	 * reads every row first.  pg_lion.enable_count_pushdown switches it off
+	 * as well.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_window_count",
+							 "Enables lion's count beside the rows for count(*) OVER () of the whole result.",
+							 "Off, such a window is left to the planner's WindowAgg; pg_lion.enable_count_pushdown = off turns it off too.",
+							 &lion_enable_window_count,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
 	 * DESIGN.md §46, "The dimension by probe": whether the planner may group
 	 * a join of a table to a dimension by its primary key with LionProbeJoin
 	 * - the dimension's key looked up for each row, its WHERE and the GROUP
@@ -618,6 +635,20 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	/*
+	 * DESIGN.md §36, "Expressions of columns not grouped": whether a GROUP BY
+	 * of expressions of lion-indexed columns it does not name may be counted
+	 * by those columns' groups, merged by a Finalize Agg.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_expr_groups",
+							 "Lets the count pushdown count a GROUP BY of expressions of lion-indexed columns by the columns' own groups, merged.",
+							 "Off, such a GROUP BY goes to a count by cells or to the ordinary plan.",
+							 &lion_enable_expr_groups,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomIntVariable("pg_lion.count_cells_max",
 							"The most cells a count by cells may have: the product of each predicate column's outcomes.",
 							"A plan with more is left to the ordinary plan.",
@@ -753,7 +784,7 @@ _PG_init(void)
 	/*
 	 * A grouped subquery joined on its grouping column, planned again as a
 	 * LATERAL subquery whose count a lion index answers per outer row
-	 * (DESIGN.md §55): its GUC and the planner hook.
+	 * (DESIGN.md §56): its GUC and the planner hook.
 	 */
 	lion_lateral_init();
 
@@ -763,6 +794,9 @@ _PG_init(void)
 	 * pg_lion_vector extension, where pgvector is installed.
 	 */
 	lion_vec_init();
+
+	/* statement-level insert batching (DESIGN.md §55) */
+	lion_defer_init();
 
 	MarkGUCPrefixReserved("pg_lion");
 
@@ -879,7 +913,7 @@ lion_handler(PG_FUNCTION_ARGS)
 		.ambuildempty = lionbuildempty,
 		.aminsert = lioninsert,
 #if PG_VERSION_NUM >= 170000
-		.aminsertcleanup = NULL,
+		.aminsertcleanup = lioninsertcleanup,	/* DESIGN.md §55 */
 #endif
 		.ambulkdelete = lionbulkdelete,
 		.amvacuumcleanup = lionvacuumcleanup,

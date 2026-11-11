@@ -11,6 +11,10 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
+#include "optimizer/restrictinfo.h"
+
 #include "lion_customscan.h"
 #include "lion_plan_private.h"
 
@@ -422,6 +426,8 @@ typedef struct LionCountPathBuild
 	Oid			distcoll;
 	bool		distcounts;		/* its walk must count, not test (§26) */
 	double		distest;
+	bool		groupsexist;	/* nothing reads the groups' counts: each
+								 * is a test for a visible row (§10) */
 	Const	   *groupcoal;		/* GROUP BY coalesce(col, c): c (§10) */
 	Node	   *groupexpr;		/* ... and the whole expression */
 	bool		plainpositive;	/* a positive clause outside ORs that
@@ -430,12 +436,22 @@ typedef struct LionCountPathBuild
 								 * collect by ranges (§10) */
 	List	   *groupdeps;		/* GROUP BY expressions of the columns
 								 * (§36), which split no group */
+	bool		groupderived;	/* ... of columns the GROUP BY does not
+								 * name, which the walk groups by and a
+								 * Finalize Agg merges (§36, "Expressions of
+								 * columns not grouped") */
+	double		finalgroups;	/* ... and the groups the merge makes */
 	List	   *wattnos;		/* §37: the columns aggregates are taken
 								 * over, weighted by their entries' rows */
 	List	   *widx;			/* ... their indexes (IndexOptInfo) */
 	List	   *wcols;			/* ... and key columns there */
 	List	   *wnaggs;			/* ... and how many aggregates each */
 	bool		wcounts;		/* the counts of the target list besides */
+	bool		rowcounts;		/* ... of them, any but filtered counts */
+	Bitmapset  *fcountruns;		/* the filters with a filtered count */
+	Cost	   *runcost;		/* each run's price, the last relation's
+								 * (lion_count_path_price_runs()) ... */
+	int			nruncost;		/* ... of this many runs */
 	bool		slicemode;		/* §52: this build answers aggregates of
 								 * sliced columns from their slices */
 	bool		slicedecode;	/* ... a GROUP BY's a batch of groups at a
@@ -452,10 +468,19 @@ typedef struct LionCountPathBuild
 	List	   *scols;			/* ... key columns there */
 	List	   *stypes;			/* ... the types they are sliced as */
 	List	   *swants;			/* ... what each is asked: LION_SWANT_* */
+	List	   *sruns;			/* ... the run each is counted in: 0, or a
+								 * filter's (§52, "Filtered aggregates") */
+	bool		snotpartial;	/* ... an aggregate among them whose value is
+								 * not its partial state (§52, "Partial
+								 * rows") */
 	int64		topkn;			/* the top k by count (§36), or 0 */
 	int			topkcand;		/* ... the candidates its walk keeps */
 	double		topkrows;		/* ... and the rows of their entries */
 	bool		topkstrict;		/* ... every group tied with the k-th */
+	double		topkwhole;		/* ... how likely it counts every group */
+	Cost		topkwholecost;	/* ... the price of that, as a path */
+	Cost		addedcost;		/* the last path lion_count_path_add()
+								 * added, its price */
 	List	   *vcols;			/* the expression columns (DESIGN.md §41) */
 	bool		distinctstage;	/* a SELECT DISTINCT's keys as the groups */
 	int			ncompl;			/* ORs with a complement arm (§35) */
@@ -582,6 +607,7 @@ lion_count_path_init(LionCountPathBuild *cx, PlannerInfo *root,
 	cx->distcoll = InvalidOid;
 	cx->distcounts = false;
 	cx->distest = 0;
+	cx->groupsexist = false;
 	cx->groupcoal = NULL;
 	cx->groupexpr = NULL;
 	cx->plainpositive = false;
@@ -789,6 +815,93 @@ lion_group_dependent(LionCountPathBuild *cx, Node *expr)
 }
 
 /*
+ * A GROUP BY of expressions of columns it does not name - `GROUP BY
+ * upper(status)`, `GROUP BY kind / 5` - is the GROUP BY of those columns,
+ * merged (DESIGN.md §36, "Expressions of columns not grouped").  Where the
+ * node can print a column from its stored keys (lion_index_can_emit_value(),
+ * decided per relation once the indexes are known), every row of the
+ * column's group holds the same value, not merely an equal one, so an
+ * immutable expression of the columns (lion_group_dependent()) is the same
+ * for every row of a group, and each group of the expressions is a union of
+ * the columns' groups.  The walk counts the columns' groups and emits them as
+ * partial rows, the projection computing the expressions from each group's
+ * key, and core's Finalize Agg adds up the rows that share a value.
+ *
+ * Each column the expressions read and the GROUP BY does not name becomes a
+ * grouping column, under its type's own equality and its own collation - a
+ * finer grouping than any the expressions make - and two grouping columns at
+ * most: the nested loop of §20.  The rows are partial, so core has to be able
+ * to add them up: partial counts, and the expressions hashable.  The
+ * expressions are computed for the groups that have rows, from the value
+ * every one of those rows holds, which is the value the ordinary plan computes
+ * them from: an error they raise, it raises too.  What wants finished groups
+ * - filtered counts, the decoded walk, a GROUP BY in parallel, the top k, an
+ * order claimed - is refused with any expression of the columns already
+ * (groupdeps), and lion_count_path_derived_ok() refuses the rest.
+ */
+static bool
+lion_count_path_derive_groups(LionCountPathBuild *cx)
+{
+	List	   *vars = NIL;
+	ListCell   *lc;
+
+	cx->groupderived = false;
+	if (!lion_enable_expr_groups)
+		return true;
+	foreach(lc, cx->groupdeps)
+		vars = list_concat(vars, pull_var_clause((Node *) lfirst(lc),
+												 PVC_RECURSE_PLACEHOLDERS));
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+		TypeCacheEntry *typentry;
+		int			g;
+
+		if (!IsA(v, Var) || v->varno != (int) cx->rti ||
+			v->varlevelsup != 0 || v->varattno <= 0)
+			return false;
+		for (g = 0; g < cx->ngroup; g++)
+		{
+			if (cx->groupattno[g] == v->varattno)
+				break;
+		}
+		if (g < cx->ngroup)
+			continue;
+		if (cx->ngroup >= 2)
+			return false;
+
+		typentry = lookup_type_cache(v->vartype, TYPECACHE_EQ_OPR);
+		if (!OidIsValid(typentry->eq_opr))
+			return false;
+		cx->groupvar[cx->ngroup] = (Var *) copyObject(v);
+		cx->groupattno[cx->ngroup] = v->varattno;
+		cx->groupcoll[cx->ngroup] = v->varcollid;
+		cx->groupeqop[cx->ngroup] = typentry->eq_opr;
+		cx->ngroup++;
+		cx->groupderived = true;
+	}
+	if (!cx->groupderived)
+		return true;
+	return cx->extra != NULL &&
+		(cx->extra->flags & GROUPING_CAN_PARTIAL_AGG) != 0 &&
+		grouping_is_hashable(cx->root->processed_groupClause);
+}
+
+/*
+ * ... and what may stand beside it, once the query's aggregates are known:
+ * counts and plain columns.  Not a count(DISTINCT), whose partial counts the
+ * Finalize Agg could not add, a SELECT DISTINCT's keys, the FK-side join or
+ * the anti join over a small inner side.
+ */
+static bool
+lion_count_path_derived_ok(const LionCountPathBuild *cx)
+{
+	return !cx->groupderived ||
+		(cx->distvar == NULL && !cx->distinctstage && cx->fj == NULL &&
+		 cx->anti == NULL && cx->wattnos == NIL && cx->nfilter == 0);
+}
+
+/*
  * GROUP BY: nothing, one indexed column, or two.  Fills in the grouping
  * columns (groupvar and the arrays beside it, ngroup), the coalesce group, or
  * singlegroup for a GROUP BY the planner folded to constants.
@@ -951,12 +1064,13 @@ lion_count_path_group_by(LionCountPathBuild *cx)
 			 * which emits partial counts too - a combination's rows may come
 			 * out in more than one row, when a pass's tally spills - for a
 			 * Finalize Agg to add up: the same two requirements.  It counts
-			 * one table, and is not made on a hot standby, where no WHERE is
-			 * collected.
+			 * one table, or each partition in its turn (§16, "The decoded
+			 * walk over partitions"), and is not made on a hot standby,
+			 * where no WHERE is collected.
 			 */
 			if (nvar > 2 &&
 				(!lion_enable_decoded_walk ||
-				 cx->partitioned || !sgc->hashable || extra == NULL ||
+				 !sgc->hashable || extra == NULL ||
 				 (extra->flags & GROUPING_CAN_PARTIAL_AGG) == 0 ||
 				 RecoveryInProgress()))
 				return false;
@@ -966,13 +1080,22 @@ lion_count_path_group_by(LionCountPathBuild *cx)
 		cx->decode = (cx->ngroup > 2);
 
 		/*
+		 * Expressions of columns the GROUP BY does not name are grouped by
+		 * those columns, and merged (lion_count_path_derive_groups()).
+		 */
+		if (!cx->decode && !lion_count_path_derive_groups(cx))
+			return false;
+
+		/*
 		 * The expressions of the grouping columns split no group: only in
 		 * one table, which emits its finished groups, and with a column to
-		 * be an expression of.
+		 * be an expression of - or as partial rows a Finalize Agg merges,
+		 * where the walk groups by columns the GROUP BY does not name.
 		 */
 		foreach(lc, cx->groupdeps)
 		{
-			if (cx->ngroup == 0 || cx->partitioned || cx->decode ||
+			if (cx->ngroup == 0 || (cx->partitioned && !cx->groupderived) ||
+				cx->decode ||
 				!lion_group_dependent(cx, (Node *) lfirst(lc)))
 				return false;
 		}
@@ -1188,10 +1311,16 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 	 * A range in a filtered count's condition (DESIGN.md §10, "Filtered
 	 * counts") bounds no walk: the walk is the WHERE's.  It is a bound of a
 	 * range taken as a source (§32), with the filter's other bounds on its
-	 * column, collected or walked beside the WHERE's sources.
+	 * column, collected or walked beside the WHERE's sources - in a build
+	 * that answers ranges from slices, from those of its column where it has
+	 * them (§53), as the WHERE's would be, which carries its own pin.
 	 */
 	if (leaf.kind == LION_CLAUSE_RANGE && cx->curfilter > 0)
 	{
+		bool		sliced = cx->slicerange &&
+			!lion_count_path_walks_column(cx, leaf.var->varattno) &&
+			lion_count_slice_range_ok(cx, leaf.var->varattno, leaf.cmptype);
+
 		leaf.kind = LION_CLAUSE_RANGESRC;
 		cx->hasrangesrc = true;
 		cx->havepositive = true;
@@ -1203,6 +1332,12 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 						  &cx->wherekinds, &cx->whereopnos,
 						  &cx->whereinor);
 		lion_count_path_noted(cx);
+		if (sliced)
+		{
+			((LionClauseInfo *) llast(cx->clauseinfos))->sliced = true;
+			cx->slicedsrc = true;
+			cx->nsliced++;
+		}
 		return true;
 	}
 
@@ -1213,13 +1348,20 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 	 * else is known.  Any number of them may name one column: they are
 	 * ANDed into one range, and they are gathered per column here.  A
 	 * strict comparison is never true of NULL, so the column is non-NULL
-	 * in every row counted.
+	 * in every row counted.  A bound made from the restriction rather than
+	 * written in it - one of `col LIKE 'p%'`'s two (lion_like_as_and()) -
+	 * is gathered as a RestrictInfo of its own, so that the column's
+	 * selectivity and its range's bounds are the range's, not the LIKE's
+	 * twice over.
 	 */
 	if (leaf.kind == LION_CLAUSE_RANGE)
 	{
 		int			pos = list_length(cx->whereattnos);
 		int			r = 0;
 		ListCell   *lr;
+
+		if (rinfo != NULL && clause != (Node *) rinfo->clause)
+			rinfo = make_simple_restrictinfo(root, (Expr *) clause);
 
 		foreach(lr, cx->rangevars)
 		{
@@ -1995,8 +2137,9 @@ lion_count_path_where(LionCountPathBuild *cx)
 
 		/*
 		 * An OR across columns (lion_count_path_where_or()), `col NOT IN
-		 * (...)` as its `<>` clauses (lion_all_as_and()), or a clause of one
-		 * column (lion_count_path_where_leaf()).
+		 * (...)` as its `<>` clauses (lion_all_as_and()), `col LIKE 'p%'` as
+		 * its range (lion_like_as_and()), or a clause of one column
+		 * (lion_count_path_where_leaf()).
 		 */
 		if (IsA(clause, BoolExpr) && ((BoolExpr *) clause)->boolop == OR_EXPR)
 			answered = lion_count_path_where_or(cx, clause);
@@ -2013,6 +2156,27 @@ lion_count_path_where(LionCountPathBuild *cx)
 									   &leaf) ||
 					leaf.kind != LION_CLAUSE_NE ||
 					!lion_count_path_where_leaf(cx, rinfo, conj))
+				{
+					answered = false;
+					break;
+				}
+			}
+		}
+		else if ((ands = lion_like_as_and(clause)) != NIL)
+		{
+			ListCell   *la;
+
+			/*
+			 * `col LIKE 'p%'` as the range it is (lion_like_as_and()), or
+			 * the equality or `IS NOT NULL` of a pattern with no wildcard or
+			 * of `%` alone: clauses of one column, which share the
+			 * restriction's position as `NOT IN`'s do.
+			 */
+			answered = true;
+			foreach(la, ands)
+			{
+				if (!lion_count_path_where_leaf(cx, rinfo,
+												(Node *) lfirst(la)))
 				{
 					answered = false;
 					break;
@@ -2591,16 +2755,22 @@ lion_count_slice_range_ok(const LionCountPathBuild *cx, AttrNumber attno,
 /*
  * An aggregate of sliced column attno answered from its slices (DESIGN.md
  * §52), of kind skind taking the column as argtype (lion_sagg_classify()):
- * over one table, with no GROUP BY or one of one or two lion-indexed columns
- * walked by their entries, or over a partitioned one with no GROUP BY (§52,
- * "Partitioned tables"), and from a whole lion index that slices the column
- * as that type (lion_find_sliced_index(); a partitioned table's first live
- * leaf's here, every leaf's once the partitions are known).  Notes the
- * column, its index and what its aggregates ask of the slices.
+ * with no GROUP BY or one of one or two lion-indexed columns walked by their
+ * entries, over one table or each partition of one (§52, "Partitioned
+ * tables"), and from a whole lion index that slices the column as that type
+ * (lion_find_sliced_index(); a partitioned table's first live leaf's here,
+ * every leaf's once the partitions are known).  Over the WHERE's rows (run
+ * 0), or a filter's run's (§52, "Filtered aggregates").  The groups of a
+ * partitioned table, or of filters' runs, go up as partial rows, which only
+ * an aggregate whose value is its partial state can be in (§52, "Partial
+ * rows"): a filter's aggregate under a GROUP BY has to be one, and
+ * lion_count_path_slices_ok() holds the others to it once the filters are
+ * known.  Notes the column, its index, its run and what its aggregates ask
+ * of the slices: a column counted in two runs is noted twice.
  */
 static bool
 lion_count_path_sagg(LionCountPathBuild *cx, AttrNumber attno, int skind,
-					 Oid argtype)
+					 Oid argtype, int run)
 {
 	IndexOptInfo *idx;
 	AttrNumber	col;
@@ -2610,10 +2780,13 @@ lion_count_path_sagg(LionCountPathBuild *cx, AttrNumber attno, int skind,
 	int			i = 0;
 
 	if (cx->fj != NULL || cx->anti != NULL || cx->ngroup > 2 ||
-		cx->singlegroup || (cx->partitioned && cx->ngroup > 0) ||
-		cx->distvar != NULL ||
-		cx->groupcoal != NULL || cx->cells || LION_ATTNO_IS_VCOL(attno))
+		cx->singlegroup || cx->groupderived || cx->distvar != NULL ||
+		cx->groupcoal != NULL || cx->cells || LION_ATTNO_IS_VCOL(attno) ||
+		(cx->ngroup > 0 && (cx->partitioned || run > 0) &&
+		 !LION_SAGG_IS_PARTIAL_OK(skind)))
 		return false;
+	if (!LION_SAGG_IS_PARTIAL_OK(skind))
+		cx->snotpartial = true;
 
 	want = (skind == LION_SAGG_SUM || skind == LION_SAGG_SUM8 ||
 			skind == LION_SAGG_AVG || skind == LION_SAGG_AVG8) ?
@@ -2622,7 +2795,8 @@ lion_count_path_sagg(LionCountPathBuild *cx, AttrNumber attno, int skind,
 		(skind == LION_SAGG_MAX) ? LION_SWANT_MAX : 0;
 	foreach(lc, cx->sattnos)
 	{
-		if ((AttrNumber) lfirst_int(lc) == attno)
+		if ((AttrNumber) lfirst_int(lc) == attno &&
+			list_nth_int(cx->sruns, i) == run)
 		{
 			if (OidIsValid(argtype) &&
 				argtype != list_nth_oid(cx->stypes, i))
@@ -2640,6 +2814,7 @@ lion_count_path_sagg(LionCountPathBuild *cx, AttrNumber attno, int skind,
 	cx->scols = lappend_int(cx->scols, (int) col);
 	cx->stypes = lappend_oid(cx->stypes, typid);
 	cx->swants = lappend_int(cx->swants, want);
+	cx->sruns = lappend_int(cx->sruns, run);
 	return true;
 }
 
@@ -2655,10 +2830,12 @@ lion_count_path_sagg(LionCountPathBuild *cx, AttrNumber attno, int skind,
  * the aggregates over keys of §37 are another build's.
  *
  * Beside a GROUP BY - one column's entries walked, or two's pairs (§20) -
- * every group's rows are that WHERE copy ANDed with the group's sets: not
- * beside filtered counts, whose runs go up as partial rows a Finalize Agg
- * adds up (an average or an extreme of them would be no partial state), the
- * top k, which counts a column's entries' own counts, or the decoded walk.
+ * every group's rows are that WHERE copy ANDed with the group's sets.  Each
+ * partition's groups, and each filtered count's run's (§10), go up as partial
+ * rows a Finalize Agg adds up: only beside aggregates whose values are their
+ * partial states (§52, "Partial rows") - not an average, whose state is a
+ * count beside a sum, nor a sum of an int8.  Not beside the top k, which
+ * counts a column's entries' own counts, or the decoded walk.
  */
 static bool
 lion_count_path_slices_ok(LionCountPathBuild *cx)
@@ -2669,8 +2846,8 @@ lion_count_path_slices_ok(LionCountPathBuild *cx)
 		cx->ncompl == 0 && !cx->runtimemulti && !cx->prefixmulti &&
 		cx->residual == NIL && cx->topkn == 0 && !cx->decode &&
 		cx->distvar == NULL && cx->ngroup <= 2 &&
-		!(cx->partitioned && cx->ngroup > 0) &&
-		(cx->ngroup == 0 || cx->nfilter == 0) &&
+		!(cx->ngroup > 0 && (cx->partitioned || cx->nfilter > 0) &&
+		  cx->snotpartial) &&
 		!RecoveryInProgress();
 }
 
@@ -2894,6 +3071,33 @@ lion_count_path_outputs(LionCountPathBuild *cx)
 			int			form;
 
 			/*
+			 * A count, sum, average, minimum or maximum of a bit-sliced
+			 * column, from its slices (DESIGN.md §52), in the build that
+			 * takes them so - with a FILTER, over the rows of its filter's
+			 * run, the one its condition numbers as a filtered count's
+			 * would (§52, "Filtered aggregates"): a count(col) of a sliced
+			 * column with a FILTER among them, whatever col's nullness.
+			 */
+			if (cx->slicemode)
+			{
+				AttrNumber	sattno;
+				Oid			argtype;
+				Node	   *sfilter;
+				int			skind = lion_sagg_classify(agg, rti, &sattno,
+													   &argtype, &sfilter);
+
+				if (skind != LION_SAGG_NONE &&
+					lion_count_path_sagg(cx, sattno, skind, argtype,
+										 (sfilter != NULL) ?
+										 lion_count_path_filter_no(cx, sfilter) :
+										 0))
+				{
+					haveagg = true;
+					continue;
+				}
+			}
+
+			/*
 			 * A filtered count (DESIGN.md §10, "Filtered counts"): its
 			 * condition is one more set of clauses, analysed once the WHERE's
 			 * strategy is known (lion_count_path_filters()); a count(col) of
@@ -2918,27 +3122,11 @@ lion_count_path_outputs(LionCountPathBuild *cx)
 				}
 				haveagg = true;
 				cx->wcounts = true;
+				cx->fcountruns = bms_add_member(cx->fcountruns, f);
+				/* ... the SUM form's NULL is the WHERE's count's */
+				if (form == LION_FCOUNT_SUM)
+					cx->rowcounts = true;
 				continue;
-			}
-
-			/*
-			 * A count, sum, average, minimum or maximum of a bit-sliced
-			 * column, from its slices (DESIGN.md §52), in the build that
-			 * takes them so.
-			 */
-			if (cx->slicemode)
-			{
-				AttrNumber	sattno;
-				Oid			argtype;
-				int			skind = lion_sagg_classify(agg, rti, &sattno,
-													   &argtype);
-
-				if (skind != LION_SAGG_NONE &&
-					lion_count_path_sagg(cx, sattno, skind, argtype))
-				{
-					haveagg = true;
-					continue;
-				}
 			}
 
 			/*
@@ -2959,6 +3147,7 @@ lion_count_path_outputs(LionCountPathBuild *cx)
 				/* checked above; a distinct count needs no other test */
 				haveagg = true;
 				cx->wcounts = true;
+				cx->rowcounts = true;
 				continue;
 			}
 
@@ -2992,6 +3181,7 @@ lion_count_path_outputs(LionCountPathBuild *cx)
 				return false;
 			haveagg = true;
 			cx->wcounts = true;
+			cx->rowcounts = true;
 
 			/*
 			 * Does the walk have to COUNT rather than test for existence?
@@ -3017,6 +3207,13 @@ lion_count_path_outputs(LionCountPathBuild *cx)
 	if (!haveagg &&
 		(cx->parse->hasAggs || (cx->ngroup == 0 && !cx->singlegroup)))
 		return false;
+
+	/*
+	 * ... and its groups are tests for a visible row, not counts (DESIGN.md
+	 * §10, "Groups nothing counts"): nothing in the target list or the
+	 * HAVING reads a count.
+	 */
+	cx->groupsexist = !haveagg;
 	return true;
 }
 
@@ -3045,8 +3242,9 @@ lion_count_path_filter_no(LionCountPathBuild *cx, Node *fexpr)
 /*
  * One conjunct of a filtered count's condition (DESIGN.md §10, "Filtered
  * counts"), as lion_count_path_where() takes a restriction of the WHERE:
- * the same rewrites, then an OR, the conjunction of a `NOT IN`, or a clause
- * of one column.  False when no posting set answers it.
+ * the same rewrites, then an OR, the conjunction of a `NOT IN` or of a
+ * `LIKE`'s range, or a clause of one column.  False when no posting set
+ * answers it.
  */
 static bool
 lion_count_path_filter_clause(LionCountPathBuild *cx, Node *clause)
@@ -3090,6 +3288,17 @@ lion_count_path_filter_clause(LionCountPathBuild *cx, Node *clause)
 		}
 		return true;
 	}
+	if ((ands = lion_like_as_and(clause)) != NIL)
+	{
+		ListCell   *la;
+
+		foreach(la, ands)
+		{
+			if (!lion_count_path_where_leaf(cx, NULL, (Node *) lfirst(la)))
+				return false;
+		}
+		return true;
+	}
 	return lion_count_path_where_leaf(cx, NULL, clause);
 }
 
@@ -3121,6 +3330,7 @@ lion_count_path_filters(LionCountPathBuild *cx)
 	bool		havepositive = cx->havepositive;
 	bool		pinnedsrc = cx->pinnedsrc;
 	bool		hasrangesrc = cx->hasrangesrc;
+	bool		slicedsrc = cx->slicedsrc;
 	bool		plainpositive = cx->plainpositive;
 	Bitmapset  *notnull;
 	ListCell   *lc;
@@ -3158,6 +3368,7 @@ lion_count_path_filters(LionCountPathBuild *cx)
 		cx->havepositive = false;
 		cx->pinnedsrc = false;
 		cx->hasrangesrc = false;
+		cx->slicedsrc = false;
 		cx->plainpositive = false;
 
 		conjuncts = make_ands_implicit(canonicalize_qual((Expr *) copyObject(expr),
@@ -3177,7 +3388,7 @@ lion_count_path_filters(LionCountPathBuild *cx)
 		 */
 		if (cx->hasrangesrc &&
 			!(cx->ngroup > 0 || cx->sumall || pinnedsrc || cx->pinnedsrc ||
-			  cx->slicedsrc))
+			  slicedsrc || cx->slicedsrc))
 			return false;
 
 		/*
@@ -3215,6 +3426,7 @@ lion_count_path_filters(LionCountPathBuild *cx)
 	cx->havepositive = havepositive;
 	cx->pinnedsrc = pinnedsrc;
 	cx->hasrangesrc = hasrangesrc;
+	cx->slicedsrc = slicedsrc;
 	cx->plainpositive = plainpositive;
 
 	if (cx->decode && !cx->filterdecode)
@@ -3236,6 +3448,13 @@ lion_count_path_filters(LionCountPathBuild *cx)
 	if (lion_where_scan_untested(cx, cx->decode))
 		return false;
 	if (cx->residual != NIL && cx->runtimemulti)
+		return false;
+
+	/*
+	 * A build that answers ranges from slices and answers none so, in the
+	 * WHERE or a filter, is the build without it (lion_count_path_strategy())
+	 */
+	if (cx->slicerange && cx->nsliced == 0)
 		return false;
 	return true;
 }
@@ -3543,9 +3762,10 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 
 	/*
 	 * A build that answers ranges from slices and answers none so is the
-	 * build without it, made again: not offered twice.
+	 * build without it, made again: not offered twice.  A filter's ranges
+	 * are known once the filters are analysed (lion_count_path_filters()).
 	 */
-	if (cx->slicerange && cx->nsliced == 0)
+	if (cx->slicerange && cx->nsliced == 0 && cx->nfilter == 0)
 		return false;
 
 	/*
@@ -3630,7 +3850,7 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 	 */
 	if (cx->residual != NIL &&
 		(!cx->havepositive || cx->sumall || cx->runtimemulti ||
-		 cx->wattnos != NIL))
+		 cx->wattnos != NIL || cx->decode))
 		return false;
 
 	/*
@@ -4082,12 +4302,12 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 	 */
 	if (cx->ngroup == 0)
 		cx->outrows = 1.0;
-	else if (cx->decode)
+	else if (cx->decode && !cx->partitioned)
 	{
 		/*
 		 * The decoded walk's rows are partial counts, one a combination with
 		 * rows (DESIGN.md §34), below a Finalize Agg - as a partitioned
-		 * table's are.
+		 * table's are, a partition's decoded walk's among them.
 		 */
 		cx->outrows = cx->numgroups;
 		cx->partialtarget = lion_make_partial_target(root,
@@ -4095,7 +4315,18 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 													 cx->having);
 	}
 	else if (!cx->partitioned)
+	{
 		cx->outrows = cx->numgroups;
+
+		/*
+		 * ... and partial too where the walk groups by columns the GROUP BY
+		 * does not name, for the Finalize Agg to merge (DESIGN.md §36)
+		 */
+		if (cx->groupderived)
+			cx->partialtarget = lion_make_partial_target(root,
+														 output_rel->reltarget,
+														 cx->having);
+	}
 	else
 	{
 		cx->outrows = 0.0;
@@ -4105,16 +4336,17 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 			double		relrows = Max(t->rel->rows, 1.0);
 			double		relgroups;
 
-			if (t->drivevar[0] != NULL && cx->ngroup == 2 &&
-				t->drivevar[1] != NULL)
-				relgroups = estimate_num_groups(root,
-												list_make2(t->drivevar[0],
-														   t->drivevar[1]),
-												relrows, NULL, NULL);
-			else if (t->drivevar[0] != NULL)
-				relgroups = estimate_num_groups(root,
-												list_make1(t->drivevar[0]),
-												relrows, NULL, NULL);
+			if (t->drivevar[0] != NULL)
+			{
+				/* every grouping column it has a column for, the first on */
+				List	   *tvars = list_make1(t->drivevar[0]);
+				int			h;
+
+				for (h = 1; h < cx->ngroup && t->drivevar[h] != NULL; h++)
+					tvars = lappend(tvars, t->drivevar[h]);
+				relgroups = estimate_num_groups(root, tvars, relrows,
+												NULL, NULL);
+			}
 			else
 				relgroups = cx->numgroups;
 
@@ -4161,6 +4393,21 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 		cx->partialtarget = lion_make_partial_target(root,
 													 output_rel->reltarget,
 													 cx->having);
+	}
+
+	/*
+	 * The groups the Finalize Agg makes of the walk's where they are merged:
+	 * those of the GROUP BY's expressions, never more than the walk's.
+	 */
+	cx->finalgroups = cx->numgroups;
+	if (cx->groupderived)
+	{
+		List	   *exprs = get_sortgrouplist_exprs(root->processed_groupClause,
+													root->processed_tlist);
+
+		cx->finalgroups = Min(estimate_num_groups(root, exprs,
+												  input_rel->rows, NULL, NULL),
+							  cx->numgroups);
 	}
 
 	/*
@@ -4256,65 +4503,319 @@ lion_topk_value_kept(Var *var, Expr *gclause, Datum v)
 }
 
 /*
- * The rows of the cand largest groups of var, of ngroups: the frequencies of
- * its most common values, which the statistics keep largest first - but for
- * those a clause of the WHERE on var alone (gclauses) rejects, whose entries
- * the walk passes by - and past the end of that list the frequency of a
- * value it leaves out; at the least cand average groups.
+ * The bounds of var's largest entries, as its statistics have them: the
+ * frequencies of its most common values, which the statistics keep largest
+ * first - but for those a clause of the WHERE on var alone (gclauses)
+ * rejects, whose entries the walk passes by - and, past the end of that
+ * list, the frequency of a value it leaves out (rest), of ngroups.  With no
+ * list, every value is an average one of ngroups.  The NULL entry is left
+ * out.
+ *
+ * ... and, for the fallback's likelihood (lion_topk_whole_share()), the
+ * values past the list as the walk meets them: how many (tailkeys: the
+ * column's distinct values, the share of them gclauses keeps), the rows of
+ * one on average (tailrows), and how those spread (tailsd).  The spread is
+ * what a lion index on the column counted - Σn²/Σn of the keys past the list
+ * is their mean plus their variance over it (lion_key_tail_counted()) - or,
+ * where none did, a count's of rows put in keys at random: the square root
+ * of the mean.
  */
-static double
-lion_topk_rows(PlannerInfo *root, RelOptInfo *rel, Var *var, List *gclauses,
-			   double cand, double ngroups)
+typedef struct LionTopkFreqs
+{
+	double	   *freq;			/* the kept values', largest first */
+	int			n;				/* ... how many */
+	double		rest;			/* a value's past them */
+	double		listmin;		/* the list's smallest frequency, or 0 */
+	double		tailkeys;		/* the values past the list the walk meets */
+	double		tailshare;		/* ... of all of them */
+	double		tailrows;		/* ... the rows of one */
+	double		tailsd;			/* ... and their spread */
+} LionTopkFreqs;
+
+static void
+lion_topk_freqs(PlannerInfo *root, RelOptInfo *rel, Var *var,
+				List *gclauses, double ngroups, LionTopkFreqs *f)
 {
 	VariableStatData vardata;
 	AttStatsSlot sslot;
 	double		tuples = Max(rel->tuples, 1.0);
-	double		rows = cand * tuples / Max(ngroups, 1.0);
+	double		restshare = 1.0;	/* of the rows, past the list */
+	double		keptshare = 0.0;	/* ... and of the list, kept */
+	double		ndistinct = Max(ngroups, 1.0);
+	int			nlist = 0;
 
+	f->freq = NULL;
+	f->n = 0;
+	f->rest = 1.0 / Max(ngroups, 1.0);
+	f->listmin = 0.0;
 	examine_variable(root, lion_vcol_unvar((Node *) var), 0, &vardata);
-	if (HeapTupleIsValid(vardata.statsTuple) &&
-		get_attstatsslot(&sslot, vardata.statsTuple, STATISTIC_KIND_MCV,
-						 InvalidOid,
-						 ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS))
+	if (HeapTupleIsValid(vardata.statsTuple))
 	{
 		Form_pg_statistic stats =
 			(Form_pg_statistic) GETSTRUCT(vardata.statsTuple);
-		double		mcv = 0.0;
-		double		top = 0.0;
-		int			kept = 0;
-		int			i;
+		bool		isdefault;
+		double		nd = get_variable_numdistinct(&vardata, &isdefault);
 
-		for (i = 0; i < sslot.nnumbers; i++)
+		if (!isdefault)
+			ndistinct = Max(nd, 1.0);
+		restshare = Max(1.0 - stats->stanullfrac, 0.0);
+		if (get_attstatsslot(&sslot, vardata.statsTuple, STATISTIC_KIND_MCV,
+							 InvalidOid,
+							 ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS))
 		{
-			ListCell   *lc;
-			bool		keep = true;
+			double		mcv = 0.0;
+			int			i;
 
-			mcv += sslot.numbers[i];
-			if (i < sslot.nvalues)
-				foreach(lc, gclauses)
-				{
-					if (!lion_topk_value_kept(var, (Expr *) lfirst(lc),
-											  sslot.values[i]))
-					{
-						keep = false;
-						break;
-					}
-				}
-			if (keep && kept < cand)
+			f->freq = (double *) palloc(sizeof(double) *
+										Max(sslot.nnumbers, 1));
+			for (i = 0; i < sslot.nnumbers; i++)
 			{
-				top += sslot.numbers[i];
-				kept++;
+				ListCell   *lc;
+				bool		keep = true;
+
+				mcv += sslot.numbers[i];
+				if (i < sslot.nvalues)
+					foreach(lc, gclauses)
+					{
+						if (!lion_topk_value_kept(var, (Expr *) lfirst(lc),
+												  sslot.values[i]))
+						{
+							keep = false;
+							break;
+						}
+					}
+				if (keep)
+				{
+					f->freq[f->n++] = sslot.numbers[i];
+					keptshare += sslot.numbers[i];
+				}
 			}
-		}
-		if (cand > kept)
-			top += (cand - kept) *
-				Max(1.0 - mcv - stats->stanullfrac, 0.0) /
+			f->rest = Max(1.0 - mcv - stats->stanullfrac, 0.0) /
 				Max(ngroups - sslot.nnumbers, 1.0);
-		rows = Max(rows, top * tuples);
-		free_attstatsslot(&sslot);
+			if (sslot.nnumbers > 0)
+				f->listmin = sslot.numbers[sslot.nnumbers - 1];
+			restshare = Max(restshare - mcv, 0.0);
+			nlist = sslot.nnumbers;
+			free_attstatsslot(&sslot);
+		}
 	}
 	ReleaseVariableStats(vardata);
+
+	f->tailkeys = Max(ndistinct - nlist, 0.0);
+	f->tailrows = restshare * tuples / Max(f->tailkeys, 1.0);
+	f->tailshare = 1.0;
+	if (gclauses != NIL && restshare > 0.0)
+	{
+		/* what the clauses keep past the list, as a share of its values */
+		Selectivity gsel = clauselist_selectivity(root, gclauses, 0,
+												  JOIN_INNER, NULL);
+
+		f->tailshare = Min(Max((gsel - keptshare) / restshare, 0.0), 1.0);
+	}
+	f->tailkeys *= f->tailshare;
+	f->tailsd = sqrt(f->tailrows);
+}
+
+/*
+ * ... and the values past the list as a lion index on the column counted
+ * them, once they are asked for: how many, their rows and the spread of
+ * those, each of the keys the walk meets of them (tailshare) - or, where no
+ * index did, the spread of a count of rows put in keys at random, the square
+ * root of the mean.
+ */
+static void
+lion_topk_tail_spread(PlannerInfo *root, RelOptInfo *rel, Var *var,
+					  LionTopkFreqs *f)
+{
+	Node	   *uvar = lion_vcol_unvar((Node *) var);
+	LionKeyTail tail;
+
+	if (IsA(uvar, Var) &&
+		lion_key_tail_counted(root, rel, (Var *) uvar, &tail))
+	{
+		f->tailkeys = tail.nkeys * f->tailshare;
+		f->tailrows = tail.mean;
+		f->tailsd = tail.sd;
+	}
+	else
+		f->tailsd = sqrt(f->tailrows);
+}
+
+/* the share of the rows in the i-th largest entry the walk keeps, from 0 */
+static inline double
+lion_topk_freq(const LionTopkFreqs *f, int i)
+{
+	return (i < f->n) ? f->freq[i] : f->rest;
+}
+
+/*
+ * The rows of the cand largest groups, of ngroups: the kept common values'
+ * frequencies and past them the rest's (lion_topk_freqs()); at the least
+ * cand average groups.
+ */
+static double
+lion_topk_rows(const LionTopkFreqs *f, double tuples, double cand,
+			   double ngroups)
+{
+	double		rows = cand * tuples / Max(ngroups, 1.0);
+	double		top = 0.0;
+	int			i;
+
+	if (f->freq == NULL)
+		return Min(rows, tuples);
+	for (i = 0; i < f->n && i < cand; i++)
+		top += f->freq[i];
+	if (cand > i)
+		top += (cand - i) * f->rest;
+	rows = Max(rows, top * tuples);
 	return Min(rows, tuples);
+}
+
+/*
+ * The rows of the r-th largest key (from 1) past the list, of tailkeys keys
+ * with tailrows rows on average and the spread tailsd: the value the share
+ * (r - 1/2) / tailkeys of them lie above, and none above the list's
+ * smallest; 0 where there is no such key.
+ *
+ * Rows put in keys at random spread as a count does, by the square root of
+ * the mean, and that part of the spread is taken as a gamma variable, read
+ * by Wilson and Hilferty's cube-root normal form (a count of mean m and
+ * variance v is near m (1 - 1/9a + z / 3 sqrt(a))^3, a = m^2 / v), which
+ * keeps a count's upper tail where a normal one cuts it short; what spreads
+ * beyond chance is the column's skew, which has a longer upper tail still,
+ * and is taken as log-normal.  A key's rows are read at the larger of the
+ * two: the first where the keys are about equal - the spread no larger than
+ * chance's, or smaller, down to none for keys of exactly the same rows - and
+ * the second where they are skewed.
+ */
+static double
+lion_topk_tail_bound(const LionTopkFreqs *f, double tuples, double r)
+{
+	double		b;
+
+	if (r > f->tailkeys)
+		return 0.0;
+	if (f->tailsd <= 0.0 || f->tailrows <= 0.0)
+		b = f->tailrows;
+	else
+	{
+		double		var = f->tailsd * f->tailsd;
+		double		chance = Min(var, f->tailrows);
+		double		s2 = log1p((var - chance) /
+							   (f->tailrows * f->tailrows));
+		double		q = (r - 0.5) / f->tailkeys;
+		double		lo = -40.0;
+		double		hi = 40.0;
+		double		a = f->tailrows * f->tailrows / chance;
+		double		c;
+		int			i;
+
+		/* the normal quantile whose upper tail is q, by halving */
+		for (i = 0; i < 60; i++)
+		{
+			double		mid = (lo + hi) / 2.0;
+
+			if (0.5 * erfc(mid / M_SQRT2) > q)
+				lo = mid;
+			else
+				hi = mid;
+		}
+		c = Max(1.0 - 1.0 / (9.0 * a) + lo / (3.0 * sqrt(a)), 0.0);
+		b = Max(f->tailrows * c * c * c,
+				exp(log(f->tailrows) - s2 / 2.0 + sqrt(s2) * lo));
+	}
+	if (f->listmin > 0.0)
+		b = Min(b, f->listmin * tuples);
+	return Max(b, 0.0);
+}
+
+/*
+ * How likely is a count of b rows' group, under a WHERE that keeps a share
+ * sel of them, to reach need?  The count is binomial, b trials at sel, taken
+ * as normal with a continuity correction; never above b.
+ */
+static double
+lion_topk_reach(double b, double sel, double need)
+{
+	double		mean = b * sel;
+	double		var = mean * (1.0 - sel);
+
+	if (b < need - 0.5)
+		return 0.0;
+	if (var < 1e-9)
+		return (mean >= need - 0.5) ? 1.0 : 0.0;
+	return 0.5 * erfc((need - 0.5 - mean) / sqrt(2.0 * var));
+}
+
+/* the strata the candidates past the list are taken in */
+#define LION_TOPK_TAIL_STRATA	32
+
+/*
+ * HOW LIKELY THE TOP k FALLS BACK ON COUNTING EVERY GROUP (DESIGN.md §36,
+ * "The fallback"): the walk counts its cand candidates largest bound first
+ * and stops once the k-th count is at least the next bound - more than it,
+ * strictly - and counts every group when it runs out of candidates first.
+ * The k-th count only grows and the next bound only falls as it goes, so it
+ * runs out exactly when, of all cand candidates, fewer than k reach the
+ * bound of the first entry left out.
+ *
+ * Under a WHERE that keeps a share sel of the rows independently of the
+ * group, each candidate reaches it with lion_topk_reach() of its own bound,
+ * and the number that do is a sum of those trials, taken as normal.  The
+ * bounds are the statistics' (lion_topk_freqs()): the list's, and past it
+ * the keys' spread about their mean, the candidates there taken in strata
+ * of equal numbers at the bound of each one's middle.  So a column whose
+ * largest entries are about as large as the ones after them falls back
+ * under a WHERE that takes away more than they differ by, and a skewed one
+ * only where the WHERE takes away more than the bounds fall from the k-th to
+ * the first left out - which the candidates, 2k/sel of them, are sized to
+ * cover.  Every key of the same rows falls back when it must show the k-th
+ * count larger than the rest, with or without a WHERE.
+ */
+static double
+lion_topk_whole_share(const LionTopkFreqs *f, double tuples, int64 k,
+					  int cand, double sel, bool strict)
+{
+	int			nlist = Min(f->n, cand);	/* candidates from the list */
+	int			ntail = cand - nlist;	/* ... and past it */
+	double		next;
+	double		need;
+	double		mean = 0.0;
+	double		var = 0.0;
+	int			i;
+
+	sel = Min(sel, 1.0);
+	next = (cand < f->n) ? f->freq[cand] * tuples :
+		lion_topk_tail_bound(f, tuples, (double) (ntail + 1));
+	if (next <= 0.0)
+		return 0.0;
+	need = strict ? next + 1.0 : next;
+	for (i = 0; i < nlist; i++)
+	{
+		double		p = lion_topk_reach(f->freq[i] * tuples, sel, need);
+
+		mean += p;
+		var += p * (1.0 - p);
+	}
+	if (ntail > 0)
+	{
+		int			strata = Min(ntail, LION_TOPK_TAIL_STRATA);
+		double		each = (double) ntail / strata;
+
+		for (i = 0; i < strata; i++)
+		{
+			double		b = lion_topk_tail_bound(f, tuples,
+												 i * each + (each + 1.0) / 2.0);
+			double		p = lion_topk_reach(b, sel, need);
+
+			mean += each * p;
+			var += each * p * (1.0 - p);
+		}
+	}
+	if (var < 1e-9)
+		return (mean < (double) k - 0.5) ? 1.0 : 0.0;
+	return Min(Max(0.5 * erfc((mean - ((double) k - 0.5)) / sqrt(2.0 * var)),
+				   0.0), 1.0);
 }
 
 static void
@@ -4336,13 +4837,17 @@ lion_count_path_topk(LionCountPathBuild *cx)
 	List	   *gonly = NIL;
 	Selectivity sel;
 	double		cand;
+	LionTopkFreqs freqs;
+	double		tuples;
 	ListCell   *lc;
 
 	cx->topkn = 0;
+	cx->topkwhole = 0.0;
 	if (!lion_enable_topk || cx->fj != NULL || cx->anti != NULL ||
 		cx->ngroup != 1 ||
 		cx->nfilter > 0 ||
 		cx->decode || cx->partitioned || cx->sumall || cx->singlegroup ||
+		cx->groupderived ||
 		cx->distvar != NULL || cx->groupcoal != NULL || cx->having != NIL ||
 		first == NULL || first->driveidx[0] == NULL)
 		return;
@@ -4445,10 +4950,50 @@ lion_count_path_topk(LionCountPathBuild *cx)
 
 	cx->topkn = limit + offset;
 	cx->topkcand = (int) cand;
-	cx->topkrows = lion_topk_rows(root, cx->input_rel, cx->groupvar[0],
-								  gonly, cand, cx->groupest[0]);
 	cx->topkstrict = (list_length(parse->sortClause) > 1 ||
 					  parse->limitOption == LIMIT_OPTION_WITH_TIES);
+	lion_topk_freqs(root, cx->input_rel, cx->groupvar[0], gonly,
+					cx->groupest[0], &freqs);
+	tuples = Max(cx->input_rel->tuples, 1.0);
+	cx->topkrows = lion_topk_rows(&freqs, tuples, cand, cx->groupest[0]);
+
+	/*
+	 * With nothing in the WHERE but g's own clauses, every count is taken to
+	 * be its entry's bound, and the k-th at least the next: only the strict
+	 * rule may fall back then.  (Dead or invisible TIDs an entry still holds
+	 * make a count smaller than its bound, which this does not foresee.)  The spread of the values past the list is asked
+	 * for where a candidate, or the first entry left out, is one of them.
+	 */
+	if (sel < 1.0 || cx->topkstrict)
+	{
+		if (cx->topkcand >= freqs.n)
+			lion_topk_tail_spread(root, cx->input_rel, cx->groupvar[0],
+								  &freqs);
+		cx->topkwhole = lion_topk_whole_share(&freqs, tuples, cx->topkn,
+											  cx->topkcand, sel,
+											  cx->topkstrict);
+	}
+	elog(DEBUG2, "lion: a top %lld from %d candidates, under a WHERE that keeps %.3g of the rows, counts every group in %.3g of runs",
+		 (long long) cx->topkn, cx->topkcand, sel, cx->topkwhole);
+	if (freqs.freq != NULL)
+		pfree(freqs.freq);
+}
+
+/*
+ * Are the build's groups tests for a visible row, not counts (DESIGN.md §10,
+ * "Groups nothing counts")?  A GROUP BY or a DISTINCT whose counts nothing
+ * reads, walked a group or a pair at a time - not the decoded walk, which
+ * counts every combination in one pass, nor the top k, which ranks by the
+ * counts, nor beside a small-side anti join, which subtracts the rows it
+ * drops from each group's count (lion_anti_adjust()) - from a test's one row
+ * that loses a group that still has rows.
+ */
+static bool
+lion_count_path_tests(const LionCountPathBuild *cx)
+{
+	return cx->groupsexist && !cx->decode && cx->topkn == 0 &&
+		cx->distvar == NULL && cx->sattnos == NIL && cx->wattnos == NIL &&
+		cx->nfilter == 0 && cx->anti == NULL;
 }
 
 /*
@@ -4487,7 +5032,8 @@ lion_count_path_fill(LionCountPathBuild *cx)
 		(cx->rangevar != NULL ? LION_FLAG_RANGE : 0) |
 		(cx->decode ? LION_FLAG_DECODE : 0) |
 		(cx->slicedecode ? LION_FLAG_SLICEDECODE : 0) |
-		(cx->residual != NIL ? LION_FLAG_RESID : 0);
+		(cx->residual != NIL ? LION_FLAG_RESID : 0) |
+		(lion_count_path_tests(cx) ? LION_FLAG_EXISTS : 0);
 	p->resid = cx->residual;
 
 	/*
@@ -4559,7 +5105,11 @@ lion_count_path_fill(LionCountPathBuild *cx)
 	p->partialidx = lion_partial_used();
 	p->predimplied = lion_partial_dropped();
 
-	/* the decoded walk's columns (DESIGN.md §34), in the order it takes them */
+	/*
+	 * the decoded walk's columns (DESIGN.md §34), in the order it takes them:
+	 * the table's indexes, or each partition's own, which reads no inner
+	 * index of a pair (§16, "The decoded walk over partitions")
+	 */
 	if (cx->decode)
 	{
 		int			g;
@@ -4568,7 +5118,23 @@ lion_count_path_fill(LionCountPathBuild *cx)
 		for (g = 0; g < cx->ngroup; g++)
 		{
 			p->groupn_attno[g] = cx->groupattno[g];
-			p->groupn_idx[g] = first->driveidx[g]->indexoid;
+			p->groupn_idx[g] = cx->partitioned ? InvalidOid :
+				first->driveidx[g]->indexoid;
+		}
+		if (cx->partitioned)
+		{
+			ListCell   *lc;
+			int			i = 0;
+
+			foreach(lc, cx->targets)
+			{
+				LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+				LionCountPrivPart *part = &p->part[i++];
+
+				part->groupidxoid2 = InvalidOid;
+				for (g = 0; g < cx->ngroup; g++)
+					part->groupnidxoid[g] = t->driveidx[g]->indexoid;
+			}
 		}
 	}
 
@@ -4622,6 +5188,7 @@ lion_count_path_fill(LionCountPathBuild *cx)
 				((IndexOptInfo *) lfirst(l2))->indexoid;
 			p->scol[i].idxcol = cx->partitioned ? 0 :
 				(AttrNumber) lfirst_int(l3);
+			p->scol[i].run = list_nth_int(cx->sruns, i);
 			i++;
 		}
 
@@ -5156,7 +5723,10 @@ lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
 								 (cx->distvar != NULL && cx->ngroup == 1) ?
 								 cx->distest : 0,
 								 cx->outrows,
-								 (cx->distvar == NULL) ? LION_DISTINCT_NONE :
+								 (cx->distvar == NULL) ?
+								 ((lion_count_path_tests(cx) &&
+								   cx->ngroup > 0) ?
+								  LION_DISTINCT_EXISTS : LION_DISTINCT_NONE) :
 								 cx->distcounts ? LION_DISTINCT_COUNT :
 								 LION_DISTINCT_EXISTS,
 								 (cx->rangevar == NULL) ?
@@ -5475,10 +6045,16 @@ lion_count_path_price_runs(LionCountPathBuild *cx, CustomPath *cpath,
 	LionRangeCost runs = {0};	/* a parallel count's, over the runs */
 	int			r;
 
+	if (cx->nruncost < cx->nfilter + 1)
+	{
+		cx->runcost = (Cost *) palloc0(sizeof(Cost) * (cx->nfilter + 1));
+		cx->nruncost = cx->nfilter + 1;
+	}
 	if (cx->nfilter == 0)
 	{
 		lion_count_path_price(cx, cpath, targets, rangeprice, walksave,
 							  false);
+		cx->runcost[0] = cpath->path.total_cost;
 		return;
 	}
 	for (r = 0; r <= cx->nfilter; r++)
@@ -5487,6 +6063,7 @@ lion_count_path_price_runs(LionCountPathBuild *cx, CustomPath *cpath,
 							  lion_count_run_targets(cx, targets, r),
 							  rangeprice, walksave,
 							  lion_count_run_plain(cx, r));
+		cx->runcost[r] = cpath->path.total_cost;
 		startup += cpath->path.startup_cost;
 		total += cpath->path.total_cost;
 		runs.countrange += rangeprice->countrange;
@@ -5517,12 +6094,16 @@ lion_cost_slice_rel(LionCountPathBuild *cx, CustomPath *cpath,
 	List	   *idxs = cx->sidx;
 	List	   *cols = cx->scols;
 	Cost		rangecollect = 0.0;
+	double	   *whererows;
+	int		   *runs;
+	bool	   *runcounted = NULL;
+	bool		filtered = false;
+	int			ncol;
+	int			i;
 
 	/* a partition's own indexes, found for it (lion_count_path_slice_parts()) */
 	if (cx->partitioned)
 	{
-		int			i;
-
 		idxs = NIL;
 		cols = NIL;
 		for (i = 0; i < list_length(cx->sattnos); i++)
@@ -5553,14 +6134,57 @@ lion_cost_slice_rel(LionCountPathBuild *cx, CustomPath *cpath,
 											  &evicts);
 		list_free(bounds);
 	}
-	lion_cost_slice_path(root, cpath, rel, idxs, cols, cx->swants, rel->rows,
+	/*
+	 * Each column's rows: the WHERE's, and a filter's run's those of the
+	 * filter's condition among them (§52, "Filtered aggregates").
+	 */
+	ncol = list_length(cx->sattnos);
+	whererows = (double *) palloc(sizeof(double) * ncol);
+	runs = (int *) palloc(sizeof(int) * ncol);
+	for (i = 0; i < ncol; i++)
+	{
+		runs[i] = list_nth_int(cx->sruns, i);
+		whererows[i] = rel->rows;
+		if (runs[i] > 0)
+		{
+			whererows[i] *=
+				clauselist_selectivity(root,
+									   make_ands_implicit((Expr *)
+														  list_nth(cx->filterexprs,
+																   runs[i] - 1)),
+									   0, JOIN_INNER, NULL);
+			filtered = true;
+		}
+	}
+
+	/*
+	 * ... and with a filter's run among them, each run's own count
+	 * (lion_count_path_price_runs()) and whether the target list takes it:
+	 * a run that only the slices' aggregates are counted in is collected for
+	 * them, not counted (lion_run_counted()).
+	 */
+	if (filtered)
+	{
+		Assert(cx->nruncost >= cx->nfilter + 1);
+		runcounted = (bool *) palloc(sizeof(bool) * (cx->nfilter + 1));
+		for (i = 0; i <= cx->nfilter; i++)
+			runcounted[i] = (i == 0) ? cx->rowcounts :
+				bms_is_member(i, cx->fcountruns);
+	}
+	lion_cost_slice_path(root, cpath, rel, idxs, cols, cx->swants, whererows,
+						 runs, filtered ? cx->runcost : NULL, runcounted,
+						 cx->nfilter + 1,
 						 cx->nwhere > 0 ||
 						 cx->input_rel->baserestrictinfo != NIL,
-						 cx->wcounts || cx->nfilter > 0 || cx->ngroup > 0,
+						 cx->wcounts || cx->ngroup > 0,
 						 (cx->ngroup > 0) ? cx->numgroups : 0.0,
 						 cx->slicedecode ?
 						 lion_count_groups_batch_est(t->driveidx[0]) : 0,
 						 rangecollect);
+	pfree(whererows);
+	pfree(runs);
+	if (runcounted != NULL)
+		pfree(runcounted);
 	if (cx->partitioned)
 	{
 		list_free(idxs);
@@ -5630,7 +6254,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 		}
 		cpath->path.startup_cost = startup;
 		cpath->path.total_cost = total;
-		cpath->path.rows = 1.0;
+		/* the one row, or every partition's groups' partial rows */
+		cpath->path.rows = (cx->ngroup > 0) ? cx->outrows : 1.0;
 	}
 
 	/*
@@ -5747,6 +6372,17 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	rangeprice.perrange = lion_units_price(&units, rangeprice.perrange);
 	rangeprice.countrange = lion_units_price(&units, rangeprice.countrange);
 	rangeprice.whole = lion_units_price(&units, rangeprice.whole);
+
+	/*
+	 * The top k's fallback (DESIGN.md §36): every group counted, at the
+	 * price of the path that walk is, as often as it is expected - before
+	 * the first row, like the rest of the top k's price.
+	 */
+	if (cx->topkn > 0 && cx->topkwholecost > 0.0)
+	{
+		cpath->path.total_cost += cx->topkwhole * cx->topkwholecost;
+		cpath->path.startup_cost += cx->topkwhole * cx->topkwholecost;
+	}
 	serialrun = cpath->path.total_cost;
 
 	/* the anti join over a small inner side (DESIGN.md §27) */
@@ -5829,7 +6465,7 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 								 root->processed_groupClause,
 								 cx->having,
 								 &agg_final_costs,
-								 cx->numgroups));
+								 cx->finalgroups));
 		return;
 	}
 
@@ -5842,11 +6478,14 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	 * source that is positive whatever its value, and no range taken as one -
 	 * and partial counts core can add up.  A GROUP BY coalesce(col, c) is
 	 * one too: its two entries go up as partial rows of c, which the Agg
-	 * adds together.  Before the serial path is added, which may free it.
+	 * adds together.  Groups tested for a visible row are offered it by
+	 * their counted twin (lion_try_count_path_once()).  Before the serial
+	 * path is added, which may free it.
 	 */
 	if (cx->ngroup == 1 && !cx->sumall && !cx->singlegroup &&
 		cx->nfilter == 0 && cx->anti == NULL && cx->sattnos == NIL &&
 		cx->distvar == NULL && cx->rangevar == NULL && !cx->hasrangesrc &&
+		!lion_count_path_tests(cx) &&
 		cx->plainpositive && rangeprice.batched && cx->topkn == 0 &&
 		cx->groupdeps == NIL && cx->ncompl == 0 && cx->residual == NIL &&
 		first->driveidx[0] != NULL &&
@@ -5886,6 +6525,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 									 serialrun, &rangeprice, cx->having,
 									 antichild, antirun);
 
+	/* read before add_path(), which may free the path */
+	cx->addedcost = cpath->path.total_cost;
 	add_path(output_rel, &cpath->path);
 }
 
@@ -6454,13 +7095,15 @@ lion_try_count_cells(const LionCountPathBuild *cxp)
  * not a coalesce group, not the top k, and not where a WHERE clause names the
  * grouping column - an IN list or an equality there drives the groups by its
  * values, one at a time (§15) - and not on a hot standby, where the slices
- * cannot be read without their pins.
+ * cannot be read without their pins.  One table's groups of one run: a
+ * filter's run's, or a partition's, are counted a group at a time.
  */
 static bool
 lion_count_path_slices_decodable(LionCountPathBuild *cx)
 {
 	return lion_enable_slice_decode &&
 		cx->slicemode && cx->sattnos != NIL && cx->ngroup == 1 &&
+		cx->nfilter == 0 && !cx->partitioned &&
 		!cx->decode && cx->groupcoal == NULL && cx->topkn == 0 &&
 		cx->groupattno[0] > 0 &&
 		!list_member_int(cx->whereattnos, cx->groupattno[0]) &&
@@ -6471,12 +7114,12 @@ lion_count_path_slices_decodable(LionCountPathBuild *cx)
 /*
  * May a GROUP BY of two columns, made the nested loop of DESIGN.md §20, be
  * the decoded walk of §34 as well?  On the terms of three columns
- * (lion_count_path_group_by(), lion_count_path_strategy()): one table, not a
- * partitioned one, partial counts core can add up, no count(DISTINCT) or
- * coalesce group, nothing the heap scan of a WHERE that narrows nothing does
- * not test (lion_where_scan_untested()), and not on a hot standby.  A range
- * in the WHERE is a source already, as every range beside two grouping
- * columns is.
+ * (lion_count_path_group_by(), lion_count_path_strategy()): one table or
+ * each partition of one in its turn, partial counts core can add up, no
+ * count(DISTINCT) or coalesce group, nothing the heap scan of a WHERE that
+ * narrows nothing does not test (lion_where_scan_untested()), and not on a
+ * hot standby.  A range in the WHERE is a source already, as every range
+ * beside two grouping columns is.
  */
 static bool
 lion_count_path_decodable(LionCountPathBuild *cx)
@@ -6485,7 +7128,7 @@ lion_count_path_decodable(LionCountPathBuild *cx)
 		cx->ngroup == 2 && !cx->decode && cx->fj == NULL &&
 		cx->sattnos == NIL &&
 		cx->anti == NULL &&
-		!cx->partitioned && cx->distvar == NULL && cx->groupcoal == NULL &&
+		cx->distvar == NULL && cx->groupcoal == NULL &&
 		cx->groupdeps == NIL && !cx->sumall && !cx->singlegroup &&
 		cx->ncompl == 0 && cx->residual == NIL &&
 		!lion_where_scan_untested(cx, true) &&
@@ -6708,6 +7351,8 @@ lion_try_count_path_once(LionCountPathBuild *cx)
 		return false;
 	if (!lion_count_path_outputs(cx))
 		return false;
+	if (!lion_count_path_derived_ok(cx))
+		return false;
 	if (!lion_count_path_strategy(cx))
 		return false;
 	if (!lion_count_path_filters(cx))
@@ -6729,11 +7374,52 @@ lion_try_count_path_once(LionCountPathBuild *cx)
 
 	lion_count_path_estimate(cx);
 	lion_count_path_topk(cx);
+
+	/*
+	 * A top k whose candidates may not be enough counts every group instead
+	 * (DESIGN.md §36, "The fallback"): that walk is the plain GROUP BY's,
+	 * made a path of its own, and the top k's price adds its price as often
+	 * as the fallback is expected.  add_path() keeps the cheaper.
+	 */
+	cx->topkwholecost = 0.0;
+	if (cx->topkn > 0 && cx->topkwhole > 0.0)
+	{
+		int64		topkn = cx->topkn;
+
+		cx->topkn = 0;
+		lion_count_path_fill(cx);
+		if (lion_count_path_anti(cx))
+		{
+			cx->addedcost = 0.0;
+			cpath = lion_count_path_make(cx);
+			lion_count_path_add(cx, cpath);
+			cx->topkwholecost = cx->addedcost;
+		}
+		cx->topkn = topkn;
+	}
 	lion_count_path_fill(cx);
 	if (!lion_count_path_anti(cx))
 		return false;
 	cpath = lion_count_path_make(cx);
 	lion_count_path_add(cx, cpath);
+
+	/*
+	 * Groups nothing counts are tested for a visible row (DESIGN.md §10,
+	 * "Groups nothing counts") - and counted too, which may collect the WHERE
+	 * and count the groups of a walk together, or divide them among the
+	 * participants of a Gather: both are priced, and add_path() keeps the
+	 * cheaper.
+	 */
+	if (lion_count_path_tests(cx))
+	{
+		/* no anti join here: lion_count_path_fill() would drop its part */
+		Assert(cx->anti == NULL);
+		cx->groupsexist = false;
+		lion_count_path_fill(cx);
+		cpath = lion_count_path_make(cx);
+		lion_count_path_add(cx, cpath);
+		cx->groupsexist = true;
+	}
 
 	/*
 	 * The aggregates of sliced columns of a GROUP BY of one column are counted
@@ -6782,9 +7468,6 @@ lion_query_has_slice_aggs(const LionCountPathBuild *cx)
 	if (!lion_enable_count_slices || cx->fj != NULL ||
 		cx->anti != NULL || cx->distinctstage || RecoveryInProgress())
 		return false;
-	/* a partitioned table's with no GROUP BY (§52.13) */
-	if (cx->partitioned && cx->parse->groupClause != NIL)
-		return false;
 	exprs = pull_var_clause((Node *) cx->output_rel->reltarget->exprs,
 							PVC_INCLUDE_AGGREGATES | PVC_RECURSE_WINDOWFUNCS |
 							PVC_INCLUDE_PLACEHOLDERS);
@@ -6801,10 +7484,11 @@ lion_query_has_slice_aggs(const LionCountPathBuild *cx)
 		AttrNumber	col;
 		Oid			argtype;
 		Oid			typid;
+		Node	   *filter;
 
 		if (IsA(n, Aggref) &&
 			lion_sagg_classify((Aggref *) n, cx->rti, &attno,
-							   &argtype) != LION_SAGG_NONE &&
+							   &argtype, &filter) != LION_SAGG_NONE &&
 			lion_count_sliced_index(cx, attno, &col, &typid) != NULL)
 			return true;
 	}
@@ -6812,10 +7496,45 @@ lion_query_has_slice_aggs(const LionCountPathBuild *cx)
 }
 
 /*
+ * Has the query an aggregate with a FILTER, whose condition may hold a range
+ * a build answers from slices (DESIGN.md §53) with no WHERE at all?
+ */
+static bool
+lion_query_has_agg_filter(const LionCountPathBuild *cx)
+{
+	List	   *exprs;
+	ListCell   *lc;
+	bool		found = false;
+
+	exprs = pull_var_clause((Node *) cx->output_rel->reltarget->exprs,
+							PVC_INCLUDE_AGGREGATES | PVC_RECURSE_WINDOWFUNCS |
+							PVC_INCLUDE_PLACEHOLDERS);
+	if (cx->having != NIL)
+		exprs = list_concat(exprs,
+							pull_var_clause((Node *) cx->having,
+											PVC_INCLUDE_AGGREGATES |
+											PVC_RECURSE_WINDOWFUNCS |
+											PVC_INCLUDE_PLACEHOLDERS));
+	foreach(lc, exprs)
+	{
+		Node	   *n = (Node *) lfirst(lc);
+
+		if (IsA(n, Aggref) && ((Aggref *) n)->aggfilter != NULL)
+		{
+			found = true;
+			break;
+		}
+	}
+	list_free(exprs);
+	return found;
+}
+
+/*
  * May a build answer ranges from slices (DESIGN.md §53)?  A table with a lion
- * index that slices a column - the WHERE is not analysed yet, and the build
- * declines itself where no range is one the slices answer - counted on its
- * own: no FK-side or anti join, outside a partial index's scope, not on a hot
+ * index that slices a column - the WHERE and the filters are not analysed
+ * yet, and the build declines itself where no range is one the slices
+ * answer - with a WHERE or an aggregate's FILTER, counted on its own: no
+ * FK-side or anti join, outside a partial index's scope, not on a hot
  * standby, where nothing is collected (§10).  A partitioned table asks its
  * first live leaf, and every partition its own once they are known
  * (lion_count_path_slice_range_parts()); not inside a partial index's scope
@@ -6828,7 +7547,8 @@ lion_query_may_slice_ranges(const LionCountPathBuild *cx)
 
 	if (!lion_enable_slice_ranges || cx->fj != NULL ||
 		cx->anti != NULL || cx->distinctstage || RecoveryInProgress() ||
-		cx->input_rel->baserestrictinfo == NIL ||
+		(cx->input_rel->baserestrictinfo == NIL &&
+		 !lion_query_has_agg_filter(cx)) ||
 		lion_partial_index_of(cx->input_rel) != NULL)
 		return false;
 	if (cx->partitioned)

@@ -21,12 +21,11 @@
  * The all-visible bits of the LION_BLOCKS_PER_CONTAINER consecutive heap blocks
  * a container covers, as one mask: bit i is set iff heap block firstblk + i is
  * marked all-visible.  Only the bits of `wanted` are answered for - the caller
- * never looks at the others, and skipping them is what keeps a one-member
- * container to a single map byte.  *vmbuf is the caller's visibility map pin;
- * it is moved
- * to whatever map page is needed and left pinned for the next call, exactly as
- * visibilitymap_get_status() leaves it - and each move adds one to *pins, when
- * pins is not NULL (EXPLAIN ANALYZE's "Visibility Map Pages Pinned").
+ * never looks at the others.  *vm is the caller's set of visibility map pins
+ * (lion_vm.h): the map page needed is pinned in its slot, if it is not
+ * already, and left pinned for the next call, as visibilitymap_get_status()
+ * leaves its one pin - and each pin taken adds one to *pins, when pins is not
+ * NULL (EXPLAIN ANALYZE's "Visibility Map Pages Pinned").
  *
  * This is visibilitymap_get_status() for a whole container at once.  It exists
  * because asking a block at a time costs a buffer-manager lookup per heap block
@@ -48,8 +47,12 @@
  * argument, spelled out in that same comment), and a bit cannot become set
  * behind our back because the caller still pins the index page the container
  * was read from, which is what stops VACUUM finishing ambulkdelete().  Reading
- * sixteen adjacent bytes instead of one changes none of that: each byte is
- * still an independent unlocked read of the same page.
+ * sixteen adjacent bytes instead of one, or reading them as two words, changes
+ * none of that: each byte is still an independent unlocked read of the same
+ * page, made after the containers were copied, as the one byte would be.  So
+ * does keeping several map pages pinned instead of one: the bytes are read
+ * off the pinned page when the container is counted, never remembered from an
+ * earlier read.
  *
  * The map fork is never extended.  visibilitymap_pin() would extend it - it
  * calls vm_readbuf() with extend = true, which writes - and a count has no
@@ -59,14 +62,25 @@
  * that a container's range may include: they have no members, so nothing the
  * mask says about them is ever read.
  *
- * The work is split in three so that what the compiler sees at the call site is
- * the case that happens.  This runs once per container - tens of thousands of
+ * The work is split so that what the compiler sees at the call site is the
+ * case that happens.  This runs once per container - tens of thousands of
  * times for one IN list - and all but one container in five hundred is answered
  * by reading a run of bytes off ONE map page; the loop that used to be here
  * spelled out the two-page case inline, and whether gcc inlined the whole thing
  * or none of it moved this query by a third in an -O1 build, in whichever
  * direction an unrelated edit to the file happened to push it.  Now the common
  * path is small and always inlined, and the straddling case is out of line.
+ *
+ * The common path reads its run - sixteen bytes at 8 kB pages - as two 64-bit
+ * words and squeezes each word's all-visible bits together in five steps
+ * (lion_vm_allvisible_bytes()), where it used to read only the bytes with a
+ * wanted block, one at a time, three steps for every four blocks.  A byte at
+ * a time was some 40% of an unfiltered GROUP BY over 200 values, whose every
+ * container has members on all sixty-four blocks; a word at a time took that
+ * query from 24 to 17 ms.  A one-member container, which used to read one
+ * byte, now reads two words: no slower, measured on a range over ten thousand
+ * keys of a million-value column, all sparse segments.  Only the straddling
+ * container still reads bytes, each half's on its own page.
  */
 
 
@@ -85,14 +99,18 @@
 /*
  * The comparison below on the blocks of ONE map page, with that page SHARE
  * locked.  `seg` are the wanted bits, shifted so that bit 0 is block blk.
+ * `whole` says the blocks are a whole container's, which the mask read as a
+ * run of words (lion_vm_allvisible_bytes()); a half of a straddling container
+ * was read a byte at a time.  Each is checked as it was read.
  */
 static void
-lion_vm_mask_check_page(Relation heap, BlockNumber blk, uint64 seg)
+lion_vm_mask_check_page(Relation heap, BlockNumber blk, uint64 seg, bool whole)
 {
 	Buffer		vmbuf = InvalidBuffer;
 	uint64		expect = 0;
 	uint64		got;
 	uint64		m = seg;
+	const char *map;
 
 	if (seg == 0)
 		return;
@@ -103,7 +121,12 @@ lion_vm_mask_check_page(Relation heap, BlockNumber blk, uint64 seg)
 		return;					/* the fork does not reach it: nothing set */
 
 	LockBuffer(vmbuf, BUFFER_LOCK_SHARE);
-	got = lion_vm_allvisible_page(heap, blk, seg, 0, &vmbuf, NULL);
+	map = PageGetContents(BufferGetPage(vmbuf));
+	if (whole)
+		got = lion_vm_allvisible_bytes(map + LION_VM_HEAPBLK_TO_MAPBYTE(blk),
+									   LION_VM_CONTAINER_BYTES);
+	else
+		got = lion_vm_allvisible_page_bytes(map, blk, seg, 0);
 	while (m != 0)
 	{
 		int			b = pg_rightmost_one_pos64(m);
@@ -140,7 +163,7 @@ lion_vm_mask_check_page(Relation heap, BlockNumber blk, uint64 seg)
  */
 void
 lion_vm_mask_check(Relation heap, BlockNumber firstblk, uint64 members,
-				  uint64 allvis, Buffer *vmbuf)
+				   uint64 allvis, LionVmPins *vm)
 {
 	uint64		expect = 0;
 	uint64		m = members;
@@ -149,9 +172,10 @@ lion_vm_mask_check(Relation heap, BlockNumber firstblk, uint64 members,
 	while (m != 0)
 	{
 		int			b = pg_rightmost_one_pos64(m);
+		BlockNumber blk = firstblk + (BlockNumber) b;
 
 		m &= m - 1;
-		if ((visibilitymap_get_status(heap, firstblk + (BlockNumber) b, vmbuf) &
+		if ((visibilitymap_get_status(heap, blk, lion_vm_pins_slot(vm, blk)) &
 			 VISIBILITYMAP_ALL_VISIBLE) != 0)
 			expect |= UINT64CONST(1) << b;
 	}
@@ -163,13 +187,13 @@ lion_vm_mask_check(Relation heap, BlockNumber firstblk, uint64 members,
 	n = (int) (LION_VM_HEAPBLOCKS_PER_PAGE -
 			   (firstblk % LION_VM_HEAPBLOCKS_PER_PAGE));
 	if (n >= LION_BLOCKS_PER_CONTAINER)
-		lion_vm_mask_check_page(heap, firstblk, members);
+		lion_vm_mask_check_page(heap, firstblk, members, true);
 	else
 	{
 		lion_vm_mask_check_page(heap, firstblk,
-								members & ((UINT64CONST(1) << n) - 1));
+								members & ((UINT64CONST(1) << n) - 1), false);
 		lion_vm_mask_check_page(heap, firstblk + (BlockNumber) n,
-								members >> n);
+								members >> n, false);
 	}
 }
 #endif
@@ -213,7 +237,7 @@ lion_vis_cache_create(MemoryContext parent)
 	cache->parent = parent;
 	cache->scratch = NULL;
 	cache->scratchbusy = false;
-	cache->vmbuf = InvalidBuffer;
+	lion_vm_pins_init(&cache->vm);
 	cache->vmrelid = InvalidOid;
 	cache->windowed = false;
 	cache->winlo = 0;
@@ -222,17 +246,61 @@ lion_vis_cache_create(MemoryContext parent)
 }
 
 /*
- * Let go of the visibility-map page the counts kept pinned from one to the
- * next (LionVisCache.vmbuf): when the node is done with the relation.
+ * Let go of the visibility-map pages the counts kept pinned from one to the
+ * next (LionVisCache.vm): when the node is done with the relation.
  */
 void
 lion_vis_cache_release_vm(LionVisCache *cache)
 {
-	if (cache == NULL || !BufferIsValid(cache->vmbuf))
+	if (cache == NULL)
 		return;
-	ReleaseBuffer(cache->vmbuf);
-	cache->vmbuf = InvalidBuffer;
+	lion_vm_pins_release(&cache->vm);
 	cache->vmrelid = InvalidOid;
+}
+
+/*
+ * A count of heap starts from the map pages the last count of the node left
+ * pinned (LionVisCache.vm): the map of a large heap is a few pages, and every
+ * count of the node asks the same ones, so a count takes the pins over rather
+ * than pinning the pages again - a buffer lookup and two atomic operations on
+ * a buffer header that every participant of a parallel plan shares.  *vm is
+ * the count's own set, empty or not yet set up; pins of another relation's
+ * map are let go.
+ */
+void
+lion_vis_cache_take_vm(LionVisCache *cache, Relation heap, LionVmPins *vm)
+{
+	if (cache != NULL && lion_vm_pins_held(&cache->vm) &&
+		cache->vmrelid == RelationGetRelid(heap))
+	{
+		*vm = cache->vm;
+		lion_vm_pins_clear(&cache->vm);
+		cache->vmrelid = InvalidOid;
+		return;
+	}
+	lion_vm_pins_init(vm);
+	if (cache != NULL)
+		lion_vis_cache_release_vm(cache);
+}
+
+/*
+ * The count is over: its map pages stay pinned for the next count, when
+ * there is a cache to keep them in and nothing kept there since (which no
+ * count does), or are let go.  *vm is empty afterwards.
+ */
+void
+lion_vis_cache_keep_vm(LionVisCache *cache, Relation heap, LionVmPins *vm)
+{
+	if (!lion_vm_pins_held(vm))
+		return;
+	if (cache != NULL && !lion_vm_pins_held(&cache->vm))
+	{
+		cache->vm = *vm;
+		cache->vmrelid = RelationGetRelid(heap);
+		lion_vm_pins_clear(vm);
+	}
+	else
+		lion_vm_pins_release(vm);
 }
 
 void
@@ -505,11 +573,21 @@ lion_vis_fill_page(LionCountCtx *cx, Buffer buf, BlockNumber blkno,
 		maxoff = (OffsetNumber) MaxHeapTuplesPerPage;	/* cannot happen */
 
 	memset(e->vis, 0, sizeof(e->vis));
+
+	/*
+	 * Every line pointer's tuple header is read, so each is asked for
+	 * LION_RECHECK_PREFETCH ahead of its turn (lion_prefetch_heap_tuple()).
+	 */
+	for (off = FirstOffsetNumber;
+		 off <= maxoff && off < FirstOffsetNumber + LION_RECHECK_PREFETCH;
+		 off = OffsetNumberNext(off))
+		lion_prefetch_heap_tuple(page, maxoff, off);
 	for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
 	{
 		ItemPointerData tid;
 		HeapTupleData heapTuple;
 
+		lion_prefetch_heap_tuple(page, maxoff, off + LION_RECHECK_PREFETCH);
 		ItemPointerSet(&tid, blkno, off);
 
 		/*

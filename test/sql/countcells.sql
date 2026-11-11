@@ -20,6 +20,9 @@ RESET client_min_messages;
 -- VACUUM can only set all-visible once the commit record is on disk
 SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
+-- Cells only: a GROUP BY of expressions of one or two columns is otherwise
+-- the columns' own groups, merged (DESIGN.md §36), where that is cheaper.
+SET pg_lion.enable_expr_groups = off;
 
 -- EXPLAIN in a form every supported release prints the same way (the
 -- definition test/sql/citext.sql uses: 18's "Disabled: true" lines dropped,

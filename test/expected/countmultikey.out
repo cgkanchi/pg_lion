@@ -24,6 +24,9 @@ SET synchronous_commit = on;
 -- own Agg, and no enable_*join setting disables it: it is off here, and tested
 -- - the upper node over it included - in fkjoin_semipath.sql.
 SET pg_lion.enable_semijoin = off;
+-- The GROUP BYs of predicates below are the counts by cells', which the
+-- columns' own groups merged (DESIGN.md §36) would otherwise count.
+SET pg_lion.enable_expr_groups = off;
 SET max_parallel_workers_per_gather = 0;
 /*
  * lion_mk() runs a query with every other scan and join method disabled, so

@@ -1131,7 +1131,7 @@ lion_slice_range_collect(Relation index, AttrNumber attno,
 	scur = (LionSetCursor *) palloc0(sizeof(LionSetCursor) * nbits);
 	memset(&scx, 0, sizeof(scx));
 	scx.cxt = cxt;
-	scx.vmbuf = InvalidBuffer;
+	lion_vm_pins_init(&scx.vm);
 	scx.droppins = true;
 
 	/* E, and each bit's slice: a bit no row has is a set not found */

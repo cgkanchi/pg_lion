@@ -27,7 +27,7 @@
  *	- planner_hook, refusing with an error, while lion_hooktest.refuse_lateral
  *	  is on, a query with a LATERAL subquery in its FROM list, as a planner
  *	  extension that does not take one would: pg_lion's planner hook plans a
- *	  query again as rewritten with such a subquery (DESIGN.md §55), which
+ *	  query again as rewritten with such a subquery (DESIGN.md §56), which
  *	  must not fail a statement whose own plan does not have one
  *	  (sql/hooks_lion_outer.sql).
  *

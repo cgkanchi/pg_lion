@@ -1981,6 +1981,26 @@ lion_entry_scan_batch_left(const LionEntryScan *es)
 }
 
 /*
+ * How many entries of that leaf lion_entry_scan_next() must still hand out
+ * before a pause (lion_entry_scan_pause()) has nothing to let go of: up to
+ * and including the batch's last INLINE copy, whose pin the scan keeps until
+ * then.  0 when no INLINE copy is still to come, and the pause then keeps
+ * the batch.  A caller that hands out that many first, and releases their
+ * sets, reads the leaf once however many rows it returns from it (DESIGN.md
+ * §28, "A walk that returns rows").  Not for a walk whose sets share the
+ * scan's pin (lion_entry_scan_share_pin()), which keeps it to the next leaf.
+ */
+static inline int
+lion_entry_scan_pinned_left(const LionEntryScan *es)
+{
+	Assert(!es->sharepin);
+	if (es->batchbuf == InvalidBuffer)
+		return 0;
+	Assert(es->lastinline >= es->nextbatch && es->lastinline < es->nbatch);
+	return es->lastinline - es->nextbatch + 1;
+}
+
+/*
  * The caller is about to hand a row to the executor and may not come back
  * for as long as a cursor stays open.  A walk must not keep a directory leaf
  * pinned across that (VACUUM would wait for it), so the INLINE copies still
@@ -2005,11 +2025,13 @@ extern Oid	lion_get_am_oid(void);
 /*
  * EXECUTE on a function, or on an aggregate and its support functions, that
  * the query a count stands for would call - the checks ExecInitFunc() and
- * ExecInitAgg() make, with the same errors and the object-access hook.  Made
- * when the count starts, never at plan time (DESIGN.md §9, "Privileges").
+ * ExecInitAgg() (or ExecInitWindowAgg()) make, with the same errors and the
+ * object-access hook.  Made when the count starts, never at plan time
+ * (DESIGN.md §9, "Privileges").
  */
 extern void lion_check_execute(Oid funcid);
 extern void lion_check_aggregate_execute(Oid aggfnoid);
+extern void lion_check_window_execute(Oid winfnoid);
 
 /* ---------------------------------------------------------------------
  * the LionCount custom scan, lion_plan_*.c and lion_exec_*.c (DESIGN.md
@@ -2041,6 +2063,13 @@ extern PGDLLIMPORT bool lion_enable_decoded_walk;
  */
 extern PGDLLIMPORT bool lion_enable_count_cells;
 extern PGDLLIMPORT int lion_count_cells_max;
+
+/*
+ * Whether a GROUP BY of expressions of lion-indexed columns it does not name
+ * may be counted by those columns' groups and merged (DESIGN.md §36,
+ * "Expressions of columns not grouped").  A planner switch.
+ */
+extern PGDLLIMPORT bool lion_enable_expr_groups;
 
 /*
  * Whether the count pushdown may test WHERE clauses no posting set answers
@@ -2092,6 +2121,7 @@ extern PGDLLIMPORT set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook;
  * small inner side"): pg_lion.enable_count_anti.
  */
 extern PGDLLIMPORT bool lion_enable_count_anti;
+extern PGDLLIMPORT bool lion_enable_window_count;
 
 /*
  * Whether a GROUP BY over a join of a table to a dimension by its primary key
@@ -2226,7 +2256,7 @@ extern void lion_ordjoin_init(void);
 /* get_relation_stats_hook; called from _PG_init. */
 extern void lion_selfuncs_init(void);
 
-/* lion_plan_lateral.c: a grouped subquery joined in, tried as LATERAL (§55) */
+/* lion_plan_lateral.c: a grouped subquery joined in, tried as LATERAL (§56) */
 extern PGDLLIMPORT bool lion_enable_lateral_counts;
 extern void lion_lateral_init(void);
 
@@ -2239,6 +2269,21 @@ extern void lion_lateral_init(void);
 extern double lion_key_containers_counted(PlannerInfo *root, RelOptInfo *rel,
 										  IndexOptInfo *idx, AttrNumber col,
 										  double *keyrows);
+
+/*
+ * The keys outside column var's MCV list, as a lion index on the column
+ * counted them (DESIGN.md §33, "The rows of a probed key"): how many, their
+ * rows on average, and the spread of those.  False where none did.
+ */
+typedef struct LionKeyTail
+{
+	double		nkeys;
+	double		mean;
+	double		sd;
+} LionKeyTail;
+
+extern bool lion_key_tail_counted(PlannerInfo *root, RelOptInfo *rel,
+								  Var *var, LionKeyTail *tail);
 
 /*
  * While lion prices one of its own accesses to rel, a range among `clauses`

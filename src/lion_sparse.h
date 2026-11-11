@@ -349,6 +349,70 @@ extern Size lion_sparse_insert_size(const LionContainer *s, uint32 ckey,
 									uint16 lo);
 
 /*
+ * Everything an insert of (ckey, lo) asks of a segment, from ONE decode of
+ * its stream (lion_insert.c): whether the pair is there (contains()), how
+ * many pairs its ckey has (count()), the segment's last ckey
+ * (lion_sparse_last_ckey()), the size the segment would have with the pair
+ * in (insert_size()), and where in the stream it goes, which
+ * lion_sparse_insert_probed() then uses without decoding again.
+ *
+ * A probe describes the bytes it was taken of: insert_probed() may be called
+ * with it on those bytes or on an identical copy of them (a page item copied
+ * into a work buffer, or the page image a WAL record registers), and on
+ * nothing else.  Assert-enabled builds probe again there and compare.
+ */
+typedef struct LionSparseProbe
+{
+	uint64		code;			/* the pair probed */
+	uint64		prev;			/* code before the insertion point, unless front */
+	uint64		next;			/* code at the insertion point, when len > 0 */
+	uint32		npairs;			/* pairs the stream decodes to */
+	uint32		end;			/* stream bytes they take */
+	uint32		off;			/* offset of the varint at the insertion point */
+	uint32		len;			/* its length; 0 when the point is the end */
+	uint32		newbytes;		/* stream bytes with the pair inserted */
+	uint32		last_ckey;		/* the segment's last ckey */
+	uint32		ckey_pairs;		/* pairs of the probed pair's ckey */
+	bool		front;			/* the point is the first pair (or s is empty) */
+	bool		found;			/* the pair is there already */
+} LionSparseProbe;
+
+extern void lion_sparse_probe(const LionContainer *s, uint32 ckey, uint16 lo,
+							  LionSparseProbe *pr);
+
+/* Does the probed pair, which is not there yet, fit (insert_size() != 0)? */
+static inline bool
+lion_sparse_probe_fits(const LionSparseProbe *pr)
+{
+	return pr->newbytes <= LION_SPARSE_MAX_BYTES &&
+		pr->npairs + 1 <= LION_SPARSE_MAX_PAIRS;
+}
+
+/* lion_sparse_insert_size() of the probed pair, for the segment probed. */
+static inline Size
+lion_sparse_probe_insert_size(const LionContainer *s, const LionSparseProbe *pr)
+{
+	if (pr->found)
+		return lion_sparse_size(s);
+	if (!lion_sparse_probe_fits(pr))
+		return 0;
+	return lion_sparse_size_for(pr->newbytes);
+}
+
+/* Does the probed segment cover the probed pair's ckey (lion_item_covers())? */
+static inline bool
+lion_sparse_probe_covers(const LionContainer *s, const LionSparseProbe *pr)
+{
+	uint32		ckey = lion_code_ckey(pr->code);
+
+	return ckey >= s->ckey && ckey <= pr->last_ckey;
+}
+
+/* lion_sparse_insert() of the probed pair, with the probe of s. */
+extern bool lion_sparse_insert_probed(LionContainer *s,
+									  const LionSparseProbe *pr, bool *dup);
+
+/*
  * Insert one pair in sorted position.  Returns false and changes nothing if
  * it does not fit (lion_sparse_insert_size() is 0); returns true with *dup
  * set (and nothing changed) when the pair is already there.  dup may be

@@ -21,6 +21,7 @@ bool		lion_enable_filter_switch = true;
 bool		lion_enable_decoded_walk = true;
 bool		lion_enable_count_cells = true;
 int			lion_count_cells_max = 134217728;
+bool		lion_enable_expr_groups = true;
 bool		lion_enable_topk = true;
 bool		lion_enable_count_slices = true;
 bool		lion_enable_slice_decode = true;
@@ -134,6 +135,40 @@ lion_try_small_anti(PlannerInfo *root, RelOptInfo *joinrel,
 	PG_END_TRY();
 }
 
+/*
+ * count(*) OVER () beside the rows of one base relation (DESIGN.md §10, "A
+ * count of every row beside the rows"), its count priced against the
+ * window's cheapest core path and with the ends the directory holds, as a
+ * GROUP BY's is below.
+ */
+static void
+lion_try_window_upper(PlannerInfo *root, RelOptInfo *input_rel,
+					  RelOptInfo *window_rel)
+{
+	if (!lion_enable_count_pushdown || !lion_enable_window_count ||
+		input_rel->reloptkind != RELOPT_BASEREL ||
+		lion_old_snapshot_threshold_active())
+		return;
+
+	lion_units_pin(root, window_rel);
+	if (!lion_probe_begin(root, input_rel, input_rel->baserestrictinfo))
+	{
+		lion_try_window_count_path(root, input_rel, window_rel);
+		lion_units_unpin();
+		return;
+	}
+	PG_TRY();
+	{
+		lion_try_window_count_path(root, input_rel, window_rel);
+	}
+	PG_FINALLY();
+	{
+		lion_probe_end();
+	}
+	PG_END_TRY();
+	lion_units_unpin();
+}
+
 void
 lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 					   RelOptInfo *input_rel, RelOptInfo *output_rel,
@@ -145,6 +180,12 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 
 	/* a competitor pinned by a hook an error left (§39) is never read */
 	lion_units_unpin();
+
+	if (stage == UPPERREL_WINDOW)
+	{
+		lion_try_window_upper(root, input_rel, output_rel);
+		return;
+	}
 
 	if (stage != UPPERREL_GROUP_AGG && stage != UPPERREL_DISTINCT)
 		return;
@@ -500,6 +541,8 @@ lion_count_scan_register(void)
 		RegisterCustomScanMethods(&lion_semijoin_scan_methods);
 	if (GetCustomScanMethods("LionAntiJoin", true) == NULL)
 		RegisterCustomScanMethods(&lion_antijoin_scan_methods);
+	if (GetCustomScanMethods("LionWindowCount", true) == NULL)
+		RegisterCustomScanMethods(&lion_window_count_scan_methods);
 }
 
 /*
@@ -671,11 +714,13 @@ lion_wagg_add_target(Aggref *agg, LionCountPriv *priv,
 
 /*
  * An aggregate of DESIGN.md §52 in the tuple the node produces: agg of one of
- * priv's sliced columns, answered from its slices.  Appends it to *ctlist
- * with its LION_TL_SAGG kind, and what it computes to priv's aggregates - its
- * LION_SAGG_* kind and its column's position in priv's.  False for any other
- * aggregate; an aggregate already in *ctlist is done.  priv->sagg has room
- * for one more.
+ * priv's sliced columns, answered from its slices - over the WHERE's rows,
+ * or with a FILTER over its filter's run's, the run whose condition is
+ * equal() to the FILTER's (§52, "Filtered aggregates").  Appends it to
+ * *ctlist with its LION_TL_SAGG kind, and what it computes to priv's
+ * aggregates - its LION_SAGG_* kind and its column's position in priv's.
+ * False for any other aggregate; an aggregate already in *ctlist is done.
+ * priv->sagg has room for one more.
  */
 static bool
 lion_sagg_add_target(Aggref *agg, LionCountPriv *priv, List **ctlist,
@@ -683,17 +728,30 @@ lion_sagg_add_target(Aggref *agg, LionCountPriv *priv, List **ctlist,
 {
 	AttrNumber	attno;
 	Oid			argtype;
+	Node	   *filter;
 	int			skind = lion_sagg_classify(agg, priv->scanrelid, &attno,
-										   &argtype);
+										   &argtype, &filter);
 	LionCountPrivSAgg *a;
+	int			run = 0;
 	int			c;
 	ListCell   *lc;
 
 	if (skind == LION_SAGG_NONE)
 		return false;
+	if (filter != NULL)
+	{
+		foreach(lc, priv->filterexprs)
+		{
+			run++;
+			if (equal(lfirst(lc), filter))
+				break;
+		}
+		if (lc == NULL)
+			return false;		/* a filtered count's, or none */
+	}
 	for (c = 0; c < priv->nscol; c++)
 	{
-		if (priv->scol[c].attno == attno)
+		if (priv->scol[c].attno == attno && priv->scol[c].run == run)
 			break;
 	}
 	if (c == priv->nscol)

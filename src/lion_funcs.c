@@ -10,6 +10,7 @@
  */
 #include "postgres.h"
 
+#include "lion_defer.h"
 #include "lion_funcs.h"
 
 PG_FUNCTION_INFO_V1(lion_index_stats);
@@ -49,6 +50,9 @@ lion_open_index(Oid relid, LOCKMODE lockmode)
 				 errmsg("cannot access temporary index \"%s\" of another session",
 						name)));
 	}
+
+	/* rows this backend has buffered for the index go in first (§55) */
+	lion_defer_flush_index(index);
 
 	return index;
 }

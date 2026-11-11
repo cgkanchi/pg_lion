@@ -1,5 +1,5 @@
 -- A grouped subquery joined in, planned again as a LATERAL subquery
--- (DESIGN.md §55): where the rewrite is tried, that the cheaper of the two
+-- (DESIGN.md §56): where the rewrite is tried, that the cheaper of the two
 -- plans is kept, and that every answer is the same as with the rewrite off.
 \set VERBOSITY terse
 SET client_min_messages = warning;

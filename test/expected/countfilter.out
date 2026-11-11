@@ -327,9 +327,9 @@ SELECT lion_cf('SELECT count(DISTINCT c), count(*) FILTER (WHERE b = 1) FROM lio
 (1 row)
 
 SELECT lion_cf('SELECT count(DISTINCT c) FILTER (WHERE b = 1) FROM lion_cft');
-       lion_cf       
----------------------
- no pushdown, 1 rows
+     lion_cf      
+------------------
+ pushdown, 1 rows
 (1 row)
 
 -- other constants, and a CASE with a FILTER

@@ -304,19 +304,70 @@ RESET hash_mem_multiplier;
 DROP TABLE lgr;
 
 -- Not the decoded walk: a WHERE of a negated clause alone (its copy has no
--- positive clause to begin from), a grouping expression, a column no lion
--- index has, and a partitioned table.
+-- positive clause to begin from), a grouping expression and a column no lion
+-- index has.
 SELECT lgd_check('SELECT a, b, d, count(*) AS n FROM lgd WHERE c IS NOT NULL GROUP BY a, b, d');
 SELECT lgd_check('SELECT a, b, c + 1 AS c1, count(*) AS n FROM lgd GROUP BY a, b, c + 1');
 ALTER TABLE lgd ADD COLUMN h int;
 SELECT lgd_check('SELECT a, b, h, count(*) AS n FROM lgd GROUP BY a, b, h');
-CREATE TABLE lgdp (a int, b int, c int) PARTITION BY LIST (a);
+
+-- A partitioned table: each partition decoded in its turn, from its own
+-- indexes, its rows partial counts like a table's (DESIGN.md §16, "The
+-- decoded walk over partitions").  The last partition numbers its columns
+-- differently, with a dropped one, and has a lion index of its own per
+-- column.
+CREATE TABLE lgdp (a int, b int, c int, d int) PARTITION BY LIST (a);
 CREATE TABLE lgdp0 PARTITION OF lgdp FOR VALUES IN (0, 1);
 CREATE TABLE lgdp1 PARTITION OF lgdp FOR VALUES IN (2, 3);
-INSERT INTO lgdp SELECT a, b, c FROM lgd;
-CREATE INDEX ON lgdp USING lion (a, b, c);
+CREATE TABLE lgdp2 (x int, d int, c int, b int, a int);
+ALTER TABLE lgdp2 DROP COLUMN x;
+ALTER TABLE lgdp ATTACH PARTITION lgdp2 FOR VALUES IN (4, 5);
+INSERT INTO lgdp SELECT a, b, c, d FROM lgd;
+INSERT INTO lgdp SELECT 4 + a % 2, b, c, d FROM lgd WHERE d < 30;
+CREATE INDEX ON lgdp0 USING lion (a, b, c, d);
+CREATE INDEX ON lgdp1 USING lion (a, b, c, d);
+CREATE INDEX ON lgdp2 USING lion (a);
+CREATE INDEX ON lgdp2 USING lion (b);
+CREATE INDEX ON lgdp2 USING lion (c);
+CREATE INDEX ON lgdp2 USING lion (d);
 VACUUM (FREEZE, ANALYZE) lgdp;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+EXPLAIN (COSTS OFF) SELECT a, b, c, count(*) FROM lgdp WHERE d > 50 GROUP BY a, b, c;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
 SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgdp GROUP BY a, b, c');
+SELECT lgd_check('SELECT c, a, count(c) AS nc, count(*) AS n, b FROM lgdp GROUP BY b, c, a');
+SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgdp WHERE d > 50 GROUP BY a, b, c');
+-- two columns and a WHERE: the pairs of §20 or the decoded walk, priced
+SELECT lgd_check('SELECT b, c, count(*) AS n FROM lgdp WHERE d < 10 GROUP BY b, c');
+-- a WHERE one partition's bounds imply (left out there), one that prunes
+-- partitions, and one with no entry in some of them
+SELECT lgd_check('SELECT b, c, d, count(*) AS n FROM lgdp WHERE a IN (0, 1, 4) GROUP BY b, c, d');
+SELECT lgd_check('SELECT b, c, d, count(*) AS n FROM lgdp WHERE a = 2 GROUP BY b, c, d');
+SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgdp WHERE d = 40 GROUP BY a, b, c');
+-- HAVING is the Finalize Agg's, over every partition's partial counts
+SELECT lgd_check('SELECT b, c, d, count(*) AS n FROM lgdp GROUP BY b, c, d HAVING count(*) > 30');
+-- filtered counts: a run per filter in each partition's turn, after the
+-- WHERE's
+SELECT lgd_check('SELECT a, b, c, count(*) AS n, count(*) FILTER (WHERE d IN (10, 40)) AS nd, count(*) FILTER (WHERE d = 7) AS n7 FROM lgdp GROUP BY a, b, c');
+SELECT lgd_check('SELECT a, b, c, count(*) AS n, count(*) FILTER (WHERE d = 40) AS nd FROM lgdp WHERE d < 60 GROUP BY a, b, c');
+-- count(DISTINCT) over the finer grouping, with a GROUP BY and without
+SELECT lgd_check('SELECT b, count(DISTINCT c) AS n FROM lgdp WHERE d < 60 GROUP BY b');
+SELECT lgd_check('SELECT count(DISTINCT c) AS n, count(*) AS m FROM lgdp WHERE d < 60');
+SELECT lgd_check('SELECT count(DISTINCT c) AS n, count(DISTINCT b) AS m FROM lgdp');
+-- rescanned with a new value of its WHERE each time, each value with no
+-- entry in some partitions
+SELECT lgd_check('SELECT v.x, s.* FROM (VALUES (1), (40), (90)) v(x), LATERAL (SELECT a, b, c, count(*) AS n FROM lgdp WHERE d = v.x GROUP BY a, b, c) s');
+-- not decoded, as over one table: a range in a FILTER, and a range on an
+-- outer row's value
+SELECT lgd_check('SELECT a, b, c, count(*) AS n, count(*) FILTER (WHERE d < 40) AS nd FROM lgdp GROUP BY a, b, c');
+SELECT lgd_check('SELECT x, (SELECT count(*) FROM (SELECT a, b, c, count(*) FROM lgdp WHERE d > x GROUP BY a, b, c) s) AS n FROM (VALUES (10), (50), (90)) v(x)');
+-- not decoded: a grouping column with no lion index
+ALTER TABLE lgdp ADD COLUMN h int;
+SELECT lgd_check('SELECT a, b, h, count(*) AS n FROM lgdp GROUP BY a, b, h');
 
 DROP TABLE lgdp;
 DROP TABLE lgd;

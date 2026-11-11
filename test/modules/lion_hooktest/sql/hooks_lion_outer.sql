@@ -51,7 +51,7 @@ SELECT lion_hooktest_rel_calls() > 0 AS rel_hook_ran,
 SET pg_lion.no_such_setting = 1;
 SET lion_hooktest.no_such_setting = 1;
 
--- pg_lion's planner hook (DESIGN.md §55) plans a grouped subquery joined in
+-- pg_lion's planner hook (DESIGN.md §56) plans a grouped subquery joined in
 -- again as a LATERAL subquery, through the other planner hook, which here
 -- refuses that form with an error: the error is dropped with the plan, and
 -- the query runs as written, with the same rows, in a transaction that

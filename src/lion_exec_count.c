@@ -431,7 +431,17 @@ lion_count_relation(LionCountScanState *st)
 	if (st->filter != NULL && !lion_where_has_positive(st))
 		count = lion_count_scan_filtered(st);
 	else
-		count = lion_node_count(st, st->nitem, &st->sources[1], false);
+	{
+		/*
+		 * A GROUP BY folded to one group that nothing counts
+		 * (LION_FLAG_EXISTS) asks only whether the group has a row.
+		 */
+		bool		exists = lion_plan_flag(st, LION_FLAG_EXISTS);
+
+		if (exists)
+			st->grouptests++;
+		count = lion_node_count(st, st->nitem, &st->sources[1], exists);
+	}
 	MemoryContextSwitchTo(oldcxt);
 
 	return count;
@@ -1324,6 +1334,30 @@ lion_run_count(LionCountScanState *st, bool sum, int r)
 }
 
 /*
+ * Does the node's row take run r's count?  Every run's but where the
+ * aggregates of sliced columns are all the target list has of it (DESIGN.md
+ * §52, "Filtered aggregates"): run 0's where nothing but those aggregates
+ * is there (needcount), and a filter's where no filtered count is of it.
+ */
+static bool
+lion_run_counted(LionCountScanState *st, int r)
+{
+	int			i;
+
+	if (st->slice == NULL)
+		return true;
+	if (r == 0)
+		return st->slice->needcount;
+	for (i = 0; i < st->ntlist; i++)
+	{
+		if (LION_TL_IS_FCOUNT(st->tlkind[i]) &&
+			LION_TL_FCOUNT_FILTER(st->tlkind[i]) == r)
+			return true;
+	}
+	return false;
+}
+
+/*
  * The counts of the runs of a node of one row with filtered counts
  * (DESIGN.md §10, "Filtered counts"): run 0's - the WHERE's - and each
  * filter's, the rows the WHERE and that filter select together, each
@@ -1351,24 +1385,26 @@ lion_count_runs(LionCountScanState *st, bool sum)
 			lion_open_relation(st, p);
 		for (r = 0; r < st->nrun; r++)
 		{
-			int64		n;
+			int64		n = 0;
 
 			lion_select_run(st, r);
 			lion_locate_where(st);
-			n = lion_run_count(st, sum, r);
+			if (lion_run_counted(st, r))
+				n = lion_run_count(st, sum, r);
 			st->runcount[r] += n;
 
 			/*
 			 * the aggregates of sliced columns (DESIGN.md §52), over the
-			 * WHERE's rows: run 0's, its sets still located - a partition's
-			 * added to the others' (§52.13)
+			 * rows of the run they are counted in - run 0's, the WHERE's,
+			 * or a filter's (§52, "Filtered aggregates") - its sets still
+			 * located: a partition's added to the others' (§52.13)
 			 */
-			if (r == 0 && st->slice != NULL)
+			if (st->slice != NULL)
 			{
 				if (p >= 0)
-					lion_slice_part(st);
+					lion_slice_part(st, r);
 				else
-					lion_slice_run(st);
+					lion_slice_run(st, r);
 			}
 			/* a partition's rows are its indexes' (lion_count_report_reads()) */
 			if (p >= 0)
@@ -1744,10 +1780,21 @@ lion_group_count(LionCountScanState *st, int nsource, LionCountSource *sources,
 {
 	int			n = 0;
 	int			k;
+	bool		exists = lion_plan_flag(st, LION_FLAG_EXISTS);
 
-	if (!st->wtried && !st->wknown)
+	/*
+	 * Groups nothing counts (LION_FLAG_EXISTS; DESIGN.md §10, "Groups nothing
+	 * counts"): a group exists when one of its rows is visible, and its test
+	 * stops at the first (lion_exists_sources_cached()), as a count(DISTINCT
+	 * k)'s does (§26).  The WHERE is not collected for them: a test reads a
+	 * container or two of the items where they hold a row, and what it
+	 * reads is no guide to what collecting would save.
+	 */
+	if (exists)
+		st->grouptests++;
+	else if (!st->wtried && !st->wknown)
 		lion_where_describe(st, sources, nwhere);
-	if (!st->wtried)
+	if (!exists && !st->wtried)
 	{
 		double		own = Min(Min((double) ownrows, st->wckeys), st->wreach);
 
@@ -1761,7 +1808,7 @@ lion_group_count(LionCountScanState *st, int nsource, LionCountSource *sources,
 	st->wcounts++;
 
 	if (!st->wcollected)
-		return lion_node_count(st, nsource, sources, false);
+		return lion_node_count(st, nsource, sources, exists);
 
 	/* the group, the collected set, what it does not hold, a second group */
 	st->wsources[n++] = sources[0];
@@ -1778,7 +1825,7 @@ lion_group_count(LionCountScanState *st, int nsource, LionCountSource *sources,
 		st->wsources[n++] = sources[k];
 	Assert(n <= st->nsource + 1);
 
-	return lion_node_count(st, n, st->wsources, false);
+	return lion_node_count(st, n, st->wsources, exists);
 }
 
 /*
@@ -2488,6 +2535,140 @@ lion_topk_run(LionCountScanState *st)
 }
 
 /*
+ * The next entry of a GROUP BY's walk counted on its own (DESIGN.md §10),
+ * and with it every entry after it that is still to come up to the last
+ * INLINE copy of the leaf it was read from (lion_entry_scan_pinned_left()):
+ * their keys and counts kept in the batch (gbkey, gbnull, gbcount) for the
+ * rows that follow, in the walk's order, and their sets released before
+ * this returns.  False when the walk has no entry left.
+ *
+ * WHY.  A row goes up to the executor after each group, and before it the
+ * walk lets go of the leaf it stands on (lion_pause_run()): the INLINE copies
+ * still to come are dropped with the leaf's pin, which §9 wants held from the
+ * copy to the count, and the leaf is read again for the next group (§28, "A
+ * walk that returns rows").  Taken one a row, the groups of a column whose
+ * entries are INLINE - any column of more than a few thousand values - read
+ * a leaf each: 993,227 directory reads for the 993k groups of a 5M-row table
+ * whose index has 6,725 leaves, and half the time of the walk.  Counted here
+ * first, under the pins of the copies, each leaf is read once; the pause
+ * after the row then finds no INLINE copy to drop, and keeps the CHAIN copies
+ * after the last one, as it always did.  A CHAIN entry with no INLINE copy
+ * after it is taken alone: the pause keeps it, and nothing is counted before
+ * a LIMIT above asks for it that a pause would not have kept.  The count
+ * that collects the WHERE ends the fill, so that the groups after it are
+ * counted together as before (lion_group_batch_ok()).
+ *
+ * WHY THE COUNTS ARE THE SAME.  Each is lion_group_count()'s for its group,
+ * as the walk one at a time made it - the group's set from the walk, with a
+ * pin of its own (§9), ANDed with the WHERE's sources or, once
+ * lion_group_count() has collected them, with the copy - only made before the
+ * previous group's row goes up rather than after, under the same snapshot.
+ * The WHERE's sets may still hold their pins then, which no count needs
+ * (§15, "Paused and finished counts").  GROUP BY coalesce(g, c) (st->coal)
+ * adds the counts of the NULL entry and of c's entry into coal->count, and
+ * keeps no row of either: lion_next_group() emits their group at the end.
+ *
+ * Memory: the keys, the INLINE payloads and the sliced columns' answers in
+ * gbatchcxt, reset by the next fill - a leaf's bytes and an entry's at most -
+ * and each count's own in pergroup, reset for the next.
+ */
+static bool
+lion_group_walk_fill(LionCountScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	LionCoalState *coal = st->coal;
+	MemoryContext oldcxt;
+	Datum		key;
+	int			cap;
+	int			n = 0;
+
+	if (st->gbatchcxt == NULL)
+		st->gbatchcxt = AllocSetContextCreate(estate->es_query_cxt,
+											  "LionCount group batch",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContextReset(st->gbatchcxt);
+	st->gbn = 0;
+	st->gbpos = 0;
+
+	oldcxt = MemoryContextSwitchTo(st->gbatchcxt);
+	if (!lion_entry_scan_next(&st->escan, &key, &st->groupset))
+	{
+		MemoryContextSwitchTo(oldcxt);
+		return false;
+	}
+	cap = 1 + lion_entry_scan_pinned_left(&st->escan);
+	st->gbkey = (Datum *) palloc(sizeof(Datum) * cap);
+	st->gbnull = (bool *) palloc(sizeof(bool) * cap);
+	st->gbcount = (int64 *) palloc(sizeof(int64) * cap);
+	if (st->slice != NULL)
+	{
+		st->gbsvalues = (Datum **) palloc0(sizeof(Datum *) * cap);
+		st->gbsnull = (bool **) palloc0(sizeof(bool *) * cap);
+	}
+
+	for (;;)
+	{
+		bool		keyisnull = st->groupset.keyisnull;
+		int64		count;
+
+		/* the count's memory, and what the equality leaks */
+		MemoryContextReset(st->pergroup);
+		MemoryContextSwitchTo(st->pergroup);
+
+		/* another entry already in hand is another count to come */
+		count = lion_group_count(st, st->nsource, st->sources, st->nitem,
+								 st->groupset.ntids,
+								 lion_entry_scan_batch_left(&st->escan) > 0);
+
+		if (coal != NULL &&
+			(keyisnull ||
+			 DatumGetBool(FunctionCall2Coll(&coal->eqfn, coal->coll, key,
+											coal->value->constvalue))))
+			coal->count += count;
+		else if (count > 0)
+		{
+			/*
+			 * the group's aggregates of sliced columns (DESIGN.md §52), its
+			 * set still located, kept for its row
+			 */
+			if (st->slice != NULL)
+			{
+				LionPostingSet *gs = &st->groupset;
+
+				lion_slice_group(st, 1, &gs);
+				lion_slice_keep(st, st->gbatchcxt, &st->gbsvalues[n],
+								&st->gbsnull[n]);
+			}
+			st->gbkey[n] = key;
+			st->gbnull[n] = keyisnull;
+			st->gbcount[n] = count;
+			n++;
+		}
+		lion_posting_set_release(&st->groupset);
+
+		/*
+		 * the leaf's INLINE copies still to come, each a pin until counted -
+		 * unless that count collected the WHERE, when the rest of the walk
+		 * is counted a batch at a time (lion_group_batch_fill()): the pause
+		 * drops those copies, and the batch reads their leaf again, once a
+		 * walk
+		 */
+		if (n >= cap || lion_entry_scan_pinned_left(&st->escan) == 0 ||
+			lion_group_batch_ok(st))
+			break;
+		MemoryContextSwitchTo(st->gbatchcxt);
+		if (!lion_entry_scan_next(&st->escan, &key, &st->groupset))
+			elog(ERROR, "LionCount: the walk ran out before the last INLINE copy of its leaf");
+		CHECK_FOR_INTERRUPTS();
+	}
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(st->pergroup);
+
+	st->gbn = n;
+	return true;
+}
+
+/*
  * The next group of the relation the node has open, as one row.
  *
  * Returns NULL and sets *exhausted once the relation's entry scan has run
@@ -2510,16 +2691,11 @@ static TupleTableSlot *
 lion_next_group(LionCountScanState *st, bool *exhausted)
 {
 	LionCoalState *coal = st->coal;
-	MemoryContext oldcxt;
 
 	*exhausted = false;
 
 	for (;;)
 	{
-		Datum		key;
-		bool		keyisnull;
-		int64		count;
-
 		CHECK_FOR_INTERRUPTS();
 
 		/*
@@ -2582,64 +2758,28 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 			return NULL;
 		}
 
-		oldcxt = MemoryContextSwitchTo(st->pergroup);
-
-		if ((coal != NULL && coal->walked) ||
-			!lion_entry_scan_next(&st->escan, &key, &st->groupset))
-		{
-			MemoryContextSwitchTo(oldcxt);
-
-			/*
-			 * The group of c, once: a HAVING that rejects it sends the caller
-			 * back here, and the walk is not asked for another entry after
-			 * it has run out.
-			 */
-			if (coal != NULL && !coal->walked)
-			{
-				coal->walked = true;
-				if (coal->count > 0)
-					return lion_emit_tuple(st, coal->value->constvalue,
-										   false, (Datum) 0, true,
-										   coal->count);
-			}
-			*exhausted = true;
-			return NULL;
-		}
-
-		/* another entry already in hand is another count to come */
-		count = lion_group_count(st, st->nsource, st->sources, st->nitem,
-								 st->groupset.ntids,
-								 lion_entry_scan_batch_left(&st->escan) > 0);
-		keyisnull = st->groupset.keyisnull;
+		/*
+		 * Before that, the walk's next entry counted on its own - and every
+		 * entry after it on the same leaf up to its last INLINE one
+		 * (lion_group_walk_fill()) - their rows going up from the batch.
+		 */
+		if ((coal == NULL || !coal->walked) && lion_group_walk_fill(st))
+			continue;
 
 		/*
-		 * the group's aggregates of sliced columns (DESIGN.md §52), its set
-		 * still located
+		 * The group of c, once: a HAVING that rejects it sends the caller
+		 * back here, and the walk is not asked for another entry after it
+		 * has run out.
 		 */
-		if (st->slice != NULL && count > 0)
+		if (coal != NULL && !coal->walked)
 		{
-			LionPostingSet *gs = &st->groupset;
-
-			lion_slice_group(st, 1, &gs);
+			coal->walked = true;
+			if (coal->count > 0)
+				return lion_emit_tuple(st, coal->value->constvalue,
+									   false, (Datum) 0, true, coal->count);
 		}
-		lion_posting_set_release(&st->groupset);
-
-		if (coal != NULL &&
-			(keyisnull ||
-			 DatumGetBool(FunctionCall2Coll(&coal->eqfn, coal->coll, key,
-											coal->value->constvalue))))
-		{
-			coal->count += count;
-			MemoryContextSwitchTo(oldcxt);
-			continue;
-		}
-		MemoryContextSwitchTo(oldcxt);
-
-		/* A group exists only if at least one of its rows is visible. */
-		if (count == 0)
-			continue;
-
-		return lion_emit_tuple(st, key, keyisnull, (Datum) 0, true, count);
+		*exhausted = true;
+		return NULL;
 	}
 }
 
