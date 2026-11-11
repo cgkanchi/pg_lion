@@ -288,7 +288,8 @@ lion_defer_get(Relation index, Relation heap)
 
 /*
  * Buffer one (key, TID) pair of column col (0-based), whose state is state:
- * key as lion_key_prepare() made it, for flag 0, or a reserved entry's flag.
+ * key as lion_key_prepare() made it, for flag 0; or a reserved entry's flag;
+ * or LION_ENTRY_SLICE, with the slice's position as key.
  */
 void
 lion_defer_add(LionDefer *d, Relation index, Relation heap, LionState *state,
@@ -335,6 +336,8 @@ lion_defer_add(LionDefer *d, Relation index, Relation heap, LionState *state,
 			bytes += MAXALIGN(len);
 		}
 	}
+	else if (flag == LION_ENTRY_SLICE)
+		hash = 0;				/* key is the position */
 	else
 		key = (Datum) 0;
 

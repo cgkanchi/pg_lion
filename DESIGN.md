@@ -34055,6 +34055,15 @@ replay compared page by page under `wal_consistency_checking = 'pg_lion'`, and s
 `make recovery-check WAL_CONSISTENCY=1` in generic mode (690,840 records); the whole suite passed
 in both modes (192 regression files and 32 isolation specs, the injection points' skipped).
 
+### A statement's rows, batched (2026-11-11)
+
+A statement's rows after its first go into their slices as a batch (§55, "A sliced column"): each
+slice's rows together, under one hold of its leaf, a container's in one record
+(`lion_insert_chain_rows()`), rather than a row's slices together. What is stored is the same. The
+walk and the several-slices record above remain the path of a statement's first row, of single-row
+statements, and of PostgreSQL 16. `slices_insert.sql` runs with `pg_lion.batch_inserts` off, so it
+keeps testing that path; `insert_batch.sql` tests the batch, and `walrecords.sql` both.
+
 ## 52. Aggregates and ranges from slices in the count pushdown (2026-10-26)
 
 §51 stored a bit-sliced column's values as posting sets and proved them exact through a SQL
@@ -35274,6 +35283,21 @@ and
   of more than one row gets the growth slack an insert's rewrite gives (§4, "Growth slack inside an
   INLINE payload"), where the leaf has room. Either may move the entry, so each is one hold.
 
+**A sliced column** (§51) is batched too: `lioninsert()` buffers each row's key and then a pair for
+each slice the row goes into (`LION_ENTRY_SLICE`, the position in place of the key), and a slice is
+a key like any other to the steps above - its search key `lion_search_key_slice()`'s, a new one made
+by `lion_make_slice_entry()`, its rows put in by the same CHAIN and INLINE steps. Slices sort after
+their column's keys and summaries (§51.2), so the batch writes a column's keys before its slices, as
+a row's own steps go; and a run of slices on one leaf shares a descent as a run of keys does. A
+row of an int4 column makes 17 slice pairs on average and of an int8 33, so most of a batch can be
+slice pairs: `lion_insert_apply()` puts them in their slices by a counting pass rather than the
+sort, each slice's in the order the rows came, which is TID order unless the heap placed a later row
+on an earlier page (an UPDATE whose new versions go partly on their own page), which is checked,
+and sorted then. A 50,000-row `INSERT ... SELECT` of random int4 values into a million-row table
+with a sliced index took 692 ms row by row and takes 227 ms (126 without slices); four clients
+inserting 200 rows a statement loaded 45,000 rows a second, a third of what one did, and load
+300,000.
+
 A key of many rows - the case that queued - is a CHAIN entry after its first few hundred, so its
 rows go in 256 to a lock handoff and a record to a container; a key of one row costs what it did,
 plus the sort.
@@ -35303,8 +35327,8 @@ covered is this backend reading the index before they are written, and the commi
 
 **When nothing is buffered** (`lion_defer_allowed()` and `lioninsert()`): PostgreSQL 16, which has
 no `aminsertcleanup`; the first row of a statement, so a one-row statement costs what it did; a
-column with stored positions, summaries or bit slices, whose inserts write more than the key's entry
-(each of those steps would have to be batched as well, and their posting sets queue less); the index
+column with stored positions or summaries, whose inserts write more than the key's entry and its
+slices (each of those steps would have to be batched as well); the index
 of an exclusion constraint, whose check scans the index for the rows inserted before in the same
 statement; while an `INSERT ... ON CONFLICT` runs, anywhere in the backend (tracked from
 `ExecutorStart` to `ExecutorEnd` and dropped with the subtransaction it began in); and the rest of
@@ -35362,14 +35386,16 @@ A record to a container rather than to a row, and a new or INLINE entry's rows i
 38% less time on two values and 20% less on 20,000; none on a million values or on statements
 whose keys have a row each.
 
-**Not done.** Columns with positions, summaries and slices are written row by row; batching them
-needs their own posting-set steps sorted and held the same way. A one-row statement gains nothing,
+**Not done.** Columns with positions and summaries are written row by row; batching them needs
+their own steps sorted and held the same way. A one-row statement gains nothing,
 and many writers inserting one row each still take turns on the leaf (each turn shorter since §21's
 "A leaf already known").
 
 Tests: `test/sql/insert_batch.sql` (every kind of key in one batch and across `work_mem`, COPY;
 a key's rows into a new, an INLINE and a CHAIN entry, spilling in the middle of the batch, and the
-records 400 rows of one CHAIN key write counted;
+records 400 rows of one CHAIN key write counted; a sliced column whose batch makes its slices and
+spills them, and an UPDATE that hands a slice its rows out of TID order, against
+`lion_index_slice_agg()`;
 a volatile function's query in the INSERT's own select list, BEFORE and AFTER triggers' queries,
 by the count pushdown first; rows left past their statement written by a query of the table, a
 direct reader and the commit, dropped with an aborted savepoint or PL/pgSQL block, written before

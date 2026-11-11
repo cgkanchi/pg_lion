@@ -1,7 +1,7 @@
 -- Statement-level insert batching (DESIGN.md §55): after a statement's first
 -- row, the (key, TID) pairs of a column that stores nothing but its posting
--- sets are buffered per index and written sorted by key at the end of the
--- statement, or before anything in the backend reads the index.
+-- sets and bit slices are buffered per index and written sorted by key at the
+-- end of the statement, or before anything in the backend reads the index.
 --
 -- PostgreSQL 16 has no aminsertcleanup and buffers nothing, so every count
 -- of buffered rows below goes through batched(n), which is n on 17 and later
@@ -282,7 +282,8 @@ SELECT lb_cmp('lb_left', 'k = 11');
 -- ---------------------------------------------------------------------
 -- What is never buffered: an exclusion constraint's index, which checks
 -- each row against the ones before it in the same statement, and columns
--- with summaries or slices beside plain ones in one index.
+-- with summaries or positions beside plain ones in one index (a column
+-- with slices is buffered, below).
 -- ---------------------------------------------------------------------
 CREATE TABLE lb_ex (a int, b text, EXCLUDE USING lion (a WITH =));
 INSERT INTO lb_ex SELECT g, 'x' FROM generate_series(1, 100) g;
@@ -349,6 +350,54 @@ SELECT lion_index_verify('lb_rows_k', true);
 SELECT lb_cmp('lb_rows', 'k = 1000');
 
 -- ---------------------------------------------------------------------
+-- A sliced column (DESIGN.md §51): a row's bit slices are buffered with
+-- its key, a pair a slice, and written after the column's keys, each
+-- slice's rows together.  The statement's first row, of value 0, makes the
+-- few slices its bits need, so the batch makes the rest, and
+-- inline_limit = 256 spills them in the middle of it.  Then an UPDATE of
+-- every row at fillfactor 70, whose new versions go partly on their own
+-- page and partly at the end of the table, so that a slice's rows come in
+-- out of TID order.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION lb_slcmp(idx regclass, attno int2) RETURNS text
+LANGUAGE plpgsql
+SET enable_indexscan = off SET enable_bitmapscan = off
+SET pg_lion.enable_count_pushdown = off AS $$
+DECLARE
+	l record;
+	r record;
+	col text := pg_get_indexdef(idx, attno, true);
+BEGIN
+	SELECT * INTO l FROM lion_index_slice_agg(idx, NULL, attno);
+	EXECUTE format('SELECT count(%1$s) AS count, sum(%1$s)::numeric AS sum, min(%1$s)::text AS min, max(%1$s)::text AS max FROM lb_sl',
+				   col) INTO r;
+	IF (l.count, l.sum, l.min, l.max) IS NOT DISTINCT FROM (r.count, r.sum, r.min, r.max) THEN
+		RETURN format('same: %s %s %s %s', l.count, l.sum, l.min, l.max);
+	END IF;
+	RETURN format('DIFFERENT: lion %s %s %s %s, query %s %s %s %s',
+				  l.count, l.sum, l.min, l.max, r.count, r.sum, r.min, r.max);
+END $$;
+
+CREATE TABLE lb_sl (i int4, v int8, w int4)
+	WITH (autovacuum_enabled = off, fillfactor = 70);
+CREATE INDEX lb_sl_vw ON lb_sl USING lion (v, w)
+	WITH (slices = on, inline_limit = 256);
+INSERT INTO lb_sl
+SELECT g, CASE WHEN g = 1 THEN 0 ELSE hashint4(g)::int8 * 1000003 END,
+	   CASE WHEN g % 7 = 0 THEN NULL ELSE g % 50 - 25 END
+FROM generate_series(1, 6000) g;
+SELECT slice_entries, slice_tids FROM lion_index_stats('lb_sl_vw');
+SELECT lion_index_verify('lb_sl_vw', true);
+SELECT lb_slcmp('lb_sl_vw', 1::int2), lb_slcmp('lb_sl_vw', 2::int2);
+SELECT lb_cmp('lb_sl', 'w = -3');
+SELECT lb_cmp('lb_sl', 'w IS NULL');
+
+UPDATE lb_sl SET v = -v, w = w + 1;
+SELECT lion_index_verify('lb_sl_vw', true);
+SELECT lb_slcmp('lb_sl_vw', 1::int2), lb_slcmp('lb_sl_vw', 2::int2);
+SELECT lb_cmp('lb_sl', 'w = -3');
+
+-- ---------------------------------------------------------------------
 -- A partitioned table: one buffer per partition's index.
 -- ---------------------------------------------------------------------
 CREATE TABLE lb_part (i int4, k int4) PARTITION BY RANGE (i);
@@ -359,6 +408,7 @@ INSERT INTO lb_part SELECT (g * 7919) % 10000, g % 5 FROM generate_series(1, 999
 SELECT lion_index_verify('lb_part_1_k_idx', true), lion_index_verify('lb_part_2_k_idx', true);
 SELECT lb_cmp('lb_part', 'k = 4');
 
-DROP TABLE lb, lb_mid, lb_log, lb_left, lb_ex, lb_mix, lb_rows, lb_part;
-DROP FUNCTION lb_probe(int4), lb_trig(), lb_after(), lb_cmp(text, text), batched(int8);
+DROP TABLE lb, lb_mid, lb_log, lb_left, lb_ex, lb_mix, lb_rows, lb_sl, lb_part;
+DROP FUNCTION lb_probe(int4), lb_trig(), lb_after(), lb_cmp(text, text), batched(int8),
+	lb_slcmp(regclass, int2);
 DROP FUNCTION lion_debug_defer_pending(regclass), lion_debug_defer_cleanup(bool);

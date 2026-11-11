@@ -5,10 +5,16 @@
 -- What is checked is what is stored: lion_index_verify() with
 -- heapallindexed, which looks every row up in every slice of its column, and
 -- lion_index_slice_agg() against the query it stands for.
+--
+-- This is the path of a row at a time, which a statement's first row and
+-- every row of PostgreSQL 16 take; the rest of a statement's rows are
+-- batched (DESIGN.md §55), which insert_batch.sql tests.  So batching is off
+-- here.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
 RESET client_min_messages;
+SET pg_lion.batch_inserts = off;
 -- count, sum, min and max of key column attno from its slices, against the
 -- query with every lion path off: 'same' and the answer, or both.
 CREATE FUNCTION si_cmp(idx regclass, attno int2 DEFAULT 1) RETURNS text
