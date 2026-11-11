@@ -157,6 +157,7 @@ typedef struct LionTbmState
 	BlockNumber curblk;			/* heap block the buffered TIDs belong to */
 	int			ntids;
 	int64		total;
+	int64		runs;			/* heap block changes, TID to TID */
 	bool		recheck;		/* passed on to tbm_add_tuples() */
 	ItemPointerData tids[LION_MAX_OFFSET + 1];
 } LionTbmState;
@@ -177,13 +178,21 @@ lion_tbm_callback(uint16 lo, void *arg)
 	 * tbm_add_tuples() call per heap block is enough.  The length test is
 	 * belt and braces: a corrupt container must not overrun tids[].
 	 */
-	if (st->ntids > 0 &&
-		(blk != st->curblk || st->ntids > LION_MAX_OFFSET))
+	if (blk != st->curblk)
+	{
+		if (st->ntids > 0)
+		{
+			tbm_add_tuples(st->tbm, st->tids, st->ntids, st->recheck);
+			st->ntids = 0;
+		}
+		st->curblk = blk;
+		st->runs++;
+	}
+	else if (st->ntids > LION_MAX_OFFSET)
 	{
 		tbm_add_tuples(st->tbm, st->tids, st->ntids, st->recheck);
 		st->ntids = 0;
 	}
-	st->curblk = blk;
 
 	Assert(st->ntids <= LION_MAX_OFFSET);
 	ItemPointerSet(&st->tids[st->ntids], blk, off);
@@ -210,17 +219,23 @@ lion_tbm_pair_callback(uint32 ckey, uint16 lo, void *arg)
 /*
  * Emit one item (container or sparse segment) into a TIDBitmap, one
  * tbm_add_tuples() call per heap block.  Returns the number of TIDs emitted.
+ *
+ * *lastblk is the heap block of the TID given to the bitmap just before, or
+ * InvalidBlockNumber, and is set to the item's last; *runs is increased by the
+ * times the block changes from one TID to the next, starting from *lastblk.
  */
 int64
-lion_container_to_tbm(const LionContainer *c, TIDBitmap *tbm, bool recheck)
+lion_container_to_tbm_runs(const LionContainer *c, TIDBitmap *tbm,
+						   bool recheck, BlockNumber *lastblk, int64 *runs)
 {
 	LionTbmState st;
 
 	st.tbm = tbm;
 	st.firstblk = lion_ckey_first_block(c->ckey);
-	st.curblk = InvalidBlockNumber;
+	st.curblk = *lastblk;
 	st.ntids = 0;
 	st.total = 0;
+	st.runs = 0;
 	st.recheck = recheck;
 
 	if (c->type == LION_CT_SPARSE)
@@ -231,7 +246,52 @@ lion_container_to_tbm(const LionContainer *c, TIDBitmap *tbm, bool recheck)
 	if (st.ntids > 0)
 		tbm_add_tuples(tbm, st.tids, st.ntids, st.recheck);
 
+	*lastblk = st.curblk;
+	*runs += st.runs;
 	return st.total;
+}
+
+int64
+lion_container_to_tbm(const LionContainer *c, TIDBitmap *tbm, bool recheck)
+{
+	BlockNumber lastblk = InvalidBlockNumber;
+	int64		runs = 0;
+
+	return lion_container_to_tbm_runs(c, tbm, recheck, &lastblk, &runs);
+}
+
+/*
+ * A batch for a walk of many keys into tbm (lion_tidbatch.c, DESIGN.md §28,
+ * "Many keys into one bitmap"), told how many blocks the heap had when it
+ * was last vacuumed or analyzed: the bitmap is given that many TIDs at once
+ * before the batch keeps any.
+ */
+static LionTidBatch *
+lion_scan_tid_batch(Relation index, TIDBitmap *tbm, bool recheck)
+{
+	Relation	heap = RelationIdGetRelation(index->rd_index->indrelid);
+	BlockNumber nblocks = 0;
+
+	if (RelationIsValid(heap))
+	{
+		nblocks = (BlockNumber) Max(RelationGetForm(heap)->relpages, 0);
+		RelationClose(heap);
+	}
+	return lion_tid_batch_begin(RelationGetRelationName(index), tbm, recheck,
+								nblocks);
+}
+
+/*
+ * One item of a key's posting set into the bitmap: through the walk's batch
+ * while it has one that keeps items (lion_tidbatch.c), at once otherwise.
+ */
+static inline int64
+lion_item_to_tbm(const LionContainer *c, TIDBitmap *tbm, bool recheck,
+				 LionTidBatch *batch)
+{
+	if (batch != NULL && lion_tid_batch_keeps(batch))
+		return lion_tid_batch_add(batch, c);
+	return lion_container_to_tbm(c, tbm, recheck);
 }
 
 /*
@@ -241,7 +301,8 @@ lion_container_to_tbm(const LionContainer *c, TIDBitmap *tbm, bool recheck)
  */
 static int64
 lion_emit_inline(Relation index, BlockNumber blk, OffsetNumber eoff,
-				 const char *payload, Size paylen, TIDBitmap *tbm, bool recheck)
+				 const char *payload, Size paylen, TIDBitmap *tbm, bool recheck,
+				 LionTidBatch *batch)
 {
 	int64		ntids = 0;
 	Size		off = 0;
@@ -249,7 +310,7 @@ lion_emit_inline(Relation index, BlockNumber blk, OffsetNumber eoff,
 
 	while (lion_inline_fetch(index, blk, eoff, payload, paylen, &off,
 							 cbuf) > 0)
-		ntids += lion_container_to_tbm(cbuf, tbm, recheck);
+		ntids += lion_item_to_tbm(cbuf, tbm, recheck, batch);
 
 	pfree(cbuf);
 	return ntids;
@@ -354,7 +415,7 @@ lionendscan(IndexScanDesc scan)
  */
 static int64
 lion_emit_chain(Relation index, uint32 hash, BlockNumber head, TIDBitmap *tbm,
-			   bool recheck)
+			   bool recheck, LionTidBatch *batch)
 {
 	PGAlignedBlock *copy;
 	BlockNumber blkno;
@@ -399,9 +460,9 @@ lion_emit_chain(Relation index, uint32 hash, BlockNumber head, TIDBitmap *tbm,
 		maxoff = PageGetMaxOffsetNumber(cpage);
 		/* each item checked before the container code reads it (§3) */
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
-			ntids += lion_container_to_tbm(lion_page_item_fetch(index, cpage,
-																 cblkno, off),
-										   tbm, recheck);
+			ntids += lion_item_to_tbm(lion_page_item_fetch(index, cpage,
+															cblkno, off),
+									  tbm, recheck, batch);
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -439,7 +500,8 @@ lion_emit_chain(Relation index, uint32 hash, BlockNumber head, TIDBitmap *tbm,
  */
 static int64
 lion_emit_entry(Relation index, Buffer entrybuf,
-			   OffsetNumber entryoff, TIDBitmap *tbm, bool recheck)
+			   OffsetNumber entryoff, TIDBitmap *tbm, bool recheck,
+			   LionTidBatch *batch)
 {
 	Page		page = BufferGetPage(entrybuf);
 	BlockNumber entryblk = BufferGetBlockNumber(entrybuf);
@@ -471,7 +533,7 @@ lion_emit_entry(Relation index, Buffer entrybuf,
 	if (payload != NULL)
 	{
 		ntids = lion_emit_inline(index, entryblk, entryoff, payload, paylen,
-								 tbm, recheck);
+								 tbm, recheck, batch);
 		pfree(payload);
 		return ntids;
 	}
@@ -488,15 +550,16 @@ lion_emit_entry(Relation index, Buffer entrybuf,
 	 */
 	LION_INJECTION_POINT("lion-scan-chain-entered");
 
-	return lion_emit_chain(index, hash, blkno, tbm, recheck);
+	return lion_emit_chain(index, hash, blkno, tbm, recheck, batch);
 }
 
 /*
- * Emit the posting set of one search value on one key column.
+ * Emit the posting set of one search value on one key column, through the
+ * list's batch when there is one.
  */
 static int64
 lion_emit_value(LionScanOpaque so, LionState *col,
-			   ScanKey skey, Datum value, TIDBitmap *tbm)
+			   ScanKey skey, Datum value, TIDBitmap *tbm, LionTidBatch *batch)
 {
 	Relation	index = so->index;
 	LionScanCol *sc = &so->cols[col->attno - 1];
@@ -522,13 +585,15 @@ lion_emit_value(LionScanOpaque so, LionState *col,
 		return 0;
 	}
 
-	return lion_emit_entry(index, entrybuf, entryoff, tbm, so->recheck);
+	return lion_emit_entry(index, entrybuf, entryoff, tbm, so->recheck, batch);
 }
 
 /*
  * `col = ANY (array)` (DESIGN.md §15).  The elements are looked up one at a
- * time and their sets emitted into the same bitmap; NULL elements select
- * nothing, and repeated elements are harmless because a TIDBitmap is a set.
+ * time and their sets emitted into the same bitmap, in heap order through a
+ * batch when there are several (DESIGN.md §28, "Many keys into one bitmap");
+ * NULL elements select nothing, and repeated elements are harmless because a
+ * TIDBitmap is a set.
  */
 static int64
 lion_emit_array(LionScanOpaque so, LionState *col,
@@ -543,19 +608,24 @@ lion_emit_array(LionScanOpaque so, LionState *col,
 	bool	   *nulls;
 	int			nelems;
 	int64		ntids = 0;
+	LionTidBatch *batch = NULL;
 	int			i;
 
 	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
 	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
 					  &elems, &nulls, &nelems);
 
+	if (nelems > 1)
+		batch = lion_scan_tid_batch(so->index, tbm, so->recheck);
 	for (i = 0; i < nelems; i++)
 	{
 		if (nulls[i])
 			continue;			/* `x = NULL` is never true */
-		ntids += lion_emit_value(so, col, skey, elems[i], tbm);
+		ntids += lion_emit_value(so, col, skey, elems[i], tbm, batch);
 		CHECK_FOR_INTERRUPTS();
 	}
+	if (batch != NULL)
+		lion_tid_batch_end(batch, ntids);
 
 	pfree(elems);
 	pfree(nulls);
@@ -585,7 +655,7 @@ lion_emit_null(Relation index, LionState *col, TIDBitmap *tbm, bool recheck)
 
 	lion_reader_lock_entry(index, BufferGetBlockNumber(entrybuf),
 						   lion_page_entry(BufferGetPage(entrybuf), entryoff));
-	return lion_emit_entry(index, entrybuf, entryoff, tbm, recheck);
+	return lion_emit_entry(index, entrybuf, entryoff, tbm, recheck, NULL);
 }
 
 /*
@@ -921,7 +991,10 @@ lion_emit_all_keys_ext(Relation index, LionState *col, TIDBitmap *tbm,
 	LionEntryTuple *entry;
 	Size		itemlen;
 	int64		ntids = 0;
+	LionTidBatch *batch;
 
+	/* the TIDs of many keys go into the bitmap in heap order (§28) */
+	batch = lion_scan_tid_batch(index, tbm, recheck);
 	lion_walk_begin(&w, index, col, withnull, range, 1, false);
 
 	while ((entry = lion_walk_next(&w, &itemlen)) != NULL)
@@ -930,15 +1003,16 @@ lion_emit_all_keys_ext(Relation index, LionState *col, TIDBitmap *tbm,
 			ntids += lion_emit_inline(index, w.entblk, w.entoff,
 									  LionEntryGetPayload(entry),
 									  LION_ENTRY_PAYLOAD_LEN(entry, itemlen),
-									  tbm, recheck);
+									  tbm, recheck, batch);
 		else
 			ntids += lion_emit_chain(index, lion_entry_owner(entry), lion_entry_head(entry),
-									tbm, recheck);
+									tbm, recheck, batch);
 
 		CHECK_FOR_INTERRUPTS();
 	}
 
 	lion_walk_end(&w);
+	lion_tid_batch_end(batch, ntids);
 	return ntids;
 }
 
@@ -3098,7 +3172,7 @@ lion_getbitmap_choice(LionScanOpaque so, LionScanChoice *ch, TIDBitmap *tbm)
 	if ((skey->sk_flags & SK_SEARCHARRAY) != 0)
 		return lion_emit_array(so, col, skey, tbm);
 
-	return lion_emit_value(so, col, skey, skey->sk_argument, tbm);
+	return lion_emit_value(so, col, skey, skey->sk_argument, tbm, NULL);
 }
 
 /*

@@ -319,9 +319,9 @@ SELECT lion_ge('SELECT upper(t), count(*) FROM lion_ge GROUP BY 1 HAVING count(*
 (1 row)
 
 SELECT lion_ge('SELECT upper(t), count(*) FROM lion_ge GROUP BY 1 HAVING upper(t) > ''X1''');
-         lion_ge         
--------------------------
- not pushed down, 3 rows
+       lion_ge       
+---------------------
+ pushed down, 3 rows
 (1 row)
 
 SELECT lion_ge('SELECT upper(t), count(*) FROM lion_ge GROUP BY 1 ORDER BY count(*) DESC LIMIT 2');

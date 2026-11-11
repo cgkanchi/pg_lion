@@ -34,10 +34,11 @@
  *
  * COST, one participant's: its share of the serial walk (`serialrun`, the
  * serial node's price before its HAVING) - the collection and the groups'
- * containers divide by key, the pages each range reads being its own - plus
- * what each of its ranges pays again (rc->perrange: the entry walk, each
- * group's set set up and sought to the range, each WHERE source sought
- * there), plus a cpu_tuple_cost a partial row.  The rows are a group's per
+ * containers divide by key, the pages each range reads being its own - but
+ * for the tests of each key, which it makes whole (rc->keys), plus what each
+ * of its ranges pays again (rc->perrange: the entry walk, each group's set
+ * set up and sought to the range, each WHERE source sought there), plus a
+ * cpu_tuple_cost a partial row.  The rows are a group's per
  * range it has rows in, at most the WHERE's rows.  The Gather prices its
  * rows and set-up, core's Finalize Agg its own work.
  */
@@ -90,8 +91,9 @@ lion_add_parallel_group_path(PlannerInfo *root, RelOptInfo *rel,
 	cpath->path.pathkeys = NIL;
 	cpath->path.rows = rows;
 	cpath->path.startup_cost = 0;
-	cpath->path.total_cost = serialrun / divisor +
-		((double) nranges / divisor) * rc->perrange + rows * cpu_tuple_cost;
+	cpath->path.total_cost = Max(serialrun - rc->keys, 0.0) / divisor +
+		rc->keys + ((double) nranges / divisor) * rc->perrange +
+		rows * cpu_tuple_cost;
 #if PG_VERSION_NUM >= 180000
 	cpath->path.disabled_nodes = 0;
 #endif
@@ -168,8 +170,8 @@ lion_anti_parallel_child(RelOptInfo *innerrel)
  *
  * COST, one participant's: its share of the serial count (`serialrun`, the
  * serial node's price before its HAVING) but for what every participant pays
- * whole (rc->whole: the lookups that locate the WHERE, and the ranges taken
- * as sources it collects), that whole, and what each range it counts pays
+ * whole (rc->whole: the lookups that locate the WHERE, the tests of each
+ * key, and the ranges taken as sources it collects), that whole, and what each range it counts pays
  * again (rc->countrange, every run's: each set sought to the range, a walk's
  * entries counted again), plus a cpu_tuple_cost for its one row.  The Gather
  * prices its rows and set-up, core's Finalize Agg its own work.
@@ -441,6 +443,16 @@ typedef struct LionCountPathBuild
 								 * Finalize Agg merges (§36, "Expressions of
 								 * columns not grouped") */
 	double		finalgroups;	/* ... and the groups the merge makes */
+	int			nkeytest;		/* WHERE clauses answered as the keys that
+								 * pass them (DESIGN.md §10, "A test of each
+								 * key") */
+	bool		nokeytest;		/* ... none: the build that leaves them
+								 * residual */
+	bool		rangeortest;	/* ... and an OR of one column with a range
+								 * among its arms too, which a union would
+								 * collect with no pin (§32) */
+	int			nrangeor;		/* such ORs a build without that took as a
+								 * union */
 	List	   *wattnos;		/* §37: the columns aggregates are taken
 								 * over, weighted by their entries' rows */
 	List	   *widx;			/* ... their indexes (IndexOptInfo) */
@@ -483,6 +495,9 @@ typedef struct LionCountPathBuild
 								 * added, its price */
 	List	   *vcols;			/* the expression columns (DESIGN.md §41) */
 	bool		distinctstage;	/* a SELECT DISTINCT's keys as the groups */
+	bool		leakproofresid; /* residual clauses only ones that raise no
+								 * error: the count of LionCountRows tests
+								 * rows its LIMIT never reaches */
 	int			ncompl;			/* ORs with a complement arm (§35) */
 	bool		runtimemulti;	/* a multi-key clause outside the ORs whose
 								 * query is known only at run time (§17) */
@@ -1291,6 +1306,100 @@ lion_count_path_where_or(LionCountPathBuild *cx, Node *clause)
 }
 
 /*
+ * What the tests of each key cost (DESIGN.md §10, "A test of each key"): a
+ * walk of the column's entries in each relation the node counts - every
+ * partition's held to the table's keys - each entry read as a range walk's
+ * is (LION_RANGE_ENTRY_COST), asked for a visible row as a count(DISTINCT)
+ * walk's is (LION_DISTINCT_TEST_COST), and its key tested.
+ */
+static Cost
+lion_count_path_keytest_price(const LionCountPathBuild *cx)
+{
+	PlannerInfo *root = cx->root;
+	double		nrel = Max((double) list_length(cx->targets), 1.0);
+	Cost		price = 0.0;
+	ListCell   *l1;
+	ListCell   *l2;
+
+	forboth(l1, cx->clauseinfos, l2, cx->whereconsts)
+	{
+		LionClauseInfo *ci = (LionClauseInfo *) lfirst(l1);
+		Node	   *pred = (Node *) lfirst(l2);
+		List	   *vars;
+		QualCost	qc;
+		double		keys;
+		bool		isdefault;
+
+		if (!ci->keytest)
+			continue;
+		vars = pull_var_clause(pred, PVC_INCLUDE_PLACEHOLDERS);
+		Assert(vars != NIL && IsA(linitial(vars), Var));
+		keys = lion_keytest_keys(root, (Var *) linitial(vars), &isdefault);
+		cost_qual_eval_node(&qc, pred, root);
+		price += nrel * (qc.startup + keys *
+						 (LION_RANGE_ENTRY_COST + LION_DISTINCT_TEST_COST +
+						  qc.per_tuple));
+		list_free(vars);
+	}
+	return price;
+}
+
+/*
+ * May a WHERE clause of this build be a test of each key (DESIGN.md §10, "A
+ * test of each key")?  The WHERE's own, of a count of one table: not a
+ * filtered count's condition, not beside the FK-side or anti join, and not
+ * in a count by cells, which takes a clause over its predicates otherwise.
+ * What else may stand beside one is lion_count_path_keytest_ok()'s to say.
+ */
+static bool
+lion_count_path_keytest_allowed(const LionCountPathBuild *cx)
+{
+	return lion_enable_key_tests && !cx->nokeytest && !cx->cells &&
+		cx->curfilter == 0 && cx->fj == NULL && cx->anti == NULL;
+}
+
+/*
+ * ... and once the build is known: a plain count, a GROUP BY of one or two
+ * columns or of expressions of them, a count(DISTINCT), over a table or a
+ * partitioned one - which locate the WHERE's clauses with
+ * lion_locate_where(), where the keys are tested.  Not the decoded walk,
+ * filtered counts, a SELECT DISTINCT's keys, the aggregates over entries or
+ * slices, or the top k (lion_count_path_topk()).
+ */
+static bool
+lion_count_path_keytest_ok(const LionCountPathBuild *cx)
+{
+	return cx->nkeytest == 0 ||
+		(!cx->decode && cx->nfilter == 0 && !cx->distinctstage &&
+		 cx->wattnos == NIL && cx->sattnos == NIL && cx->fj == NULL &&
+		 cx->anti == NULL && !cx->cells);
+}
+
+/*
+ * Did lion_count_path_where_or() take the OR clause, whose leaves begin at
+ * position first, as a union with a range among its arms that it collects
+ * from the entries rather than the slices - and is it an OR of one column
+ * whose keys could be tested instead (lion_keytest_leaf())?
+ */
+static bool
+lion_count_path_or_range(const LionCountPathBuild *cx, int first,
+						 Node *clause)
+{
+	LionLeafInfo leaf;
+	bool		range = false;
+	ListCell   *lc;
+
+	for_each_from(lc, cx->clauseinfos, first)
+	{
+		LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
+
+		if (ci->kind == LION_CLAUSE_RANGESRC && !ci->sliced)
+			range = true;
+	}
+	return range && lion_keytest_leaf(cx->root, clause, cx->rti, &leaf);
+}
+
+/*
  * A WHERE restriction that is no OR (lion_count_path_where()): a range
  * comparison, gathered per column, or a clause the posting sets answer, with
  * what it says of its column noted.  False when no posting set answers it;
@@ -1304,7 +1413,14 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 	Index		rti = cx->rti;
 	LionLeafInfo leaf;
 
-	if (!lion_analyze_leaf(root, clause, rti, true, true, true, &leaf))
+	/*
+	 * ... or, where nothing answers it as it stands, a clause of one column
+	 * answered as the keys that pass it (DESIGN.md §10, "A test of each
+	 * key")
+	 */
+	if (!lion_analyze_leaf(root, clause, rti, true, true, true, &leaf) &&
+		!(lion_count_path_keytest_allowed(cx) &&
+		  lion_keytest_leaf(root, clause, rti, &leaf)))
 		return false;
 
 	/*
@@ -1647,6 +1763,8 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 			break;
 	}
 
+	if (leaf.keytest)
+		cx->nkeytest++;
 	lion_append_clause(&leaf, clause, false,
 					  &cx->whereattnos, &cx->clauseinfos, &cx->whereclauses,
 					  &cx->whereconsts, &cx->wherekinds, &cx->whereopnos,
@@ -1725,10 +1843,13 @@ lion_all_as_and(Node *clause)
  * over the table's own user columns, Params and constants that calls
  * nothing volatile and holds no subplan, which the node evaluates as the
  * ordinary plan's scan would - with ExecInitQual() - on the rows the
- * snapshot sees.  Over a partitioned table, not one on a partitioning key
- * with a Param or a stable function in it: that is a clause run-time
- * pruning decides, and the node, which keeps the planner's partitions
- * (§16), would fetch the rows of every partition pruning skips to test it.
+ * snapshot sees.  For the count of a LIMIT's rows (lion_count_rows.c), also
+ * none that hands a column to a function not marked leakproof, which may
+ * raise an error - `100 / w > 20` - on a row the LIMIT would never read.
+ * Over a partitioned table, not one on a partitioning key with a Param or a
+ * stable function in it: that is a clause run-time pruning decides, and the
+ * node, which keeps the planner's partitions (§16), would fetch the rows of
+ * every partition pruning skips to test it.
  */
 static bool
 lion_residual_ok(LionCountPathBuild *cx, RestrictInfo *rinfo)
@@ -1743,6 +1864,8 @@ lion_residual_ok(LionCountPathBuild *cx, RestrictInfo *rinfo)
 		return false;
 	if (contain_subplans(clause) || contain_volatile_functions(clause) ||
 		contain_agg_clause(clause) || contain_window_function(clause))
+		return false;
+	if (cx->leakproofresid && contain_leaked_vars(clause))
 		return false;
 	vars = pull_var_clause(clause, PVC_INCLUDE_PLACEHOLDERS);
 	foreach(lc, vars)
@@ -1815,9 +1938,16 @@ lion_rel_has_index(PlannerInfo *root, RelOptInfo *rel, AttrNumber attno,
 		}
 		return false;
 	}
-	return lion_match_index(rel, attno, ci->kind, ci->opno, ci->cmptype,
-							ci->strategy, ci->extractquery, ci->collation,
-							ci->positions, &col) != NULL;
+	{
+		IndexOptInfo *idx = lion_match_index(rel, attno, ci->kind, ci->opno,
+											 ci->cmptype, ci->strategy,
+											 ci->extractquery, ci->collation,
+											 ci->positions, &col);
+
+		/* a test of each key needs the rows' own values (§10) */
+		return idx != NULL &&
+			(!ci->keytest || lion_index_can_emit_value(idx, col));
+	}
 }
 
 /*
@@ -2142,7 +2272,37 @@ lion_count_path_where(LionCountPathBuild *cx)
 		 * (lion_count_path_where_leaf()).
 		 */
 		if (IsA(clause, BoolExpr) && ((BoolExpr *) clause)->boolop == OR_EXPR)
+		{
 			answered = lion_count_path_where_or(cx, clause);
+
+			/*
+			 * An OR of one column with a range among its arms - `c LIKE
+			 * 'c1%' OR c = 'c5'`, the LIKE its range (lion_like_as_and()) -
+			 * that the keys passing it could answer as well: the union
+			 * collects the range with no pin (DESIGN.md §32), and a count
+			 * with no other pinned source declines it, where the IN list
+			 * of the keys is pinned.  The build that tests its keys is made
+			 * as well (lion_try_count_path_scoped()), and add_path() keeps
+			 * the cheaper.
+			 */
+			if (answered && lion_count_path_keytest_allowed(cx) &&
+				lion_count_path_or_range(cx, startlen, clause))
+			{
+				if (!cx->rangeortest)
+					cx->nrangeor++;
+				else
+				{
+					lion_count_path_restore(cx, &snap);
+					lion_count_path_snapshot(cx, &snap);
+					if (!lion_count_path_where_leaf(cx, rinfo, clause))
+					{
+						lion_count_path_restore(cx, &snap);
+						lion_count_path_snapshot(cx, &snap);
+						answered = lion_count_path_where_or(cx, clause);
+					}
+				}
+			}
+		}
 		else if ((ands = lion_all_as_and(clause)) != NIL)
 		{
 			ListCell   *la;
@@ -2185,6 +2345,22 @@ lion_count_path_where(LionCountPathBuild *cx)
 		}
 		else
 			answered = lion_count_path_where_leaf(cx, rinfo, clause);
+
+		/*
+		 * An OR whose arms the posting sets do not all answer, of one column -
+		 * `t LIKE '%a' OR t LIKE '%b'`, `upper(t) = 'A' OR t = 'b'` - may be
+		 * a test of each key (DESIGN.md §10, "A test of each key"), its arms
+		 * taken back first.
+		 */
+		if (!answered && IsA(clause, BoolExpr) &&
+			((BoolExpr *) clause)->boolop == OR_EXPR &&
+			lion_count_path_keytest_allowed(cx))
+		{
+			lion_count_path_restore(cx, &snap);
+			lion_count_path_snapshot(cx, &snap);
+			answered = lion_count_path_where_leaf(cx, rinfo, clause);
+		}
+
 		/*
 		 * ... on a column no lion index covers, where it may be residual
 		 * (below) rather than decline the query when the indexes are
@@ -4847,7 +5023,7 @@ lion_count_path_topk(LionCountPathBuild *cx)
 		cx->ngroup != 1 ||
 		cx->nfilter > 0 ||
 		cx->decode || cx->partitioned || cx->sumall || cx->singlegroup ||
-		cx->groupderived ||
+		cx->groupderived || cx->nkeytest > 0 ||
 		cx->distvar != NULL || cx->groupcoal != NULL || cx->having != NIL ||
 		first == NULL || first->driveidx[0] == NULL)
 		return;
@@ -5046,6 +5222,16 @@ lion_count_path_fill(LionCountPathBuild *cx)
 							  cx->wherekinds, cx->whereopnos, cx->ors);
 	if (cx->partitioned)
 		lion_count_priv_set_parts(p, cx->targets, true);
+
+	/* the tests of each key (DESIGN.md §10, "A test of each key") */
+	if (cx->nkeytest > 0)
+	{
+		ListCell   *lc;
+		int			i = 0;
+
+		foreach(lc, cx->clauseinfos)
+			p->clause[i++].keytest = ((LionClauseInfo *) lfirst(lc))->keytest;
+	}
 
 	/* the ranges answered from slices (DESIGN.md §53), every bound */
 	if (cx->nsliced > 0)
@@ -6336,6 +6522,22 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	}
 
 	/*
+	 * The tests of each key (DESIGN.md §10, "A test of each key"), made
+	 * before the first row: every key of the column walked, asked for a
+	 * visible row and tested, in each relation counted - and in each
+	 * participant of a parallel count or GROUP BY, whole.
+	 */
+	if (cx->nkeytest > 0)
+	{
+		Cost		keys = lion_count_path_keytest_price(cx);
+
+		cpath->path.startup_cost += keys;
+		cpath->path.total_cost += keys;
+		rangeprice.whole += keys;
+		rangeprice.keys = keys;
+	}
+
+	/*
 	 * Against a bitmap heap scan with cold reads (DESIGN.md §39, "A bitmap
 	 * heap scan's cold reads"), the count's own reads beside them: its
 	 * directory leaves, posting pages and heap recheck, which its price
@@ -6372,6 +6574,7 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	rangeprice.perrange = lion_units_price(&units, rangeprice.perrange);
 	rangeprice.countrange = lion_units_price(&units, rangeprice.countrange);
 	rangeprice.whole = lion_units_price(&units, rangeprice.whole);
+	rangeprice.keys = lion_units_price(&units, rangeprice.keys);
 
 	/*
 	 * The top k's fallback (DESIGN.md §36): every group counted, at the
@@ -7126,7 +7329,7 @@ lion_count_path_decodable(LionCountPathBuild *cx)
 {
 	return lion_enable_decoded_walk &&
 		cx->ngroup == 2 && !cx->decode && cx->fj == NULL &&
-		cx->sattnos == NIL &&
+		cx->sattnos == NIL && cx->nkeytest == 0 &&
 		cx->anti == NULL &&
 		cx->distvar == NULL && cx->groupcoal == NULL &&
 		cx->groupdeps == NIL && !cx->sumall && !cx->singlegroup &&
@@ -7211,7 +7414,7 @@ static void
 lion_try_count_path_ext(PlannerInfo *root, RelOptInfo *input_rel,
 						RelOptInfo *output_rel, GroupPathExtraData *extra,
 						const LionFkJoin *fj, const LionSmallAnti *anti,
-						bool distinctstage)
+						bool distinctstage, bool leakproofresid)
 {
 	LionCountPathBuild cx;
 	LionPartialCands *cands;
@@ -7220,6 +7423,7 @@ lion_try_count_path_ext(PlannerInfo *root, RelOptInfo *input_rel,
 	lion_count_path_init(&cx, root, input_rel, output_rel, extra, fj);
 	cx.anti = anti;
 	cx.distinctstage = distinctstage;
+	cx.leakproofresid = leakproofresid;
 
 	if (!lion_count_path_query(&cx))
 		return;
@@ -7249,7 +7453,20 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				   const LionFkJoin *fj)
 {
 	lion_try_count_path_ext(root, input_rel, output_rel, extra, fj, NULL,
-							false);
+							false, false);
+}
+
+/*
+ * The same, for a count whose residual clauses (DESIGN.md §10) may only be
+ * ones that raise no error (lion_residual_ok()).
+ */
+void
+lion_try_count_path_leakproof(PlannerInfo *root, RelOptInfo *input_rel,
+							  RelOptInfo *output_rel,
+							  GroupPathExtraData *extra)
+{
+	lion_try_count_path_ext(root, input_rel, output_rel, extra, NULL, NULL,
+							false, true);
 }
 
 /*
@@ -7265,7 +7482,7 @@ lion_try_count_anti_path(PlannerInfo *root, RelOptInfo *input_rel,
 						 const LionSmallAnti *anti)
 {
 	lion_try_count_path_ext(root, input_rel, output_rel, extra, NULL, anti,
-							false);
+							false, false);
 }
 
 /*
@@ -7310,7 +7527,7 @@ lion_try_distinct_path(PlannerInfo *root, RelOptInfo *input_rel,
 	PG_TRY();
 	{
 		lion_try_count_path_ext(root, input_rel, output_rel, &extra, NULL,
-								NULL, true);
+								NULL, true, false);
 	}
 	PG_FINALLY();
 	{
@@ -7370,6 +7587,9 @@ lion_try_count_path_once(LionCountPathBuild *cx)
 		return false;
 	/* ... and the ranges from every partition's own slices (§53) */
 	if (!lion_count_path_slice_range_parts(cx))
+		return false;
+
+	if (!lion_count_path_keytest_ok(cx))
 		return false;
 
 	lion_count_path_estimate(cx);
@@ -7568,6 +7788,7 @@ lion_try_count_path_scoped(LionCountPathBuild *cxp)
 	LionCountPathBuild cx = *cxp;
 	bool		may;
 	bool		sliced = false;
+	bool		ok;
 
 	/* a GROUP BY of expressions, or a WHERE over them, counted by cells */
 	lion_try_count_cells(cxp);
@@ -7616,7 +7837,39 @@ lion_try_count_path_scoped(LionCountPathBuild *cxp)
 	if (sliced && lion_prefer_slice_ranges)
 		return;
 
-	if (lion_try_count_path_once(&cx))
+	/*
+	 * A build that tests the keys of some WHERE clauses (DESIGN.md §10, "A
+	 * test of each key") is made once more with those clauses left to what
+	 * else would take them - residual, or the ordinary plan - and add_path()
+	 * keeps the cheaper: a few rows the other clauses select are fetched for
+	 * less than every key is tested, and a shape that takes no test may take
+	 * a residual clause.
+	 */
+	ok = lion_try_count_path_once(&cx);
+
+	/*
+	 * ... and where it took an OR of one column with a range among its arms
+	 * as a union, once more with the keys that pass the OR tested instead.
+	 */
+	if (cx.nrangeor > 0)
+	{
+		LionCountPathBuild kt = *cxp;
+
+		kt.rangeortest = true;
+		if (lion_try_count_path_once(&kt))
+			ok = true;
+	}
+	if (cx.nkeytest > 0)
+	{
+		LionCountPathBuild nk = *cxp;
+
+		nk.nokeytest = true;
+		if (lion_try_count_path_once(&nk))
+			ok = true;
+		else if (!ok)
+			cx = nk;
+	}
+	if (ok)
 		return;
 
 	/*

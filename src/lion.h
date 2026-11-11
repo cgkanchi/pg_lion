@@ -2551,6 +2551,38 @@ extern bool lion_enable_plain_scan;	/* GUC pg_lion.enable_plain_scan */
  */
 extern int64 lion_container_to_tbm(const LionContainer *c, TIDBitmap *tbm,
 								  bool recheck);
+extern int64 lion_container_to_tbm_runs(const LionContainer *c,
+										TIDBitmap *tbm, bool recheck,
+										BlockNumber *lastblk, int64 *runs);
+
+/*
+ * The items of many keys, put in heap order on their way into a TIDBitmap
+ * (lion_tidbatch.c, DESIGN.md §28 "Many keys into one bitmap"): begin, for
+ * index name over a heap of about nblocks blocks; add each item as
+ * lion_container_to_tbm() would emit it (the number of members is returned
+ * the same way) while lion_tid_batch_keeps() says so, and emit it with
+ * lion_container_to_tbm() once it does not; and end, told how many TIDs the
+ * walk emitted, which emits what is left and frees the batch.  What it keeps
+ * is held to about work_mem.
+ */
+typedef struct LionTidBatch LionTidBatch;
+
+/* the head of a LionTidBatch, which a walk reads for every item */
+typedef struct LionTidBatchHead
+{
+	bool		direct;			/* it takes no more items */
+} LionTidBatchHead;
+
+extern LionTidBatch *lion_tid_batch_begin(const char *name, TIDBitmap *tbm,
+										  bool recheck, BlockNumber nblocks);
+extern int64 lion_tid_batch_add(LionTidBatch *b, const LionContainer *c);
+extern void lion_tid_batch_end(LionTidBatch *b, int64 ntids);
+
+static inline bool
+lion_tid_batch_keeps(const LionTidBatch *b)
+{
+	return !((const LionTidBatchHead *) b)->direct;
+}
 
 
 /* ---------- additive helpers (wave 1, agent "am-core") ---------- */

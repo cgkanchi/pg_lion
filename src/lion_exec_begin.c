@@ -1434,6 +1434,71 @@ lion_begin_wagg(LionCountScanState *st, CustomScanState *node,
 }
 
 /*
+ * A test of each key (DESIGN.md §10, "A test of each key"): the clause
+ * initialised as a qual, the way the ordinary plan's scan initialises it
+ * (ExecInitQual(), which checks EXECUTE on every function it calls), over a
+ * slot of the node's own scan tuple whose one column the clause reads -
+ * setrefs.c pointed its Var at that column's place in custom_scan_tlist,
+ * where each key tested goes.  The list of the keys that pass is of the
+ * equality's right-hand type, which the index compares its keys with.
+ */
+static void
+lion_begin_keytest(LionCountScanState *st, CustomScanState *node,
+				   LionClauseState *cl)
+{
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	EState	   *estate = node->ss.ps.state;
+	List	   *vars;
+	ListCell   *lc;
+	Oid			lefttype;
+	Oid			righttype;
+
+	cl->con = NULL;
+	cl->valstate = NULL;
+	cl->keypos = 0;
+	if (cl->kind != LION_CLAUSE_ARRAY)
+		elog(ERROR, "LionCount: a test of each key of clause kind %d",
+			 cl->kind);
+
+	vars = pull_var_clause((Node *) cl->valexpr, 0);
+	foreach(lc, vars)
+	{
+		Var		   *var = (Var *) lfirst(lc);
+		TargetEntry *tle;
+
+		if (var->varno != INDEX_VAR || var->varattno < 1 ||
+			var->varattno > list_length(cscan->custom_scan_tlist))
+			elog(ERROR, "LionCount: a test of each key reads no column of the scan");
+		tle = (TargetEntry *) list_nth(cscan->custom_scan_tlist,
+									   var->varattno - 1);
+		if (!IsA(tle->expr, Var) ||
+			((Var *) tle->expr)->varattno != cl->attno ||
+			(cl->keypos != 0 && cl->keypos != var->varattno))
+			elog(ERROR, "LionCount: a test of each key reads more than its column");
+		cl->keypos = var->varattno;
+	}
+	list_free(vars);
+	if (cl->keypos == 0)
+		elog(ERROR, "LionCount: a test of each key reads no column");
+
+	op_input_types(cl->opno, &lefttype, &righttype);
+	cl->keytype = righttype;
+	cl->valtype = get_array_type(righttype);
+	if (!OidIsValid(cl->valtype))
+		elog(ERROR, "LionCount: no array type for the keys of a test");
+
+	cl->keyqual = ExecInitQual(list_make1(cl->valexpr), &node->ss.ps);
+	cl->keyslot = ExecInitExtraTupleSlot(estate,
+										 node->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
+										 &TTSOpsVirtual);
+	cl->keycxt = AllocSetContextCreate(estate->es_query_cxt,
+									   "lion key tests",
+									   ALLOCSET_DEFAULT_SIZES);
+	if (st->keyecxt == NULL)
+		st->keyecxt = CreateExprContext(estate);
+}
+
+/*
  * The plan's clauses, one LionClauseState each: what kind, on which column
  * and index, under which operator, and how its value is had.
  */
@@ -1465,6 +1530,17 @@ lion_begin_clauses(LionCountScanState *st, CustomScanState *node,
 		 */
 		cl->valexpr = (Expr *) list_nth(exprs, i);
 		cl->valtype = exprType((Node *) cl->valexpr);
+
+		/*
+		 * A test of each key's expression is the clause, evaluated over the
+		 * keys (DESIGN.md §10, "A test of each key"), whose list it makes.
+		 */
+		cl->keytest = priv->clause[i].keytest;
+		if (cl->keytest)
+		{
+			lion_begin_keytest(st, node, cl);
+			continue;
+		}
 
 		/*
 		 * The join key's value is not evaluated at all: it is a column of the

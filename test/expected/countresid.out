@@ -99,11 +99,11 @@ SELECT cr_plan('SELECT count(*) FROM cr WHERE a = 2 AND p LIKE ''a%''');
 (3 rows)
 
 SELECT cr_plan('SELECT b, count(*) FROM cr WHERE a = 2 AND id % 3 = 0 AND length(t) = 2 GROUP BY b');
-                         cr_plan                         
----------------------------------------------------------
+                            cr_plan                             
+----------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: cr_b (b), cr_a (a = 2)
-   Residual Filter: ((length(t) = 2) AND ((id % 3) = 0))
+   Lion Indexes: cr_b (b), cr_a (a = 2), cr_t ((length(t) = 2))
+   Residual Filter: ((id % 3) = 0)
    Group Key: b
 (4 rows)
 
