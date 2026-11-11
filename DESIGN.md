@@ -5347,8 +5347,9 @@ Tests: `test/sql/scan_notnull.sql` (§29.12).
 ## 15. IN lists and ScalarArrayOp (v1, implemented)
 
 AM: `amsearcharray = true`. liongetbitmap receives an SK_SEARCHARRAY key whose argument is an array
-datum: deconstruct it, skip NULL elements, look up each value and emit its set. Duplicates are not
-filtered there - set semantics make them harmless, they only cost a second lookup.
+datum: deconstruct it, skip NULL elements, look up each value and emit its set, through the batch of
+§28 ("Many keys into one bitmap") when there are several. Duplicates are not filtered there - set
+semantics make them harmless, they only cost a second lookup.
 
 Count pushdown: accept `ScalarArrayOpExpr` with useOr = true whose operator is strategy 1 of the
 index opfamily and whose array is a non-NULL one-dimensional Const of at most LION_MAX_LIST_ELEMS =
@@ -17282,7 +17283,9 @@ The walk emits entry by entry: an INLINE payload from the leaf's private copy, a
 `lion_emit_chain()` one page at a time, with nothing pinned between entries. A range of any width
 therefore holds at most one index pin at a time and draws nothing from §15's pin budget - the bitmap
 scan needs no §9 interlock at all, since the executor visits every TID it emits - and its memory is
-the TIDBitmap's own `work_mem` budget, which goes lossy rather than growing.
+about the TIDBitmap's own `work_mem` budget, which turns pages lossy to stay within it and is raised
+only when lossy pages cannot get it there, and about as much again for the TIDs it gathers by heap
+block on their way into the bitmap ("Many keys into one bitmap" below).
 
 On a column with SUMMARY posting sets (§32) the walk is the summed walk of a count
 (`lion_entry_scan_begin_summed()`, from `lion_walk_begin()`): the keys of the buckets at the range's
@@ -17371,6 +17374,89 @@ recheck only on a column that has an equality or a list of its own. `test/sql/ra
 has the shape - a synthetic table, the bound a literal, a stable expression and a generic plan's
 parameter, with and without summaries - at a `work_mem` that holds the answer exactly and the range
 alone lossily: no row removed by the recheck and no lossy page.)*
+
+### Many keys into one bitmap
+
+A TIDBitmap finds a heap page's entry by hashing its block number, once for each run of TIDs on one
+page that `tbm_add_tuples()` is handed. One key's posting set comes in TID order, a page at a time.
+A walk of many keys emits key after key, and on a column in no heap order each key's few rows are
+spread over the whole heap: every TID is then a run of its own and a lookup, a cache miss once the
+bitmap holds more pages than the cache. On a 5M-row table of 56,819 pages (PostgreSQL 18.7, warm
+cache) one key's 2.5M TIDs took 9 ns each; the same number from a range over 9,901 keys 39 ns and
+over 499,000 keys 62 ns, two thirds of it in the bitmap's hash table.
+
+So every walk of many keys - a range (this section), `IS NOT NULL` (§14), `< ANY` (above), the
+whole-index fallback of a multi-key query (§17) and a list of values (§15) - puts its items through
+a batch (`lion_tidbatch.c`) that gathers them by container key (§2: 64 heap blocks at 8K) and gives
+them to the bitmap a heap block at a time:
+
+- A container key's members are appended to an array of lo values; past `LION_ARRAY_MAX_CARD` (the
+  4 KB of a BITSET) the array is folded into a bitset, and from then on it is a buffer of 512
+  members folded in whenever it fills. Setting each TID's bit as it came would be a cache miss a TID
+  again once the bitsets outgrow the cache - 3.5 MB of them for the table above - where an append
+  writes to the cache line at the array's end. The keys' slots are found through a two-level
+  directory indexed by container key, not a hash.
+- What is kept goes to the bitmap when the walk is over, or whenever it outgrows `work_mem`: one
+  `tbm_add_tuples()` a heap block, an array counting-sorted by block first. The bound is
+  approximate: it counts the arena blocks handed out. What an item will take is reckoned before it
+  is kept - the directory chunks of 1,024 slots (24 KB each) it has no slots in yet, several for a
+  sparse item, the directory itself, grown once for the item (a pointer for each 65,536 heap blocks,
+  512 KB at 2^32 blocks), and its slots' arrays as they grow or fold into bitsets, each counted
+  whole since the array it replaces is given back only after - and when that would pass `work_mem`,
+  what is kept is flushed first; an item that could not fit even then goes to the bitmap at once.
+  Only a damaged item, whose members are not what its header says, can pass the bound; a check after
+  each item flushes then. The arena maps regions of 1 MB and more and keeps them across flushes;
+  only the pages written to take memory. The bitmap's own memory is the TIDBitmap's, as in any
+  bitmap scan.
+- It is kept in an arena of anonymous memory (`lion_arena.c` without a file), unmapped when the walk
+  ends or with the query's memory if it fails, not in palloc's. glibc's malloc gives the top of its
+  heap back to the kernel once it is free and larger than twice the largest block malloc has
+  unmapped, and a TIDBitmap's page table, which doubles, each table made before the last is freed,
+  leaves a heap of about that size; a few hundred kilobytes more from the batch tipped scans that
+  had stayed under that line over it, and the next scan faulted the whole heap in again (3,000
+  faults, 4 ms, on the table below).
+- An item of 512 members or more is a few TIDs a page already and goes to the bitmap at once.
+- Batching saves only the lookups of a page the bitmap already has. Until the bitmap has been given
+  as many TIDs as the heap had pages at its last VACUUM or ANALYZE (`relpages`), most TIDs are a
+  page's first, and they go to the bitmap at once: a narrow range over few rows costs what it did.
+- A walk in heap order already - a range over a column the rows were appended in the order of -
+  hands the bitmap its TIDs a page at a time without help. While the bitmap warms up, the batch
+  counts the runs of one heap block among the TIDs of the items under 512 members; at four TIDs a
+  run or more, the rest of the walk goes to the bitmap at once too.
+- A flush before the end that found fewer than two TIDs a page - a heap far larger than `work_mem`,
+  whose rows the walk spreads thinner than that between two flushes - stops the batching, and the
+  rest of the walk goes to the bitmap at once.
+
+A scan returns the same rows either way; only the order of `tbm_add_tuples()` calls changes. A
+bitmap that passes `work_mem` and turns pages lossy does so at a different moment, so other pages
+can end up lossy and a different number of rows is rechecked.
+Each walk's DEBUG1 line says how many TIDs went through the batch and in how many flushes
+(`test/sql/bitmap_heaporder.sql`, which checks every answer against a sequential scan: ranges above
+and below `relpages`, a list, `IS NOT NULL`, a multi-key fallback rechecked, a walk in heap order,
+several flushes at `work_mem` = 64kB, a lossy bitmap).
+
+Measured on the same rows with two columns in heap order added (61,729 pages), PostgreSQL 18.7
+release build, warm cache, `work_mem` = 4MB, the Bitmap Index Scan alone (median over three rounds
+of seven runs, each round alternating with the code before; the heap scan after it is unchanged):
+
+| Walk | Keys | TIDs | Before | After |
+|---|---:|---:|---:|---:|
+| `c200 BETWEEN 10 AND 110` | 101 | 2.54M | 97 ms | 42 ms |
+| `c20k BETWEEN 5000 AND 14900` | 9,901 | 2.47M | 108 ms | 50 ms |
+| `c1m BETWEEN 1000 AND 500000` | 495,641 | 2.50M | 156 ms | 93 ms |
+| `c20k IS NOT NULL` | 20,000 | 5.00M | 207 ms | 87 ms |
+| `c200 BETWEEN 10 AND 49` | 40 | 1.00M | 40 ms | 19 ms |
+| `c20k BETWEEN 5000 AND 8999` | 4,000 | 1.00M | 46 ms | 25 ms |
+| `c1m BETWEEN 1000 AND 200000` | 197,723 | 1.00M | 69 ms | 43 ms |
+| `c200 IN` (20 values) | 20 | 0.50M | 24 ms | 17 ms |
+| `c200 IN` (10 values), `c20k BETWEEN 5000 AND 5999` | 10, 1,000 | 0.25M | 14 to 16 ms | 14 ms |
+| narrower ranges (3 to 10,001 keys, 25k to 125k TIDs) | | | 3 to 10 ms | the same |
+| `ts BETWEEN 10000 AND 60000`: 50 rows a key, in heap order | 50,001 | 2.50M | 20 ms | the same |
+| `ts3 BETWEEN 100000 AND 900000`: 3 rows a key, in heap order | 800,001 | 2.40M | 84 ms | the same |
+
+At four TIDs a heap page or fewer there is little to gather, and the batch costs about what it
+saves; a walk in heap order goes to the bitmap at once after the warm-up. What is left on the
+widest walks is the walk itself: decoding half a million entries' items and appending their TIDs.
 
 ### amcostestimate
 
