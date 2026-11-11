@@ -21,12 +21,12 @@
  * What an item will take - the directory chunks it has no slots in yet, the
  * directory as it grows, the scratch, its slots' arrays and bitsets - is
  * reckoned before it is kept: when that would pass the bound, what is kept is
- * flushed, and an item that could not fit even then goes at once.  Only a
- * damaged item can pass it.  A container key's slot is found through a
- * two-level directory of slots, not a hash: container keys are small and
- * dense, and so are the slots, a 5M-row table's in 21 kB.  All of it is in an
- * arena of anonymous memory, outside malloc's heap (lion_tid_batch_map() says
- * why).
+ * flushed, and an item that could not fit even then goes at once.  Beyond the
+ * moment one array is copied into a larger one, only a damaged item can pass
+ * it.  A container key's slot is found through a two-level directory of slots,
+ * not a hash: container keys are small and dense, and so are the slots, a
+ * 5M-row table's in 21 kB.  All of it is in an arena of anonymous memory,
+ * outside malloc's heap (lion_tid_batch_map() says why).
  *
  * An array that would outgrow LION_ARRAY_MAX_CARD members, the size of a 4 KB
  * bitset of the container's TIDs, is FOLDED into one, and from then on the
@@ -250,27 +250,38 @@ lion_tid_free(LionTidBatch *b, void *p, Size size)
 	b->held -= lion_tid_class_bytes(size);
 }
 
+/*
+ * The directory grown to n chunks, in one step for an item: a grown array is
+ * taken before the old one is given back, so growing it once keeps that peak
+ * to what lion_tid_item_bytes() counted.
+ */
+static void
+lion_tid_dir_grow(LionTidBatch *b, uint32 n)
+{
+	LionTidSlot **dir;
+
+	Assert(n > b->ndir);
+	dir = (LionTidSlot **) lion_tid_alloc(b, sizeof(LionTidSlot *) * n);
+	memset(dir + b->ndir, 0, sizeof(LionTidSlot *) * (n - b->ndir));
+	if (b->ndir > 0)
+	{
+		memcpy(dir, b->dir, sizeof(LionTidSlot *) * b->ndir);
+		lion_tid_free(b, b->dir, sizeof(LionTidSlot *) * b->ndir);
+	}
+	b->dir = dir;
+	b->ndir = n;
+}
+
 /* The slot of ckey. */
 static inline LionTidSlot *
 lion_tid_slot(LionTidBatch *b, uint32 ckey)
 {
 	uint32		hi = ckey >> LION_TID_BATCH_DIR_BITS;
 
-	if (hi >= b->ndir)
-	{
-		uint32		n = Max(hi + 1, b->ndir * 2);
-		LionTidSlot **dir;
-
-		dir = (LionTidSlot **) lion_tid_alloc(b, sizeof(LionTidSlot *) * n);
-		memset(dir + b->ndir, 0, sizeof(LionTidSlot *) * (n - b->ndir));
-		if (b->ndir > 0)
-		{
-			memcpy(dir, b->dir, sizeof(LionTidSlot *) * b->ndir);
-			lion_tid_free(b, b->dir, sizeof(LionTidSlot *) * b->ndir);
-		}
-		b->dir = dir;
-		b->ndir = n;
-	}
+	/* lion_tid_batch_add() grew the directory for the item's every key */
+	if (unlikely(hi >= b->ndir))
+		elog(ERROR, "lion TID batch: container key %u past a directory of %u chunks",
+			 ckey, b->ndir);
 	if (b->dir[hi] == NULL)
 	{
 		b->dir[hi] = (LionTidSlot *)
@@ -325,7 +336,7 @@ lion_tid_item_chunk(const LionTidBatch *b, uint32 hi, uint32 *nd,
 {
 	if (hi >= b->ndir || b->dir[hi] == NULL)
 		(*fresh)++;
-	/* as lion_tid_slot() grows the directory */
+	/* doubled at least, so that it is seldom grown again */
 	if (hi >= *nd)
 		*nd = Max(hi + 1, *nd * 2);
 }
@@ -334,7 +345,7 @@ lion_tid_item_chunk(const LionTidBatch *b, uint32 hi, uint32 *nd,
  * What keeping item c takes from the arena: the scratch if b has none, the
  * directory chunks it has no slots in yet, the directory when it grows for
  * them (a pointer for each 65,536 heap blocks at 8K), and what its members
- * add to their slots.  *ndir is what the directory will have grown to.  A
+ * add to their slots.  *ndir is what the directory is grown to first.  A
  * sparse item's pairs come sorted by code, so a container key's come
  * together, and a chunk's; a damaged one counts what iterating it yields.
  */
@@ -664,6 +675,8 @@ lion_tid_batch_add(LionTidBatch *b, const LionContainer *c)
 		lion_tid_batch_map(b);
 	if (b->scratch == NULL)
 		b->scratch = (LionTidScratch *) lion_tid_alloc(b, sizeof(LionTidScratch));
+	if (ndir > b->ndir)
+		lion_tid_dir_grow(b, ndir);
 
 	if (c->type == LION_CT_SPARSE)
 	{
@@ -691,7 +704,6 @@ lion_tid_batch_add(LionTidBatch *b, const LionContainer *c)
 								   b->scratch->members, k);
 		n = k;
 	}
-	Assert(n == 0 || b->ndir == ndir);
 
 	b->pending += n;
 	b->nkept += n;
