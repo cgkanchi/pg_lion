@@ -62,10 +62,14 @@ teardown
 	DROP TABLE srg;
 }
 
+# Each session's min and max are the slices' own: LionCountMinMax, which
+# walks an index for them, is off (countminmax.sql tests it).
+
 # The long-lived REPEATABLE READ reader, which also shows that the node
 # answers its ranges from the slices.
 session s1
 setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off;
+				  SET pg_lion.enable_count_minmax = off;
 				  SET pg_lion.enable_plain_scan = off;
 				  SET pg_lion.prefer_slice_ranges = on; SET TimeZone = 'UTC'; }
 step s1_explain	{ EXPLAIN (COSTS OFF)
@@ -82,6 +86,7 @@ step s1_commit	{ COMMIT; }
 # across the ranges' bounds, a delete.
 session s2
 setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off;
+				  SET pg_lion.enable_count_minmax = off;
 				  SET pg_lion.enable_plain_scan = off;
 				  SET pg_lion.prefer_slice_ranges = on; SET TimeZone = 'UTC'; }
 step s2_begin	{ BEGIN; }
@@ -99,6 +104,7 @@ step s2_rollback	{ ROLLBACK; }
 # A reader that takes a fresh snapshot for every statement, and a VACUUM.
 session s3
 setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off;
+				  SET pg_lion.enable_count_minmax = off;
 				  SET pg_lion.enable_plain_scan = off;
 				  SET pg_lion.prefer_slice_ranges = on; SET TimeZone = 'UTC'; }
 step s3_ranges	{ SELECT * FROM srg_both(); }

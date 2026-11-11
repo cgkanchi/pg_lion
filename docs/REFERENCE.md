@@ -713,6 +713,22 @@ working around a bad choice:
 
 - `pg_lion.enable_count_pushdown`: answer `count(*)` from Lion indexes with the `LionCount`
   custom scan (DESIGN.md §10). Off, it turns off `pg_lion.enable_semijoin`'s joins too.
+- `pg_lion.enable_lateral_counts`: plan a query that joins in a grouped subquery a second time,
+  with the join clause moved into the subquery as a `LATERAL` reference, and keep the cheaper
+  plan (DESIGN.md §56). For
+
+      SELECT u.id, s.n FROM users u
+        JOIN (SELECT user_id, count(*) AS n FROM events WHERE status = 'paid'
+               GROUP BY user_id) s ON s.user_id = u.id
+       WHERE u.region = 'r3';
+
+  that is one `LionCount` of each user's paid events per outer row instead of every user's
+  count grouped first. Tried when the clause is an equality of the subquery's grouping column,
+  that column has a Lion index, every join is an inner join and the subquery's rows are its
+  groups' own (no window function, `DISTINCT`, `LIMIT`, grouping sets or volatile function);
+  each such query is planned twice. Needs the library loaded before the query is planned
+  (`shared_preload_libraries` or `session_preload_libraries`): otherwise the first query of a
+  session, the one that loads it, is planned as written.
 - `pg_lion.enable_semijoin`: offer `LionSemiJoin` and `LionAntiJoin`, a semi or anti join over a
   fact table answered from the Lion index on its foreign key (DESIGN.md §27, "The semi and anti
   join as a join path"). PostgreSQL's `enable_hashjoin`, `enable_mergejoin` and `enable_nestloop`
@@ -882,6 +898,23 @@ working around a bad choice:
   answers - `payload LIKE 'ab%'`, `id > 1000`, `length(s) = 64` - beside ones that do, testing it on
   the heap row of each row the others select (DESIGN.md §10, "Residual clauses"), over one table or
   each partition of a partitioned one (§16). Off, such a count goes to the ordinary plan.
+- `pg_lion.enable_key_tests`: let the count pushdown answer a `WHERE` clause of one Lion-indexed
+  column of few distinct values that no index answers as it stands - `lower(status) = 'paid'`,
+  `country ILIKE 'c1%'`, `country ~ '^c[12]$'`, `kind % 5 = 0` - by testing each of the column's
+  keys once and counting the keys that pass as an `IN` list (DESIGN.md §10, "A test of each key").
+  The column's statistics have to put its distinct values at 1% of the table's rows or fewer, and
+  its index has to store the rows' exact values (as for `enable_expr_groups`). The clause has to be
+  immutable, read no other column, be NULL or false where the column is NULL, and call only
+  functions that cannot fail on a value: leakproof ones, text's `lower()`, `upper()`, `initcap()`,
+  lengths, trims, `left()`, `right()`, `substr()` and `||`, `LIKE`, `ILIKE` and regular
+  expressions against a constant or a parameter, and an integer division or remainder by a
+  constant. Taken in a count, a `GROUP BY` and a `count(DISTINCT)`, over one table or a
+  partitioned one; not in a `FILTER`, a count by cells, a join or the top k. EXPLAIN prints the
+  clause itself among the `Lion Indexes`, and ANALYZE counts `Keys Tested` and `Keys Passed`. Off,
+  such a clause is residual (above) or the query goes to the ordinary plan:
+
+      Custom Scan (LionCount)
+        Lion Indexes: t_c ((c ~~* 'C1%'::text)), t_s (s = 's3'::text)
 - `pg_lion.enable_count_anti`: let the count pushdown answer `SELECT count(*) FROM t WHERE ... AND
   NOT EXISTS (SELECT 1 FROM s WHERE s.a = t.k ...)` over a small inner side as the count of the
   `WHERE` less the rows some inner row matches: the node runs the inner side as its child, looks
@@ -921,6 +954,20 @@ working around a bad choice:
   clause or an `ORDER BY` of the window function. EXPLAIN shows the count as the node's first
   child and prints the window function as `count(*)`. `pg_lion.enable_count_pushdown = off` turns
   it off too.
+- `pg_lion.enable_count_rows`: answer a `LIMIT` over rows of one table that read no column - the
+  subquery of a capped count, `SELECT count(*) FROM (SELECT 1 FROM t WHERE ... LIMIT 10001) s` -
+  with the `LionCountRows` node (DESIGN.md §10, "A count capped by a LIMIT"): the pushdown's count
+  of the table under the same `WHERE`, less the `OFFSET`, up to the `LIMIT`, that many rows of the
+  target. Not with an `ORDER BY`, `DISTINCT`, grouping, a join, `FOR UPDATE`, `WITH TIES`, a
+  set-returning function or a volatile target or `WHERE` clause. `pg_lion.enable_count_pushdown =
+  off` turns it off too.
+- `pg_lion.enable_count_minmax`: answer `min()` and `max()` beside a `count(*)` - `SELECT count(*),
+  min(ts), max(ts) FROM t WHERE ...` - with the `LionCountMinMax` node (DESIGN.md §10, "A count
+  beside min or max"): the pushdown's count of the other aggregates, and for each `min` or `max`
+  the first row of an ordered walk under the same `WHERE`, an InitPlan as PostgreSQL makes for a
+  query of only `min` and `max`. Not under a `GROUP BY`, `HAVING`, a window or a join, nor with a
+  `FILTER` or `ORDER BY` on the `min` or `max`, a volatile `WHERE` clause, one that reads an outer
+  query's row, or row-level security. `pg_lion.enable_count_pushdown = off` turns it off too.
 - `pg_lion.enable_probe_join`: group a join of a table to a dimension by the dimension's primary
   key with `LionProbeJoin` (DESIGN.md §46) - `SELECT CASE WHEN d.region IN ('north', 'east') THEN
   'ne' ELSE 'other' END, f.channel, count(*) FROM fact f JOIN dim d ON f.dim_id = d.id WHERE

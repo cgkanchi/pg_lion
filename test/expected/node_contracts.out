@@ -115,6 +115,12 @@ INSERT INTO nc_nodes VALUES
 	 'SELECT id, count(*) OVER () FROM nc WHERE k = 3 ORDER BY o LIMIT 5', 'int4eq(int4,int4)', ''),
 	('LionWindowCount, its window function',
 	 'SELECT id, count(1) OVER () FROM nc WHERE k = 3 ORDER BY o LIMIT 5', 'count("any")', ''),
+	('LionCountRows',
+	 'SELECT count(*) FROM (SELECT 1 FROM nc WHERE k = 3 LIMIT 200) s', 'int4eq(int4,int4)', ''),
+	('LionCountMinMax',
+	 'SELECT count(*), min(o), max(o) FROM nc WHERE k = 3 AND j = 2', 'int4eq(int4,int4)', ''),
+	('LionCountMinMax, its min or max',
+	 'SELECT count(*), min(o), max(o) FROM nc WHERE k = 3 AND j = 2', 'max(int4)', ''),
 	('LionSemiJoin',
 	 'SELECT d.pk FROM ncd d WHERE EXISTS (SELECT 1 FROM nc WHERE nc.k = d.pk AND nc.j = 3)',
 	 'int4eq(int4,int4)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
@@ -442,6 +448,27 @@ SELECT node, nc_check(node) FROM nc_nodes ORDER BY node;
  LionCount, its aggregate                         | granted to the role: the answer
  LionCount, its aggregate                         | a cached plan (planned, the answer) without it: ERROR: permission denied for aggregate count
  LionCount, its aggregate                         | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for aggregate count
+ LionCountMinMax                                  | plan: planned
+ LionCountMinMax                                  | every privilege: the ordinary plan's answer
+ LionCountMinMax                                  | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
+ LionCountMinMax                                  | plain EXPLAIN: as the ordinary plan
+ LionCountMinMax                                  | granted to the role: the answer
+ LionCountMinMax                                  | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
+ LionCountMinMax                                  | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
+ LionCountMinMax, its min or max                  | plan: planned
+ LionCountMinMax, its min or max                  | every privilege: the ordinary plan's answer
+ LionCountMinMax, its min or max                  | without EXECUTE on max(integer): ERROR: permission denied for aggregate max, as the ordinary plan
+ LionCountMinMax, its min or max                  | plain EXPLAIN: as the ordinary plan
+ LionCountMinMax, its min or max                  | granted to the role: the answer
+ LionCountMinMax, its min or max                  | a cached plan (planned, the answer) without it: ERROR: permission denied for aggregate max
+ LionCountMinMax, its min or max                  | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for aggregate max
+ LionCountRows                                    | plan: planned
+ LionCountRows                                    | every privilege: the ordinary plan's answer
+ LionCountRows                                    | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
+ LionCountRows                                    | plain EXPLAIN: as the ordinary plan
+ LionCountRows                                    | granted to the role: the answer
+ LionCountRows                                    | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
+ LionCountRows                                    | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
  LionJoinAgg                                      | plan: planned
  LionJoinAgg                                      | every privilege: the ordinary plan's answer
  LionJoinAgg                                      | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
@@ -540,7 +567,7 @@ SELECT node, nc_check(node) FROM nc_nodes ORDER BY node;
  LionWindowCount, its window function             | granted to the role: the answer
  LionWindowCount, its window function             | a cached plan (planned, the answer) without it: ERROR: permission denied for function count
  LionWindowCount, its window function             | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function count
-(224 rows)
+(245 rows)
 
 -- nothing is left revoked from PUBLIC by this file
 SELECT fn FROM nc_nodes WHERE NOT has_function_privilege('public', fn, 'EXECUTE');

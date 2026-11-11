@@ -27,6 +27,8 @@
  *	  - a reset frees everything, keeps the regions, and hands them out
  *		again from the first; a release unmaps them and leaves an arena
  *		that can be set up again;
+ *	  - with no file, the regions are anonymous memory, zero filled, and
+ *		grow, reset and release as a file's do;
  *	  - under random requests and returns of random sizes, the shadow model
  *		holds: no overlap, every live block's bytes intact, containment
  *		true for every live block and false outside the arena, and the
@@ -505,6 +507,52 @@ test_reset(void)
 	test_file_close(&tf);
 }
 
+static void
+test_anonymous(void)
+{
+	LionArena	a;
+	LionArenaRegion regions[NREGIONS];
+	char	   *p;
+	char	   *q = NULL;
+	int			i;
+
+	phase("anonymous");
+	lion_arena_init(&a, regions, NREGIONS, NULL, NULL, NULL);
+	p = (char *) lion_arena_alloc(&a, 64);
+	CHECK(p != NULL && a.nregions == 1 && a.regions[0].size == LION_ARENA_GRAIN,
+		  "no file: a region of a grain");
+	for (i = 0; p != NULL && i < 64; i++)
+	{
+		if (p[i] != 0)
+			break;
+	}
+	CHECK(i == 64, "... zero filled");
+	if (p == NULL)
+		return;
+	memset(p, 0xAB, 64);
+	for (i = 0; i < 300; i++)
+	{
+		q = (char *) lion_arena_alloc(&a, 4104);
+		if (q == NULL)
+			break;
+		q[0] = 1;
+		q[4103] = 2;
+	}
+	CHECK(i == 300 && a.nregions == 2,
+		  "300 containers, each written to its last byte: two regions");
+	CHECK(p[0] == (char) 0xAB && p[63] == (char) 0xAB,
+		  "... and the first block intact");
+	CHECK(a.filesize == 2 * LION_ARENA_GRAIN, "... their sizes summed");
+
+	lion_arena_reset(&a);
+	CHECK(a.nregions == 2 && lion_arena_used(&a) == 0,
+		  "reset keeps the regions, with nothing used");
+	q = (char *) lion_arena_alloc(&a, 64);
+	CHECK(q == a.regions[0].base, "... and hands out the first region's first");
+	lion_arena_release(&a);
+	CHECK(a.nregions == 0 && lion_arena_used(&a) == 0, "released");
+}
+
 /* ----------------------------------------------------------------
  *						random, against a shadow
  * ----------------------------------------------------------------
@@ -649,6 +697,7 @@ main(void)
 	test_regions();
 	test_failures();
 	test_reset();
+	test_anonymous();
 	test_random();
 
 	printf("arena_test: %ld checks, %ld failures\n", nchecks, nfail);
