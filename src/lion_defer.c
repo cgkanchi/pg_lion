@@ -304,7 +304,7 @@ lion_defer_row_pos(const LionState *state, const LionInsertRow *row)
 {
 	Assert(state->positions && row->flag == 0 && !state->typbyval);
 	return (const LionDeferPos *)
-		(DatumGetPointer(row->key) +
+		((const char *) DatumGetPointer(row->key) +
 		 MAXALIGN(lion_defer_key_len(state, row->key)));
 }
 
