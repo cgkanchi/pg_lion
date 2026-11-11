@@ -1051,12 +1051,13 @@ lion_count_path_group_by(LionCountPathBuild *cx)
 			 * which emits partial counts too - a combination's rows may come
 			 * out in more than one row, when a pass's tally spills - for a
 			 * Finalize Agg to add up: the same two requirements.  It counts
-			 * one table, and is not made on a hot standby, where no WHERE is
-			 * collected.
+			 * one table, or each partition in its turn (§16, "The decoded
+			 * walk over partitions"), and is not made on a hot standby,
+			 * where no WHERE is collected.
 			 */
 			if (nvar > 2 &&
 				(!lion_enable_decoded_walk ||
-				 cx->partitioned || !sgc->hashable || extra == NULL ||
+				 !sgc->hashable || extra == NULL ||
 				 (extra->flags & GROUPING_CAN_PARTIAL_AGG) == 0 ||
 				 RecoveryInProgress()))
 				return false;
@@ -3780,7 +3781,7 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 	 */
 	if (cx->residual != NIL &&
 		(!cx->havepositive || cx->sumall || cx->runtimemulti ||
-		 cx->wattnos != NIL))
+		 cx->wattnos != NIL || cx->decode))
 		return false;
 
 	/*
@@ -4232,12 +4233,12 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 	 */
 	if (cx->ngroup == 0)
 		cx->outrows = 1.0;
-	else if (cx->decode)
+	else if (cx->decode && !cx->partitioned)
 	{
 		/*
 		 * The decoded walk's rows are partial counts, one a combination with
 		 * rows (DESIGN.md §34), below a Finalize Agg - as a partitioned
-		 * table's are.
+		 * table's are, a partition's decoded walk's among them.
 		 */
 		cx->outrows = cx->numgroups;
 		cx->partialtarget = lion_make_partial_target(root,
@@ -4266,16 +4267,17 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 			double		relrows = Max(t->rel->rows, 1.0);
 			double		relgroups;
 
-			if (t->drivevar[0] != NULL && cx->ngroup == 2 &&
-				t->drivevar[1] != NULL)
-				relgroups = estimate_num_groups(root,
-												list_make2(t->drivevar[0],
-														   t->drivevar[1]),
-												relrows, NULL, NULL);
-			else if (t->drivevar[0] != NULL)
-				relgroups = estimate_num_groups(root,
-												list_make1(t->drivevar[0]),
-												relrows, NULL, NULL);
+			if (t->drivevar[0] != NULL)
+			{
+				/* every grouping column it has a column for, the first on */
+				List	   *tvars = list_make1(t->drivevar[0]);
+				int			h;
+
+				for (h = 1; h < cx->ngroup && t->drivevar[h] != NULL; h++)
+					tvars = lappend(tvars, t->drivevar[h]);
+				relgroups = estimate_num_groups(root, tvars, relrows,
+												NULL, NULL);
+			}
 			else
 				relgroups = cx->numgroups;
 
@@ -5016,7 +5018,11 @@ lion_count_path_fill(LionCountPathBuild *cx)
 	p->partialidx = lion_partial_used();
 	p->predimplied = lion_partial_dropped();
 
-	/* the decoded walk's columns (DESIGN.md §34), in the order it takes them */
+	/*
+	 * the decoded walk's columns (DESIGN.md §34), in the order it takes them:
+	 * the table's indexes, or each partition's own, which reads no inner
+	 * index of a pair (§16, "The decoded walk over partitions")
+	 */
 	if (cx->decode)
 	{
 		int			g;
@@ -5025,7 +5031,23 @@ lion_count_path_fill(LionCountPathBuild *cx)
 		for (g = 0; g < cx->ngroup; g++)
 		{
 			p->groupn_attno[g] = cx->groupattno[g];
-			p->groupn_idx[g] = first->driveidx[g]->indexoid;
+			p->groupn_idx[g] = cx->partitioned ? InvalidOid :
+				first->driveidx[g]->indexoid;
+		}
+		if (cx->partitioned)
+		{
+			ListCell   *lc;
+			int			i = 0;
+
+			foreach(lc, cx->targets)
+			{
+				LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+				LionCountPrivPart *part = &p->part[i++];
+
+				part->groupidxoid2 = InvalidOid;
+				for (g = 0; g < cx->ngroup; g++)
+					part->groupnidxoid[g] = t->driveidx[g]->indexoid;
+			}
 		}
 	}
 
@@ -6941,12 +6963,12 @@ lion_count_path_slices_decodable(LionCountPathBuild *cx)
 /*
  * May a GROUP BY of two columns, made the nested loop of DESIGN.md §20, be
  * the decoded walk of §34 as well?  On the terms of three columns
- * (lion_count_path_group_by(), lion_count_path_strategy()): one table, not a
- * partitioned one, partial counts core can add up, no count(DISTINCT) or
- * coalesce group, nothing the heap scan of a WHERE that narrows nothing does
- * not test (lion_where_scan_untested()), and not on a hot standby.  A range
- * in the WHERE is a source already, as every range beside two grouping
- * columns is.
+ * (lion_count_path_group_by(), lion_count_path_strategy()): one table or
+ * each partition of one in its turn, partial counts core can add up, no
+ * count(DISTINCT) or coalesce group, nothing the heap scan of a WHERE that
+ * narrows nothing does not test (lion_where_scan_untested()), and not on a
+ * hot standby.  A range in the WHERE is a source already, as every range
+ * beside two grouping columns is.
  */
 static bool
 lion_count_path_decodable(LionCountPathBuild *cx)
@@ -6955,7 +6977,7 @@ lion_count_path_decodable(LionCountPathBuild *cx)
 		cx->ngroup == 2 && !cx->decode && cx->fj == NULL &&
 		cx->sattnos == NIL &&
 		cx->anti == NULL &&
-		!cx->partitioned && cx->distvar == NULL && cx->groupcoal == NULL &&
+		cx->distvar == NULL && cx->groupcoal == NULL &&
 		cx->groupdeps == NIL && !cx->sumall && !cx->singlegroup &&
 		cx->ncompl == 0 && cx->residual == NIL &&
 		!lion_where_scan_untested(cx, true) &&

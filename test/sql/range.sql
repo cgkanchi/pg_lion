@@ -633,7 +633,7 @@ VACUUM (FREEZE, ANALYZE) lion_rpt;
 SELECT lion_rc('SELECT count(*) FROM lion_rpt WHERE k < 30');
 SELECT lion_rc('SELECT count(*) FROM lion_rpt WHERE k BETWEEN 30 AND 60 AND x = 2');
 SELECT lion_rc('SELECT k, count(*) FROM lion_rpt WHERE k > 90 GROUP BY k');
-SELECT lion_rc('SELECT count(DISTINCT k) FROM lion_rpt WHERE k < 30');         -- declined (§26)
+SELECT lion_rc('SELECT count(DISTINCT k) FROM lion_rpt WHERE k < 30');         -- GROUP BY k (§10)
 SELECT lion_rq('SELECT id FROM lion_rpt WHERE k BETWEEN 30 AND 33');
 SELECT * FROM lion_explain_norm('SELECT k, count(*) FROM lion_rpt WHERE k > 90 GROUP BY k') AS p("QUERY PLAN");
 
