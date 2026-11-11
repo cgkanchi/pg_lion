@@ -163,8 +163,18 @@ SELECT CASE WHEN current_setting('server_version_num')::int < 170000 THEN true
 	   END AS batch_shares_leaves;
 INSERT INTO lh_one SELECT 5 * i, 100000 + i FROM generate_series(0, 3999) i
 	WHERE current_setting('server_version_num')::int < 170000;
+-- a batch whose keys are far apart, on leaves of their own, descends for
+-- each (on this one-column index, so that only they read directory pages)
+SELECT CASE WHEN current_setting('server_version_num')::int < 170000 THEN true
+			ELSE lh_reads($$INSERT INTO lh_one
+					SELECT 3000 * i + 1, 200000 + i
+					FROM generate_series(1, 6) i$$) >= 2 * 6
+	   END AS far_keys_descend;
+INSERT INTO lh_one SELECT 3000 * i + 1, 200000 + i FROM generate_series(1, 6) i
+	WHERE current_setting('server_version_num')::int < 170000;
 SELECT lh_cmp('lh_one', 'k % 10 = 0 AND k < 20000') AS old_keys,
-	   lh_cmp('lh_one', 'k % 10 = 5') AS new_keys;
+	   lh_cmp('lh_one', 'k % 10 = 5') AS new_keys,
+	   lh_cmp('lh_one', 'k % 3000 = 1') AS far;
 SELECT lion_index_verify('lh_one_k', true);
 
 CREATE TABLE lh_b (k int4, t text, a int4[], v int4) WITH (autovacuum_enabled = off);
@@ -182,13 +192,6 @@ SELECT lh_cmp('lh_b', 'k % 10 = 0 AND k < 20000') AS old_keys,
 	   lh_cmp('lh_b', 'k IS NULL') AS null_k,
 	   lh_cmp('lh_b', $$t = 't7'$$) AS t7,
 	   lh_cmp('lh_b', 'a @> ARRAY[5]') AS a5;
--- a batch whose keys are far apart descends for each
-SELECT CASE WHEN current_setting('server_version_num')::int < 170000 THEN true
-			ELSE lh_reads($$INSERT INTO lh_b
-					SELECT 7000 * i + 3, 'far', NULL, 200000 + i
-					FROM generate_series(1, 6) i$$) >= 2 * 6
-	   END AS far_keys_descend;
-INSERT INTO lh_b SELECT 7000 * i + 3, 'far', NULL, 200000 + i FROM generate_series(1, 6) i
-	WHERE current_setting('server_version_num')::int < 170000;
+INSERT INTO lh_b SELECT 7000 * i + 3, 'far', NULL, 200000 + i FROM generate_series(1, 6) i;
 SELECT lh_cmp('lh_b', 'k % 7000 = 3') AS far, lh_cmp('lh_b', $$t = 'far'$$) AS far_t;
 SELECT lion_index_verify('lh_b_kta', true);

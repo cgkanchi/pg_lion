@@ -237,11 +237,26 @@ SELECT CASE WHEN current_setting('server_version_num')::int < 170000 THEN true
 
 INSERT INTO lh_one SELECT 5 * i, 100000 + i FROM generate_series(0, 3999) i
 	WHERE current_setting('server_version_num')::int < 170000;
+-- a batch whose keys are far apart, on leaves of their own, descends for
+-- each (on this one-column index, so that only they read directory pages)
+SELECT CASE WHEN current_setting('server_version_num')::int < 170000 THEN true
+			ELSE lh_reads($$INSERT INTO lh_one
+					SELECT 3000 * i + 1, 200000 + i
+					FROM generate_series(1, 6) i$$) >= 2 * 6
+	   END AS far_keys_descend;
+ far_keys_descend 
+------------------
+ t
+(1 row)
+
+INSERT INTO lh_one SELECT 3000 * i + 1, 200000 + i FROM generate_series(1, 6) i
+	WHERE current_setting('server_version_num')::int < 170000;
 SELECT lh_cmp('lh_one', 'k % 10 = 0 AND k < 20000') AS old_keys,
-	   lh_cmp('lh_one', 'k % 10 = 5') AS new_keys;
-   old_keys   |   new_keys   
---------------+--------------
- ok 8000 rows | ok 2000 rows
+	   lh_cmp('lh_one', 'k % 10 = 5') AS new_keys,
+	   lh_cmp('lh_one', 'k % 3000 = 1') AS far;
+   old_keys   |   new_keys   |    far    
+--------------+--------------+-----------
+ ok 8000 rows | ok 2000 rows | ok 6 rows
 (1 row)
 
 SELECT lion_index_verify('lh_one_k', true);
@@ -270,19 +285,7 @@ SELECT lh_cmp('lh_b', 'k % 10 = 0 AND k < 20000') AS old_keys,
  ok 7979 rows | ok 1979 rows | ok 42 rows | ok 7 rows | ok 1390 rows
 (1 row)
 
--- a batch whose keys are far apart descends for each
-SELECT CASE WHEN current_setting('server_version_num')::int < 170000 THEN true
-			ELSE lh_reads($$INSERT INTO lh_b
-					SELECT 7000 * i + 3, 'far', NULL, 200000 + i
-					FROM generate_series(1, 6) i$$) >= 2 * 6
-	   END AS far_keys_descend;
- far_keys_descend 
-------------------
- t
-(1 row)
-
-INSERT INTO lh_b SELECT 7000 * i + 3, 'far', NULL, 200000 + i FROM generate_series(1, 6) i
-	WHERE current_setting('server_version_num')::int < 170000;
+INSERT INTO lh_b SELECT 7000 * i + 3, 'far', NULL, 200000 + i FROM generate_series(1, 6) i;
 SELECT lh_cmp('lh_b', 'k % 7000 = 3') AS far, lh_cmp('lh_b', $$t = 'far'$$) AS far_t;
     far    |   far_t   
 -----------+-----------
