@@ -1,0 +1,194 @@
+-- Inserts that skip the directory descent (DESIGN.md §21, "A leaf already
+-- known").  A backend remembers the leaf it last wrote each key's entry on,
+-- and a single-row insert into an existing entry goes straight there when
+-- that leaf still holds the entry and the insert leaves the leaf unsplit;
+-- and a statement's batch (DESIGN.md §55) finds each key from the leaf the
+-- key before it ended on, when that leaf's range reaches it.  Anything else
+-- descends from the root as before.
+--
+-- lion_debug_dir_pages_read() counts the directory pages this backend has
+-- read, which is how the tests below tell the paths apart: one page for an
+-- insert through a remembered leaf, the directory's height or more for one
+-- that descended.  Every table is then checked against a sequential scan
+-- and with lion_index_verify().
+\set VERBOSITY terse
+SET client_min_messages = warning;
+
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+
+CREATE FUNCTION lion_debug_dir_pages_read() RETURNS int8
+	AS 'pg_lion', 'lion_debug_dir_pages_read' LANGUAGE C STRICT;
+
+-- the directory pages one statement reads, as the path it took
+CREATE FUNCTION lh_path(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	r0 int8 := lion_debug_dir_pages_read();
+	n int8;
+BEGIN
+	EXECUTE q;
+	n := lion_debug_dir_pages_read() - r0;
+	RETURN CASE WHEN n = 1 THEN 'leaf' WHEN n > 1 THEN 'descent' ELSE n::text END;
+END $$;
+
+-- ... and as a number
+CREATE FUNCTION lh_reads(q text) RETURNS int8 LANGUAGE plpgsql AS $$
+DECLARE
+	r0 int8 := lion_debug_dir_pages_read();
+BEGIN
+	EXECUTE q;
+	RETURN lion_debug_dir_pages_read() - r0;
+END $$;
+
+-- the count and sum of the rows pred matches by the count pushdown (which
+-- reads the index without a scan of it, so it goes first), by a bitmap scan
+-- and by a sequential scan, when the three agree
+CREATE FUNCTION lh_cmp(tbl text, pred text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	q text := format('SELECT count(*) AS c, coalesce(sum(v), 0) AS s FROM %s WHERE %s', tbl, pred);
+	n int8;
+	a record;
+	b record;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	EXECUTE format('SELECT count(*) FROM %s WHERE %s', tbl, pred) INTO n;
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE q INTO a;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	EXECUTE q INTO b;
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	IF a IS DISTINCT FROM b OR n IS DISTINCT FROM b.c THEN
+		RETURN format('MISMATCH count=%s index=%s seqscan=%s', n, a::text, b::text);
+	END IF;
+	RETURN format('ok %s rows', a.c);
+END $$;
+
+-- ---------------------------------------------------------------------
+-- Single-row inserts.  Keys are multiples of 10 so that new keys can be
+-- put between them; key 0 has a quarter of the rows, scattered (a CHAIN
+-- entry), the others a few each (INLINE entries), across a directory of
+-- more than one level.
+-- ---------------------------------------------------------------------
+CREATE TABLE lh (k int4, v int4) WITH (autovacuum_enabled = off);
+INSERT INTO lh
+	SELECT CASE WHEN hashint4(i) % 4 = 0 THEN 0 ELSE 10 * (i % 20000) END, i
+	FROM generate_series(1, 80000) i;
+CREATE INDEX lh_k ON lh USING lion (k);
+SELECT internal_pages > 0 AS several_levels, entries - inline_entries AS chain_entries
+	FROM lion_index_stats('lh_k');
+
+-- the first insert of a key descends; the next ones go to its leaf
+SELECT lh_path('INSERT INTO lh VALUES (0, 1)') AS chain_first,
+	   lh_path('INSERT INTO lh VALUES (0, 2)') AS chain_next,
+	   lh_path('INSERT INTO lh VALUES (0, 3)') AS chain_next2;
+SELECT lh_path('INSERT INTO lh VALUES (77770, 1)') AS inline_first,
+	   lh_path('INSERT INTO lh VALUES (77770, 2)') AS inline_next;
+
+-- and so does the next transaction's
+BEGIN;
+SELECT lh_path('INSERT INTO lh VALUES (0, 4)') AS chain_new_xact;
+ROLLBACK;
+SELECT lh_path('INSERT INTO lh VALUES (0, 5)') AS chain_after_rollback;
+
+-- a key that is new descends, and is remembered from then on
+SELECT lh_path('INSERT INTO lh VALUES (77771, 1)') AS new_key,
+	   lh_path('INSERT INTO lh VALUES (77771, 2)') AS new_key_next;
+-- (a remembered leaf that no longer holds its key, after a split or a
+-- VACUUM, is test/isolation/insert_leaf_hint.spec's: the keys of the
+-- statement that splits it would be remembered in its place, and VACUUM
+-- makes every backend forget)
+INSERT INTO lh SELECT 77770 - 300 + i, 7 FROM generate_series(0, 299) i;
+SELECT lh_cmp('lh', 'k = 0') AS k0, lh_cmp('lh', 'k = 77770') AS k77770,
+	   lh_cmp('lh', 'k = 77771') AS k77771,
+	   lh_cmp('lh', 'k BETWEEN 77470 AND 77770') AS around;
+
+-- a backend remembers one leaf in each of 256 slots, chosen by the key's
+-- hash, and the 300 keys of the batch above took key 0's, so it descends
+-- once more; REINDEX builds the directory again, and nothing is remembered
+-- of the old one
+SELECT lh_path('INSERT INTO lh VALUES (0, 6)') AS after_batch,
+	   lh_path('INSERT INTO lh VALUES (0, 66)') AS before_reindex;
+REINDEX INDEX lh_k;
+SELECT lh_path('INSERT INTO lh VALUES (0, 7)') AS after_reindex,
+	   lh_path('INSERT INTO lh VALUES (0, 8)') AS after_reindex_next;
+SELECT lion_index_verify('lh_k', true);
+
+-- ---------------------------------------------------------------------
+-- An INLINE entry on a full leaf: the leaf holds the entry, but the row
+-- does not fit beside it, so the insert descends and splits the leaf.
+-- Long keys make leaves of a few entries each, and rows a heap page each
+-- make every row grow the entry.
+-- ---------------------------------------------------------------------
+CREATE TABLE lh_full (k text, v int4, pad text) WITH (autovacuum_enabled = off);
+ALTER TABLE lh_full ALTER pad SET STORAGE PLAIN;
+INSERT INTO lh_full
+	SELECT lpad((i % 400)::text, 400, 'x'), i, '' FROM generate_series(1, 800) i;
+CREATE INDEX lh_full_k ON lh_full USING lion (k);
+SELECT leaf_pages AS leaves_before FROM lion_index_stats('lh_full_k');
+CREATE TEMP TABLE lh_paths AS
+	SELECT i, lh_path(format('INSERT INTO lh_full VALUES (%L, %s, repeat(''p'', 7000))',
+							 lpad('200', 400, 'x'), 10000 + i)) AS path
+	FROM generate_series(1, 500) i;
+-- the first descends, most go to the remembered leaf, and one or more
+-- found it full and descended to split it
+SELECT path, count(*) > 1 AS more_than_one FROM lh_paths WHERE i > 1
+	GROUP BY path ORDER BY path;
+SELECT leaf_pages AS leaves_after, entries, inline_entries
+	FROM lion_index_stats('lh_full_k');
+SELECT lh_cmp('lh_full', format('k = %L', lpad('200', 400, 'x'))) AS k200;
+SELECT lion_index_verify('lh_full_k', true);
+
+-- ---------------------------------------------------------------------
+-- Batches (PostgreSQL 17 and later; 16 writes each row as it comes).
+-- Each key is found from the leaf the one before it ended on when that
+-- leaf's range reaches it, whether the key is there already or new: a
+-- batch of keys that share leaves reads about one directory page a key,
+-- where a descent reads two.  Keys in other columns, NULLs and array
+-- elements go the same way.
+-- ---------------------------------------------------------------------
+CREATE TABLE lh_one (k int4, v int4) WITH (autovacuum_enabled = off);
+INSERT INTO lh_one SELECT 10 * (i % 5000), i FROM generate_series(1, 15000) i;
+CREATE INDEX lh_one_k ON lh_one USING lion (k);
+SELECT internal_pages = 1 AS two_levels FROM lion_index_stats('lh_one_k');
+-- 4000 keys: every existing one from 0 to 19990, and a new one between
+-- each two
+SELECT CASE WHEN current_setting('server_version_num')::int < 170000 THEN true
+			ELSE lh_reads($$INSERT INTO lh_one
+					SELECT 5 * i, 100000 + i FROM generate_series(0, 3999) i$$) < 6000
+	   END AS batch_shares_leaves;
+INSERT INTO lh_one SELECT 5 * i, 100000 + i FROM generate_series(0, 3999) i
+	WHERE current_setting('server_version_num')::int < 170000;
+SELECT lh_cmp('lh_one', 'k % 10 = 0 AND k < 20000') AS old_keys,
+	   lh_cmp('lh_one', 'k % 10 = 5') AS new_keys;
+SELECT lion_index_verify('lh_one_k', true);
+
+CREATE TABLE lh_b (k int4, t text, a int4[], v int4) WITH (autovacuum_enabled = off);
+INSERT INTO lh_b
+	SELECT 10 * (i % 5000), 't' || (i % 3000), ARRAY[i % 700, i % 11], i
+	FROM generate_series(1, 15000) i;
+CREATE INDEX lh_b_kta ON lh_b USING lion (k, t, a);
+INSERT INTO lh_b
+	SELECT CASE WHEN i % 97 = 0 THEN NULL ELSE 5 * i END,
+		   CASE WHEN i % 89 = 0 THEN NULL ELSE 't' || (i % 3000) END,
+		   ARRAY[i % 700], 100000 + i
+	FROM generate_series(0, 3999) i;
+SELECT lh_cmp('lh_b', 'k % 10 = 0 AND k < 20000') AS old_keys,
+	   lh_cmp('lh_b', 'k % 10 = 5') AS new_keys,
+	   lh_cmp('lh_b', 'k IS NULL') AS null_k,
+	   lh_cmp('lh_b', $$t = 't7'$$) AS t7,
+	   lh_cmp('lh_b', 'a @> ARRAY[5]') AS a5;
+-- a batch whose keys are far apart descends for each
+SELECT CASE WHEN current_setting('server_version_num')::int < 170000 THEN true
+			ELSE lh_reads($$INSERT INTO lh_b
+					SELECT 7000 * i + 3, 'far', NULL, 200000 + i
+					FROM generate_series(1, 6) i$$) >= 2 * 6
+	   END AS far_keys_descend;
+INSERT INTO lh_b SELECT 7000 * i + 3, 'far', NULL, 200000 + i FROM generate_series(1, 6) i
+	WHERE current_setting('server_version_num')::int < 170000;
+SELECT lh_cmp('lh_b', 'k % 7000 = 3') AS far, lh_cmp('lh_b', $$t = 'far'$$) AS far_t;
+SELECT lion_index_verify('lh_b_kta', true);

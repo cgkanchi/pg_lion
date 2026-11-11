@@ -1190,7 +1190,37 @@ struct LionIndexState
 	 * state is checked again once a function has changed since.
 	 */
 	uint64		procgen;
+
+	/*
+	 * The insert path's leaf hints (§21, "A leaf already known"): for each
+	 * of LION_LEAF_HINTS slots, the directory leaf that last held the entry
+	 * of a key this backend wrote whose slot it is (lion_leaf_hint_slot()),
+	 * with the key's column and hash, or an invalid block.  Only guesses: a
+	 * writer looks for its entry on the leaf when the column and hash are
+	 * its own, and descends when the entry is not there.  NULL until the
+	 * first insert through this state; allocated beside cols, so it lives
+	 * and dies with the state - a new relfilenode is a new state.
+	 */
+	struct LionLeafHint *leafhint;
 };
+
+typedef struct LionLeafHint
+{
+	BlockNumber blk;			/* the leaf, or InvalidBlockNumber */
+	uint32		hash;			/* the key's bucket hash */
+	AttrNumber	attno;			/* its column */
+	int16		kind;			/* and its kind (LION_KIND_*) */
+} LionLeafHint;
+
+#define LION_LEAF_HINTS		256
+
+/* The hint slot of a key of column attno whose bucket hash is hash */
+static inline int
+lion_leaf_hint_slot(AttrNumber attno, uint32 hash)
+{
+	return (int) ((hash ^ ((uint32) attno * 0x9E3779B9U)) &
+				  (LION_LEAF_HINTS - 1));
+}
 
 /* The state of one key column of an index whose state is already in hand. */
 static inline LionState *
@@ -1929,6 +1959,42 @@ extern bool lion_dir_find_next(Relation index, Relation heaprel,
 							   OffsetNumber *offnum);
 /* ... and whether it would look on the held leaf buf itself */
 extern bool lion_dir_leaf_holds(Buffer buf, const LionSearchKey *sk);
+
+/*
+ * A leaf already known (DESIGN.md §21).  lion_dir_find_on_leaf() looks for
+ * sk's entry on block blk alone, taken EXCLUSIVE: true with the leaf held
+ * and *offnum the entry, false with nothing held.  The caller may only do
+ * what leaves that leaf unsplit.
+ *
+ * lion_dir_find_from() is lion_dir_find() with forwrite from the leaf last
+ * names - one this transaction held for a key whose prefix sorts strictly
+ * before sk's - in place of the root: LION_FIND_NOT_HERE with nothing held
+ * when the high key the leaf had then, or has now, does not exceed sk, or
+ * the block is not a live leaf any more; else LION_FIND_FOUND or
+ * LION_FIND_ABSENT with what lion_dir_find() leaves.  lion_dir_note_leaf()
+ * fills one from a leaf the caller holds.
+ */
+#define LION_FIND_NOT_HERE	(-1)
+#define LION_FIND_ABSENT	0
+#define LION_FIND_FOUND		1
+
+typedef struct LionLastLeaf
+{
+	BlockNumber blk;			/* InvalidBlockNumber: none yet */
+	bool		rightmost;		/* no high key when held */
+	LionEntryTuple *high;		/* a copy of the high key, when there was one */
+	Size		highcap;		/* bytes allocated at high */
+	MemoryContext cxt;			/* where high is allocated */
+} LionLastLeaf;
+
+extern bool lion_dir_find_on_leaf(Relation index, const LionSearchKey *sk,
+								  BlockNumber blk, Buffer *bufp,
+								  OffsetNumber *offnum);
+extern void lion_dir_note_leaf(LionLastLeaf *last, Buffer buf);
+extern int	lion_dir_find_from(Relation index, Relation heaprel,
+							   LionIndexState *ix, const LionSearchKey *sk,
+							   const LionLastLeaf *last, Buffer *bufp,
+							   OffsetNumber *offnum, bool *movedright);
 
 /*
  * The pieces of the above, for a caller that walks the leaves itself; _ext
