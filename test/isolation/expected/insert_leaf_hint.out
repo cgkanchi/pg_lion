@@ -1,0 +1,246 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_1500 s2_split_1500 s1_1500_again s3_counts s3_verify
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_1500: 
+	SELECT lhs_reads($$INSERT INTO lhs VALUES (-1, lhs_key(1500))$$) AS first,
+		   lhs_reads($$INSERT INTO lhs VALUES (-2, lhs_key(1500))$$) AS next;
+
+first|next
+-----+----
+    4|   1
+(1 row)
+
+step s2_split_1500: 
+	INSERT INTO lhs SELECT -100 - i, lhs_key(1499) || chr(97 + i)
+	  FROM generate_series(0, 11) i;
+
+step s1_1500_again: 
+	SELECT lhs_reads($$INSERT INTO lhs VALUES (-3, lhs_key(1500))$$) AS moved,
+		   lhs_reads($$INSERT INTO lhs VALUES (-4, lhs_key(1500))$$) AS next;
+
+moved|next
+-----+----
+    5|   1
+(1 row)
+
+step s3_counts: SELECT lhs_counts() AS counts;
+counts
+------
+agree 
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('lhs_k', true) AS verify;
+verify
+------
+      
+(1 row)
+
+
+starting permutation: s1_5 s2_halfdead s2_vacuum s2_detach_halfdead s3_shape s1_5_again s3_counts s3_verify
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_5: 
+	BEGIN;
+	SELECT lhs_reads($$INSERT INTO lhs VALUES (-5, lhs_key(5))$$) AS first,
+		   lhs_reads($$INSERT INTO lhs VALUES (-6, lhs_key(5))$$) AS next;
+	ROLLBACK;
+
+first|next
+-----+----
+    4|   1
+(1 row)
+
+step s2_halfdead: SELECT injection_points_attach('lion-dir-delete-halfdead', 'error');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s2_vacuum: VACUUM lhs;
+ERROR:  error triggered for injection point lion-dir-delete-halfdead
+step s2_detach_halfdead: SELECT injection_points_detach('lion-dir-delete-halfdead');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s3_shape: SELECT deleted_pages > 0 AS some_deleted FROM lion_index_stats('lhs_k');
+some_deleted
+------------
+f           
+(1 row)
+
+step s1_5_again: 
+	SELECT lhs_reads($$INSERT INTO lhs VALUES (-7, lhs_key(5))$$) AS gone,
+		   lhs_reads($$INSERT INTO lhs VALUES (-8, lhs_key(5))$$) AS next;
+
+gone|next
+----+----
+  10|   1
+(1 row)
+
+step s3_counts: SELECT lhs_counts() AS counts;
+counts
+------
+agree 
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('lhs_k', true) AS verify;
+verify
+------
+      
+(1 row)
+
+
+starting permutation: s1_5 s2_unlinked s2_vacuum s2_detach_unlinked s3_shape s1_5_again s3_counts s3_verify
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_5: 
+	BEGIN;
+	SELECT lhs_reads($$INSERT INTO lhs VALUES (-5, lhs_key(5))$$) AS first,
+		   lhs_reads($$INSERT INTO lhs VALUES (-6, lhs_key(5))$$) AS next;
+	ROLLBACK;
+
+first|next
+-----+----
+    4|   1
+(1 row)
+
+step s2_unlinked: SELECT injection_points_attach('lion-dir-delete-unlinked', 'error');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s2_vacuum: VACUUM lhs;
+ERROR:  error triggered for injection point lion-dir-delete-unlinked
+step s2_detach_unlinked: SELECT injection_points_detach('lion-dir-delete-unlinked');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s3_shape: SELECT deleted_pages > 0 AS some_deleted FROM lion_index_stats('lhs_k');
+some_deleted
+------------
+t           
+(1 row)
+
+step s1_5_again: 
+	SELECT lhs_reads($$INSERT INTO lhs VALUES (-7, lhs_key(5))$$) AS gone,
+		   lhs_reads($$INSERT INTO lhs VALUES (-8, lhs_key(5))$$) AS next;
+
+gone|next
+----+----
+  10|   1
+(1 row)
+
+step s3_counts: SELECT lhs_counts() AS counts;
+counts
+------
+agree 
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('lhs_k', true) AS verify;
+verify
+------
+      
+(1 row)
+
+
+starting permutation: s1_attach s1_batch s2_release s3_counts s3_verify
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_attach: SELECT injection_points_attach('lion-insert-batch-hold', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_batch: 
+	SELECT lhs_reads($$INSERT INTO lhs VALUES (-9, lhs_key(1800)),
+							(-10, lhs_key(1500)), (-11, lhs_key(1505))$$) AS batch;
+ <waiting ...>
+step s2_release: SELECT lhs_release('lion-insert-batch-hold');
+lhs_release
+-----------
+           
+(1 row)
+
+step s1_batch: <... completed>
+batch
+-----
+    9
+(1 row)
+
+step s3_counts: SELECT lhs_counts() AS counts;
+counts
+------
+agree 
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('lhs_k', true) AS verify;
+verify
+------
+      
+(1 row)
+
+
+starting permutation: s1_attach s1_batch s2_split_1505 s2_release s3_counts s3_verify
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_attach: SELECT injection_points_attach('lion-insert-batch-hold', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_batch: 
+	SELECT lhs_reads($$INSERT INTO lhs VALUES (-9, lhs_key(1800)),
+							(-10, lhs_key(1500)), (-11, lhs_key(1505))$$) AS batch;
+ <waiting ...>
+step s2_split_1505: 
+	INSERT INTO lhs SELECT -200 - i, lhs_key(1500) || chr(97 + i)
+	  FROM generate_series(0, 11) i;
+
+step s2_release: SELECT lhs_release('lion-insert-batch-hold');
+lhs_release
+-----------
+           
+(1 row)
+
+step s1_batch: <... completed>
+batch
+-----
+   13
+(1 row)
+
+step s3_counts: SELECT lhs_counts() AS counts;
+counts
+------
+agree 
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('lhs_k', true) AS verify;
+verify
+------
+      
+(1 row)
+

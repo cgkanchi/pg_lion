@@ -674,7 +674,11 @@ INLINE entry's one row per hold, with other writers and VACUUM free to run betwe
 1. Hash the key and build the search key - kind VALUE, or a reserved entry: NULL, or one of the
    key-less entries of §17 (EMPTY, EMPTYDIM, EMPTYINNER, NULLELEMS) (§14, §17). Descend the directory (`lion_dir_find()`) and take the LEAF EXCLUSIVE; a write descent that
    lands on an INCOMPLETE_SPLIT page finishes that split first (§21, the repair rule). The leaf is
-   held until the insert is complete: it is the page every writer of this key serialises on.
+   held until the insert is complete: it is the page every writer of this key serialises on. A
+   writer that remembers the leaf it last wrote the key on takes that leaf EXCLUSIVE instead, and
+   goes on from step 3 when it still holds the entry and the insert leaves it unsplit; a batch
+   starts the next key's lookup from the leaf the key before it ended on (§21, "A leaf already
+   known").
 2. Look the key up on the leaf: binary search to its prefix run, then the opclass equality over the
    run (§21 "The order"). If it is absent, add an INLINE entry holding a one-pair sparse segment
    (§13) at its exact position (`lion_dir_add_entry()`); find-or-create is one serialised operation,
@@ -9914,6 +9918,73 @@ right sibling's already - so their high keys are compared with nothing.
 
 The empty leaves of a LIVE key's posting set go too, by a protocol of one record each (§22, "Empty
 leaves").
+
+### A leaf already known (2026-11-11)
+
+An insert descended from the root for every key of every row, and the descents were the largest
+part of what the directory cost: about 30% of the CPU of a 50,000-row INSERT into a column of
+20,000 values, and, where the directory is one page, a SHARE lock on the hottest page of the index
+and then the EXCLUSIVE one the insert needs - two acquisitions of the lock every writer of the
+column queues on (§55). But a writer that inserts into a key usually inserted into it a moment ago, and a batch
+(§55) writes its keys in the directory's order, so the leaf it needs next is mostly the one it
+just let go of. Two shortcuts use that; whatever they find goes on as the descent's own result
+would.
+
+**A remembered leaf** (`lion_insert_one()`, and each key of a batch). Each backend keeps, per index
+(beside the index state, `LionIndexState.leafhint`), the block of the leaf it last wrote each key's
+entry on, in 256 slots chosen by (column, hash): a key whose slot holds another key's leaf has none.
+It is kept across statements and transactions, and goes when the relcache entry is rebuilt (REINDEX,
+TRUNCATE, VACUUM updating the index's statistics, any invalidation of it). Before it descends, the
+writer takes that block EXCLUSIVE and looks for the key's entry on it (`lion_dir_find_on_leaf()`):
+only when the page is a live leaf (a BUCKET page of level 0, not HALF_DEAD, DELETED or
+INCOMPLETE_SPLIT) and holds the entry does it insert there; otherwise it lets the page go and
+descends. The block may be anything by then - the leaf it was may have split, gone, or been freed
+and taken again for any page of the index - which is why the test reads only what every page has
+and why it looks for the ENTRY rather than for the key's place: the directory holds one entry per
+equality class, so the leaf that holds it is the one every writer of the key serialises on (§5),
+however the writer came to it. What a remembered leaf cannot promise is a downlink: a freed leaf
+can be taken again as the right half of a split whose downlink is not in yet, and a writer that
+split it would have no parent to put the new page's downlink in. So on a remembered leaf the writer
+does only what leaves the leaf unsplit: a CHAIN entry's insert, which rewrites the entry at its
+size; an INLINE entry's when the rewritten entry fits where it stands
+(`PageIndexTupleOverwrite()`'s test), or spills (which shrinks it); never an INLINE entry with
+positions, or a new key. Anything else lets the leaf go, having written nothing, and descends.
+
+**The leaf before** (`lion_insert_apply()`). A batch writes its keys in the directory's order, and
+for the next key starts from the leaf the previous one ended on (`lion_dir_find_from()`) instead of
+the root, when the previous key's prefix sorts strictly before this one's. That leaf's range began
+at or below the previous key then, and still does: a split keeps a page's lower bound, the deletion
+of the page to its left lowers it, and its own deletion - the one thing that would take its range
+away - shows in its flags, as the page cannot be freed and taken again while the batch's
+transaction runs (its safexid is newer than that transaction's xid, "Page deletion"). Nor can it
+lack a downlink: the writer reached it by a descent, or by this step from a leaf it reached by one -
+never as a remembered leaf, which is why a key written through one leaves the batch's starting
+point where it was. So if its high key still exceeds the key, or
+it has none, it is the leaf a descent would land on - a descent's last step is the walk right
+while the high key does not exceed the key - and the find-or-create runs from it as the descent's
+does, guard and all. If not, the writer descends: walking right past more than that one leaf costs
+more than a descent once keys are a leaf or more apart. The writer keeps a copy of the leaf's high
+key from when it let go of it, so that a key past it goes straight to the descent without reading
+the leaf; the high key taken under the lock decides.
+
+**Measured** (PostgreSQL 18, release build, custom WAL resource manager, 4 cores, against main,
+alternating runs). Four clients each inserting one row a transaction into an empty table with a lion
+index on a column of two values: 122,000 rows a second before, 157,000 after (a B-tree on the same
+column: 178,000); a column of a thousand values, unchanged (163,000-168,000). One 50,000-row INSERT
+into a table of five million rows, CPU per statement: a column of 20,000 values (INLINE entries)
+138 → 120 ms, a column of a million values 128 → 118 ms, a column of two values unchanged
+(52-56 ms). 200-row INSERTs into a column of 20,000 values, whose keys are a hundred apart and share
+no leaf: unchanged (690-710 µs).
+
+`lion_debug_dir_pages_read()`, which tests create with `CREATE FUNCTION ... AS 'pg_lion'`, returns
+the directory pages the backend has read. Tests: `test/sql/insert_leaf_hint.sql` (the first insert
+of a key descends and the next ones read one page, across transactions and a rollback; a new key; a
+full leaf, where the remembered leaf holds the entry but the row does not fit and the insert
+descends and splits it; REINDEX; batches of existing and new keys read about a page a key, keys in
+several columns, NULLs and array elements, each against sequential scans and
+`lion_index_verify()`); `test/isolation/insert_leaf_hint.spec` (a remembered leaf that another
+writer split so that the key moved right, or that VACUUM left HALF_DEAD or DELETED; a batch parked
+between two keys while another writer splits the leaf the first ended on).
 
 ### Locking summary
 
@@ -35472,7 +35543,9 @@ then sorts the keys into the directory's own order (`lion_cmp_prefix()`: an orde
 proc 4, as a descent compares it - never a sort operator, which a column whose catalog changed since
 the build may have lost, §21), so that a run of new keys fills leaves as an ascending run of inserts does rather
 than splitting them all down the middle. Then each key: one descent with the leaf EXCLUSIVE and the
-writer's SERIALIZABLE check (§9), as `lion_insert_one()` makes, and
+writer's SERIALIZABLE check (§9), as `lion_insert_one()` makes - or none, from the leaf the
+writer remembers for the key or the one the key before it ended on (§21, "A leaf already known") -
+and
 
 - a CHAIN entry takes up to `LION_APPLY_HOLD` (256) rows under that one hold, each through
   `lion_insert_chain()`, which rewrites the entry in place at its size, so its offset stays good;
@@ -35562,7 +35635,8 @@ statements each.
 
 **Not done.** Columns with positions, summaries and slices are written row by row; batching them
 needs their own posting-set steps sorted and held the same way. A one-row statement gains nothing,
-and many writers inserting one row each still take turns on the leaf. Each CHAIN row is still its
+and many writers inserting one row each still take turns on the leaf (each turn shorter since §21's
+"A leaf already known"). Each CHAIN row is still its
 own WAL record: a batch could put a key's rows for one container into one.
 
 Tests: `test/sql/insert_batch.sql` (every kind of key in one batch and across `work_mem`, COPY;

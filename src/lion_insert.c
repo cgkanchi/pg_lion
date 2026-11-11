@@ -89,6 +89,11 @@ static void lion_insert_inline(Relation index, Relation heaprel,
 							  LionState *state, Buffer entrybuf,
 							  OffsetNumber entryoff, uint32 ckey, uint16 lo,
 							  const LionPosMember *pm);
+static bool lion_insert_inline_ext(Relation index, Relation heaprel,
+								   LionState *state, Buffer entrybuf,
+								   OffsetNumber entryoff, uint32 ckey,
+								   uint16 lo, const LionPosMember *pm,
+								   bool nosplit);
 static void lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 							 OffsetNumber entryoff, uint32 ckey, uint16 lo,
 							 const LionPosMember *pm);
@@ -806,6 +811,36 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 				  OffsetNumber entryoff, uint32 ckey, uint16 lo,
 				  const LionPosMember *pm)
 {
+	(void) lion_insert_inline_ext(index, heaprel, state, entrybuf, entryoff,
+								  ckey, lo, pm, false);
+}
+
+/*
+ * Would an entry of newsize bytes take the place of the one at off without
+ * the leaf splitting - would PageIndexTupleOverwrite() take it?
+ */
+static inline bool
+lion_page_overwrite_fits(Page page, OffsetNumber off, Size newsize)
+{
+	PageHeader	phdr = (PageHeader) page;
+
+	return MAXALIGN(newsize) <=
+		MAXALIGN(ItemIdGetLength(PageGetItemId(page, off))) +
+		(Size) (phdr->pd_upper - phdr->pd_lower);
+}
+
+/*
+ * lion_insert_inline(), and with nosplit for a leaf a writer took without a
+ * descent (lion_dir_find_on_leaf()): returns false, having written nothing,
+ * where the entry would have to grow past what the leaf has room for, which
+ * would split it.  An entry with positions is not taken there at all.  A
+ * spill is: it rewrites the entry smaller, where it stands.
+ */
+static bool
+lion_insert_inline_ext(Relation index, Relation heaprel, LionState *state,
+					   Buffer entrybuf, OffsetNumber entryoff, uint32 ckey,
+					   uint16 lo, const LionPosMember *pm, bool nosplit)
+{
 	Page		page = BufferGetPage(entrybuf);
 	ItemId		iid = PageGetItemId(page, entryoff);
 	LionEntryTuple *entry = lion_page_entry_fetch(index, page,
@@ -835,17 +870,18 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 		/* The TID is already in this posting set; nothing to do. */
 		pfree(newpay);
 		pfree(oldpay);
-		return;
+		return true;
 	}
 
 	if (pm != NULL)
 	{
+		Assert(!nosplit);
 		lion_insert_inline_pos(index, heaprel, state, entrybuf, entryoff,
 							   entry, itemsz, oldpay, paylen, newpay, newlen,
 							   ndelta, pm);
 		pfree(newpay);
 		pfree(oldpay);
-		return;
+		return true;
 	}
 
 	if (newlen <= lion_inline_max(payoff,
@@ -856,6 +892,14 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 
 		newentry = lion_inline_rebuilt(state, page, entry, itemsz, newpay,
 									   newlen, ndelta, &newsize);
+
+		if (nosplit && !lion_page_overwrite_fits(page, entryoff, newsize))
+		{
+			pfree(newentry);
+			pfree(newpay);
+			pfree(oldpay);
+			return false;
+		}
 
 		/*
 		 * DESIGN.md §21: a grown entry that no longer fits its leaf splits the
@@ -868,7 +912,7 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 		pfree(newentry);
 		pfree(newpay);
 		pfree(oldpay);
-		return;
+		return true;
 	}
 
 	/*
@@ -891,6 +935,7 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 	pfree(oldpay);
 
 	lion_insert_chain(index, heaprel, entrybuf, entryoff, ckey, lo, NULL);
+	return true;
 }
 
 /*
@@ -1940,6 +1985,88 @@ lion_summary_insert(Relation index, Relation heaprel, LionState *state,
 	}
 }
 
+/* ---------------------------------------------------------------------
+ * Leaf hints (DESIGN.md §21, "A leaf already known")
+ * --------------------------------------------------------------------- */
+
+static LionLeafHint *
+lion_leaf_hints(LionIndexState *ix)
+{
+	if (ix->leafhint == NULL)
+	{
+		LionLeafHint *h = (LionLeafHint *)
+			MemoryContextAlloc(GetMemoryChunkContext(ix->cols),
+							   sizeof(LionLeafHint) * LION_LEAF_HINTS);
+		int			i;
+
+		for (i = 0; i < LION_LEAF_HINTS; i++)
+		{
+			h[i].blk = InvalidBlockNumber;
+			h[i].hash = 0;
+			h[i].attno = InvalidAttrNumber;
+			h[i].kind = 0;
+		}
+		ix->leafhint = h;
+	}
+	return ix->leafhint;
+}
+
+/* The leaf this backend last found sk's entry on, or InvalidBlockNumber */
+static inline BlockNumber
+lion_leaf_hint_get(LionIndexState *ix, const LionSearchKey *sk)
+{
+	LionLeafHint *h = &lion_leaf_hints(ix)[lion_leaf_hint_slot(sk->attno,
+																sk->hash)];
+
+	if (h->attno == sk->attno && h->hash == sk->hash && h->kind == sk->kind)
+		return h->blk;
+	return InvalidBlockNumber;
+}
+
+/* ... and remember blk as that leaf */
+static inline void
+lion_leaf_hint_set(LionIndexState *ix, const LionSearchKey *sk,
+				   BlockNumber blk)
+{
+	LionLeafHint *h = &lion_leaf_hints(ix)[lion_leaf_hint_slot(sk->attno,
+																sk->hash)];
+
+	h->blk = blk;
+	h->hash = sk->hash;
+	h->attno = sk->attno;
+	h->kind = (int16) sk->kind;
+}
+
+/*
+ * Put the row (ckey, lo) into the entry at (leafbuf, entryoff), a leaf the
+ * writer took without a descent (lion_dir_find_on_leaf()) and holds
+ * EXCLUSIVE: true when it is in, false - with nothing written - when the
+ * insert could split the leaf, which only a writer that came through a
+ * descent may do.  A CHAIN entry's insert rewrites the entry where it stands
+ * at its size; an INLINE entry's does when the leaf has the room
+ * (lion_insert_inline_ext()), or when it spills; an INLINE entry with
+ * positions is left to the descent.
+ */
+static bool
+lion_insert_known(Relation index, Relation heaprel, LionState *state,
+				  Buffer leafbuf, OffsetNumber entryoff, uint32 ckey, uint16 lo,
+				  const LionPosMember *pm)
+{
+	LionEntryTuple *entry = lion_page_entry(BufferGetPage(leafbuf), entryoff);
+
+	if ((entry->flags & LION_ENTRY_INLINE) != 0)
+	{
+		if (pm != NULL)
+			return false;
+		lion_writer_check(index, leafbuf, entryoff, true);
+		return lion_insert_inline_ext(index, heaprel, state, leafbuf, entryoff,
+									  ckey, lo, NULL, true);
+	}
+	lion_writer_check(index, leafbuf, entryoff, true);
+	lion_insert_chain(index, heaprel, leafbuf, entryoff, ckey, lo, pm);
+	return true;
+}
+
 /*
  * Add one (key, code) pair to the index: locate or create the key's entry and
  * put the member in it.  reservedflag is 0 for a real key, or the flag of the
@@ -1957,6 +2084,7 @@ lion_insert_one(Relation index, Relation heaprel, LionState *state, Datum key,
 	OffsetNumber entryoff;
 	bool		movedright;
 	bool		found;
+	BlockNumber hint;
 
 	hash = (reservedflag != 0) ? LION_NULLKEY_HASH : lion_hash_key(state, key);
 
@@ -1965,6 +2093,23 @@ lion_insert_one(Relation index, Relation heaprel, LionState *state, Datum key,
 							 (Datum) 0, hash);
 	else
 		lion_search_key_init(state, &sk, LION_KIND_VALUE, key, hash);
+
+	/*
+	 * The leaf this backend last wrote the key on, when it still holds the
+	 * entry and the insert leaves it unsplit: no descent at all (DESIGN.md
+	 * §21, "A leaf already known").
+	 */
+	hint = lion_leaf_hint_get(state->ix, &sk);
+	if (BlockNumberIsValid(hint) &&
+		lion_dir_find_on_leaf(index, &sk, hint, &leafbuf, &entryoff))
+	{
+		bool		done = lion_insert_known(index, heaprel, state, leafbuf,
+											 entryoff, ckey, lo, pm);
+
+		UnlockReleaseBuffer(leafbuf);
+		if (done)
+			return;
+	}
 
 	/*
 	 * One descent, with the leaf taken EXCLUSIVE, and it is held for the whole
@@ -1998,6 +2143,11 @@ lion_insert_one(Relation index, Relation heaprel, LionState *state, Datum key,
 			lion_insert_chain(index, heaprel, leafbuf, entryoff, ckey, lo, pm);
 	}
 
+	/*
+	 * The leaf held now: the entry's, or one to its left when a split moved
+	 * the entry on - a guess either way, which the next insert checks.
+	 */
+	lion_leaf_hint_set(state->ix, &sk, BufferGetBlockNumber(leafbuf));
 	UnlockReleaseBuffer(leafbuf);
 }
 
@@ -2711,6 +2861,58 @@ lion_insert_group_cmp(const void *pa, const void *pb, void *arg)
 }
 
 /*
+ * Does a's prefix (lion_cmp_prefix()) sort strictly before b's?  a is the key
+ * of an earlier hold of the same batch, so it sorts at or before b (the
+ * groups are in the directory's order): the question is only whether the two
+ * prefixes tie - the same column and kind, and for a value the same position
+ * under proc 4 in an ordered column, the same hash in any other.  Only then
+ * is the leaf that held a's entry one whose range begins before every entry
+ * of b's prefix run, which lion_dir_find_from() needs.
+ */
+static bool
+lion_insert_prefix_before(const LionSearchKey *a, const LionSearchKey *b)
+{
+	if (a->attno != b->attno || a->kind != b->kind)
+		return true;
+	if (a->kind != LION_KIND_VALUE)
+		return false;
+	if (a->cmpproc != NULL)
+		return DatumGetInt32(FunctionCall2Coll(a->cmpproc, a->collation,
+											   a->key, b->key)) != 0;
+	return a->hash != b->hash;
+}
+
+/*
+ * The rows rows[0 .. n) of one key, whose entry the writer found on a leaf it
+ * took without a descent (lion_dir_find_on_leaf()) and holds EXCLUSIVE: as
+ * many as one hold takes - a CHAIN entry's up to LION_APPLY_HOLD, an INLINE
+ * entry's one - or none, with nothing written, when the INLINE entry would
+ * have to grow past what the leaf has room for (lion_insert_known()).
+ */
+static int
+lion_insert_apply_known(Relation index, Relation heaprel, LionState *state,
+						Buffer leafbuf, OffsetNumber entryoff,
+						const LionInsertRow *rows, int n)
+{
+	int			i;
+	int			stop;
+
+	if ((lion_page_entry(BufferGetPage(leafbuf), entryoff)->flags &
+		 LION_ENTRY_INLINE) != 0)
+		return lion_insert_known(index, heaprel, state, leafbuf, entryoff,
+								 lion_code_ckey(rows[0].code),
+								 lion_code_lo(rows[0].code), NULL) ? 1 : 0;
+
+	lion_writer_check(index, leafbuf, entryoff, true);
+	stop = Min(n, LION_APPLY_HOLD);
+	for (i = 0; i < stop; i++)
+		lion_insert_chain(index, heaprel, leafbuf, entryoff,
+						  lion_code_ckey(rows[i].code),
+						  lion_code_lo(rows[i].code), NULL);
+	return stop;
+}
+
+/*
  * Write a batch of buffered rows (lion_defer.c), reordering rows[] in place.
  *
  * Each key's rows are what lion_insert_one() would do for them one at a
@@ -2738,6 +2940,8 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 	int			ngroups = 0;
 	int			g;
 	int			i;
+	LionLastLeaf last;
+	LionSearchKey lastsk;
 
 	if (nrows == 0)
 		return;
@@ -2751,6 +2955,10 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 									LION_INSERT_CONTEXT_SIZE,
 									ALLOCSET_DEFAULT_MAXSIZE);
 	oldcxt = MemoryContextSwitchTo(cxt);
+	memset(&last, 0, sizeof(last));
+	memset(&lastsk, 0, sizeof(lastsk));
+	last.blk = InvalidBlockNumber;
+	last.cxt = cxt;
 
 	/* the keys' rows together, in TID order, by a cheap comparison ... */
 	qsort_arg(rows, nrows, sizeof(LionInsertRow), lion_insert_row_cmp, ix);
@@ -2788,8 +2996,10 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 			LionSearchKey sk;
 			Buffer		leafbuf;
 			OffsetNumber entryoff;
-			bool		movedright;
+			bool		movedright = false;
 			bool		found;
+			BlockNumber hint;
+			int			r = LION_FIND_NOT_HERE;
 
 			if (flag != 0)
 				lion_search_key_init(state, &sk, lion_reserved_kind(flag),
@@ -2798,9 +3008,52 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 				lion_search_key_init(state, &sk, LION_KIND_VALUE,
 									 grows[i].key, grows[i].hash);
 
-			found = lion_dir_find(index, heaprel, state->ix, &sk,
-								  BUFFER_LOCK_EXCLUSIVE, true, &leafbuf,
-								  &entryoff, &movedright);
+			/*
+			 * The leaf this backend last wrote the key on, when it still
+			 * holds the entry: a CHAIN entry's next rows, or an INLINE
+			 * entry's next row where the leaf has the room, with no descent
+			 * (DESIGN.md §21, "A leaf already known").
+			 */
+			hint = lion_leaf_hint_get(ix, &sk);
+			if (BlockNumberIsValid(hint) &&
+				lion_dir_find_on_leaf(index, &sk, hint, &leafbuf, &entryoff))
+			{
+				int			n = lion_insert_apply_known(index, heaprel, state,
+														leafbuf, entryoff,
+														&grows[i], end - i);
+
+				/*
+				 * Not noted as the leaf the next key starts from: a leaf
+				 * reached without a descent may be a split's right half with
+				 * no downlink yet, where a new entry must not go.
+				 */
+				UnlockReleaseBuffer(leafbuf);
+				if (n > 0)
+				{
+					i += n;
+					MemoryContextReset(holdcxt);
+					LION_INJECTION_POINT("lion-insert-batch-hold");
+					CHECK_FOR_INTERRUPTS();
+					continue;
+				}
+			}
+
+			/*
+			 * Else the find-or-create, from the leaf the last one ended on
+			 * when that key's prefix sorts before this one's - the keys go
+			 * in the directory's order, so a run of them that share a leaf
+			 * shares its descent - or from the root.
+			 */
+			if (BlockNumberIsValid(last.blk) &&
+				lion_insert_prefix_before(&lastsk, &sk))
+				r = lion_dir_find_from(index, heaprel, ix, &sk, &last,
+									   &leafbuf, &entryoff, &movedright);
+			if (r == LION_FIND_NOT_HERE)
+				found = lion_dir_find(index, heaprel, ix, &sk,
+									  BUFFER_LOCK_EXCLUSIVE, true, &leafbuf,
+									  &entryoff, &movedright);
+			else
+				found = (r == LION_FIND_FOUND);
 			lion_writer_check(index, leafbuf, entryoff, found);
 
 			if (!found)
@@ -2830,6 +3083,9 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 									  lion_code_lo(grows[i].code), NULL);
 			}
 
+			lion_dir_note_leaf(&last, leafbuf);
+			lastsk = sk;
+			lion_leaf_hint_set(ix, &sk, last.blk);
 			UnlockReleaseBuffer(leafbuf);
 			MemoryContextReset(holdcxt);
 

@@ -58,6 +58,7 @@
 
 #include "access/generic_xlog.h"
 #include "access/xact.h"
+#include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
@@ -249,6 +250,23 @@ lion_dir_read_since(Oid indexoid, int64 since)
 	mark = (LionDirReadMark *) hash_search(lion_dir_marks, &indexoid,
 										   HASH_FIND, NULL);
 	return mark != NULL && mark->last > since;
+}
+
+/*
+ * lion_debug_dir_pages_read() returns int8: lion_dir_pages_read, the
+ * directory pages this backend has read so far - what the tests of the
+ * insert paths that skip a descent count (test/sql/insert_leaf_hint.sql).
+ */
+PG_FUNCTION_INFO_V1(lion_debug_dir_pages_read);
+
+Datum
+lion_debug_dir_pages_read(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("lion_debug_dir_pages_read() is for superusers")));
+	PG_RETURN_INT64(lion_dir_pages_read);
 }
 
 static inline LionEntryTuple *
@@ -1016,6 +1034,11 @@ lion_dir_note_parent(Page page, BlockNumber blk, LionDirParent *parent)
  * read through strategy: NULL, or VACUUM's (lion_dir_readbuf()).  The split
  * a writer finishes on the way reads without it, as every write does.
  */
+static bool lion_dir_find_landed(Relation index, const LionSearchKey *sk,
+								 Buffer *bufp, OffsetNumber *offnum,
+								 bool *movedright,
+								 BufferAccessStrategy strategy);
+
 static Buffer
 lion_dir_descend(Relation index, Relation heaprel, LionIndexState *ix,
 				 const LionSearchKey *sk, int lockmode, bool forwrite,
@@ -1564,40 +1587,224 @@ lion_dir_find_ext(Relation index, Relation heaprel, LionIndexState *ix,
 
 	if (forwrite)
 	{
-		Buffer		guard;
-		bool		found;
-		bool		moved;
-
-		/*
-		 * The insert path's find-or-create (DESIGN.md §21).  When the lookup
-		 * stays on one leaf, that leaf is held from here to the insert and
-		 * nothing more is needed.  When the prefix run crosses a page
-		 * boundary, the leaf the run is entered from - the one every writer
-		 * of a key of this prefix descends to - is kept locked (the guard) and
-		 * handed back INSTEAD of the leaf the scan ended on, so that no other
-		 * writer can run the same lookup, miss as well, and create the key a
-		 * second time before this one has placed it.
-		 */
-		found = lion_dir_scan_run_ext(index, sk, lockmode, bufp, offnum,
-									  &moved, &guard, strategy);
-		if (movedright != NULL)
-			*movedright = moved;
-		if (!BufferIsValid(guard))
-			return found;
-		if (found)
-		{
-			UnlockReleaseBuffer(guard);
-			return true;
-		}
-		UnlockReleaseBuffer(*bufp);
-		*bufp = guard;
-		*offnum = InvalidOffsetNumber;
-		Assert(moved);
-		return false;
+		Assert(lockmode == BUFFER_LOCK_EXCLUSIVE);
+		return lion_dir_find_landed(index, sk, bufp, offnum, movedright,
+									strategy);
 	}
 
 	return lion_dir_scan_run_ext(index, sk, lockmode, bufp, offnum, movedright,
 								 NULL, strategy);
+}
+
+/*
+ * The insert path's find-or-create (DESIGN.md §21), from the leaf a write
+ * descent landed on: *bufp, held EXCLUSIVE, and *offnum the first item there
+ * that does not sort before sk.  When the lookup stays on one leaf, that leaf
+ * is held from here to the insert and nothing more is needed.  When the
+ * prefix run crosses a page boundary, the leaf the run is entered from - the
+ * one every writer of a key of this prefix descends to - is kept locked (the
+ * guard) and handed back INSTEAD of the leaf the scan ended on, so that no
+ * other writer can run the same lookup, miss as well, and create the key a
+ * second time before this one has placed it.
+ */
+static bool
+lion_dir_find_landed(Relation index, const LionSearchKey *sk, Buffer *bufp,
+					 OffsetNumber *offnum, bool *movedright,
+					 BufferAccessStrategy strategy)
+{
+	Buffer		guard;
+	bool		found;
+	bool		moved;
+
+	found = lion_dir_scan_run_ext(index, sk, BUFFER_LOCK_EXCLUSIVE, bufp,
+								  offnum, &moved, &guard, strategy);
+	if (movedright != NULL)
+		*movedright = moved;
+	if (!BufferIsValid(guard))
+		return found;
+	if (found)
+	{
+		UnlockReleaseBuffer(guard);
+		return true;
+	}
+	UnlockReleaseBuffer(*bufp);
+	*bufp = guard;
+	*offnum = InvalidOffsetNumber;
+	Assert(moved);
+	return false;
+}
+
+/* ---------------------------------------------------------------------
+ * A leaf already known (DESIGN.md §21)
+ * --------------------------------------------------------------------- */
+
+/*
+ * Is page a directory leaf a writer may take without a descent: a live leaf,
+ * not on its way out of the tree (HALF_DEAD, DELETED) and with no split of
+ * its own left unfinished?  Any page of the index may stand at a block a
+ * writer remembers - the leaf it was may since have been freed and taken
+ * again for anything - so this reads only what every page has.
+ */
+static bool
+lion_dir_page_live_leaf(Page page)
+{
+	LionPageOpaque opaque;
+
+	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE)
+		return false;
+	opaque = LionPageGetOpaque(page);
+
+	return opaque->page_id == LION_PAGE_ID &&
+		(opaque->flags & LION_PAGE_KINDS) == LION_PAGE_BUCKET &&
+		(opaque->flags & (LION_PAGE_DELETED | LION_PAGE_HALF_DEAD |
+						  LION_PAGE_INCOMPLETE_SPLIT)) == 0 &&
+		opaque->level == 0;
+}
+
+/*
+ * Look for sk's entry on block blk alone, which the caller remembers as the
+ * leaf that held it (lion_insert.c's leaf hints): blk taken EXCLUSIVE, and
+ * true with it held and *offnum the entry when the entry is on it; false,
+ * with nothing held, when blk is not a live leaf or does not hold the entry.
+ *
+ * Holding the leaf that holds the key's entry is all a writer of that entry
+ * needs, however it got there: every writer of the key serialises on that
+ * leaf (DESIGN.md §5), and the entry is the key's only one.  What a
+ * remembered leaf cannot promise is a downlink: the block may have been
+ * freed and taken again as the new right half of a split whose downlink is
+ * not in yet, which only a writer that splits the page could trip over
+ * (lion_dir_descend()).  So the caller does on it only what leaves the leaf
+ * unsplit - a CHAIN entry's insert, an INLINE entry rewritten where it
+ * stands - and anything else, a new key included, goes through a descent.
+ */
+bool
+lion_dir_find_on_leaf(Relation index, const LionSearchKey *sk,
+					  BlockNumber blk, Buffer *bufp, OffsetNumber *offnum)
+{
+	Buffer		buf;
+	Page		page;
+
+	Assert(BlockNumberIsValid(blk));
+	buf = lion_dir_readbuf(index, blk);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	if (lion_dir_page_live_leaf(page))
+	{
+		OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+		OffsetNumber off;
+
+		for (off = lion_page_binsrch_ext(page, sk, false); off <= maxoff;
+			 off = OffsetNumberNext(off))
+		{
+			ItemId		iid = PageGetItemId(page, off);
+			LionEntryTuple *e;
+
+			if (!ItemIdIsUsed(iid))
+				continue;
+			e = lion_entry_at(page, iid);
+			if (lion_cmp_prefix(e, sk) != 0)
+				break;
+			if (sk->kind != LION_KIND_VALUE ||
+				DatumGetBool(FunctionCall2Coll(sk->eqproc, sk->collation,
+											   lion_entry_key(sk->col, e),
+											   sk->key)))
+			{
+				*bufp = buf;
+				*offnum = off;
+				return true;
+			}
+		}
+	}
+	UnlockReleaseBuffer(buf);
+	return false;
+}
+
+/*
+ * Remember the directory leaf buf, which the caller holds, for a later
+ * lion_dir_find_from(): its block, and a copy of its high key, so that a key
+ * past the leaf's range is sent to a descent without the leaf being read.
+ */
+void
+lion_dir_note_leaf(LionLastLeaf *last, Buffer buf)
+{
+	Page		page = BufferGetPage(buf);
+
+	last->blk = BufferGetBlockNumber(buf);
+	last->rightmost = LionPageIsRightmost(page);
+	if (!last->rightmost)
+	{
+		Size		sz = lion_page_itemsz(page, FirstOffsetNumber);
+
+		if (sz > last->highcap)
+		{
+			if (last->high != NULL)
+				pfree(last->high);
+			last->high = MemoryContextAlloc(last->cxt, sz);
+			last->highcap = sz;
+		}
+		memcpy(last->high, lion_page_highkey(page), sz);
+	}
+}
+
+/*
+ * lion_dir_find() with forwrite, starting from the leaf last names instead
+ * of the root: a leaf this writer held for an earlier key during the same
+ * transaction (lion_insert_apply()), whose range begins at or below sk.
+ * Returns LION_FIND_NOT_HERE, with nothing held, when the leaf's range ended
+ * at or below sk when it was noted or does now, or the block is no longer a
+ * live leaf - a descent is cheaper than a walk right past more than the leaf
+ * it lands on; otherwise what lion_dir_find() returns, with what it leaves in
+ * *bufp, *offnum and *movedright.
+ *
+ * Why the range still begins at or below sk.  The leaf held a key that sorts
+ * strictly before sk's prefix when the writer held it.  A split since kept
+ * the leaf's lower bound and moved what sorts above its cut to the right; a
+ * deletion of the page to its left handed that page's range to this one,
+ * which only lowers it; and its own deletion - the one thing that would take
+ * the range away - shows in its flags, as the page cannot have been freed
+ * and taken again while this transaction runs (its safexid is past this
+ * transaction's xid, DESIGN.md §21 "Page deletion").  Nor can it lack a
+ * downlink: the writer reached it through a descent, or by this function
+ * from a leaf that one did - never as a remembered leaf
+ * (lion_dir_find_on_leaf()) - and either finishes every split it steps over.
+ *
+ * So a leaf whose high key exceeds sk (or that has none) is the leaf a
+ * descent for sk lands on: the descent's last step is the walk right while
+ * the high key does not exceed sk (lion_dir_descend()).  Its page has no
+ * split of its own left unfinished (lion_dir_page_live_leaf()), so the
+ * descent would have nothing to finish there either, and the find-or-create
+ * from it is the descent's (lion_dir_find_landed()), guard and all.  The
+ * high key last keeps only saves the read when it already rules the
+ * leaf out: a split since lowers it, a left neighbour's deletion leaves it,
+ * so the one taken under the lock decides.
+ */
+int
+lion_dir_find_from(Relation index, Relation heaprel, LionIndexState *ix,
+				   const LionSearchKey *sk, const LionLastLeaf *last,
+				   Buffer *bufp, OffsetNumber *offnum, bool *movedright)
+{
+	Buffer		buf;
+	Page		page;
+
+	Assert(BlockNumberIsValid(last->blk));
+	if (!last->rightmost && lion_cmp_entry(last->high, sk) <= 0)
+		return LION_FIND_NOT_HERE;
+
+	buf = lion_dir_readbuf(index, last->blk);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	if (!lion_dir_page_live_leaf(page) ||
+		(!LionPageIsRightmost(page) &&
+		 lion_cmp_entry(lion_page_highkey(page), sk) <= 0))
+	{
+		UnlockReleaseBuffer(buf);
+		return LION_FIND_NOT_HERE;
+	}
+
+	*bufp = buf;
+	*offnum = lion_page_binsrch_ext(BufferGetPage(buf), sk, false);
+	return lion_dir_find_landed(index, sk, bufp, offnum, movedright, NULL) ?
+		LION_FIND_FOUND : LION_FIND_ABSENT;
 }
 
 /*
