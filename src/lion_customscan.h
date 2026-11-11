@@ -292,6 +292,14 @@
 #define LION_SAGG_MAXKIND	LION_SAGG_MAX
 
 /*
+ * ... whose partial aggregate's state is that value, which a node emitting
+ * partial rows emits as it is (DESIGN.md §52, "Partial rows")
+ */
+#define LION_SAGG_IS_PARTIAL_OK(kind) \
+	((kind) == LION_SAGG_COUNT || (kind) == LION_SAGG_SUM || \
+	 (kind) == LION_SAGG_MIN || (kind) == LION_SAGG_MAX)
+
+/*
  * What a sliced column's aggregates ask of its slices (DESIGN.md §52): every
  * bit slice's count, for a sum or an average; each descent; E's count alone
  * is what count(x) and every other needs.
@@ -2231,6 +2239,8 @@ typedef struct LionSCol
 	AttrNumber	attno;			/* the heap column */
 	Oid			idxoid;
 	AttrNumber	idxcol;			/* its key column in idxoid */
+	int			run;			/* the run it is counted in: 0, or a filter's
+								 * (§52, "Filtered aggregates") */
 	int			want;			/* LION_SWANT_*: what its aggregates ask */
 	Oid			typid;			/* the type it is sliced as */
 	int			nbits;
@@ -2811,6 +2821,9 @@ typedef struct LionCountPrivSCol
 	AttrNumber	attno;			/* the heap column */
 	Oid			idxoid;			/* the lion index whose slices it reads */
 	AttrNumber	idxcol;			/* ... the column's key column there */
+	int			run;			/* the run whose rows it is counted over: 0
+								 * the WHERE's, f filter f's (§52,
+								 * "Filtered aggregates") */
 } LionCountPrivSCol;
 
 /* ... and one of those aggregates, from SLICES' fourth list (PLAN stage) */
@@ -4344,7 +4357,7 @@ extern bool lion_contains_param(Node *expr);
 extern int	lion_wagg_classify(Aggref *agg, Index rti, AttrNumber *attno,
 							   int *argwidth);
 extern int	lion_sagg_classify(Aggref *agg, Index rti, AttrNumber *attno,
-							   Oid *argtype);
+							   Oid *argtype, Node **filter);
 extern IndexOptInfo *lion_range_sliced_index(RelOptInfo *rel, AttrNumber attno,
 											 AttrNumber *colp, Oid *typid);
 extern bool lion_rel_has_sliced_index(RelOptInfo *rel);
@@ -4673,7 +4686,9 @@ extern void lion_target_lists(const LionCountTarget *t, List *whereclauses,
 							  List **tors, int *joinclause);
 extern void lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath,
 								 RelOptInfo *rel, List *idxs, List *cols,
-								 List *wants, double whererows,
+								 List *wants, const double *whererows,
+								 const int *runs, const Cost *runwhere,
+								 const bool *runcounted, int nrun,
 								 bool haswhere, bool counts, double ngroups,
 								 int batch, Cost rangecollect);
 extern void lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath,
@@ -4921,9 +4936,11 @@ extern TupleTableSlot *lion_next_group_any(LionCountScanState *st,
 										   bool *exhausted);
 
 /* lion_exec_slice.c: the aggregates of sliced columns (DESIGN.md §52) */
-extern void lion_slice_run(LionCountScanState *st);
+extern void lion_slice_run(LionCountScanState *st, int run);
 extern void lion_slice_parts_begin(LionCountScanState *st);
-extern void lion_slice_part(LionCountScanState *st);
+extern void lion_slice_part(LionCountScanState *st, int run);
+extern bool lion_slice_partial_null(LionCountScanState *st,
+									const struct LionSAgg *a);
 extern void lion_slice_parts_end(LionCountScanState *st);
 extern void lion_slice_none(LionCountScanState *st);
 extern void lion_slice_group(LionCountScanState *st, int ngset,

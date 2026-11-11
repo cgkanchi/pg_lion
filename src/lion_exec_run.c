@@ -80,7 +80,7 @@ lion_run_partition(LionCountScanState *st, int p)
 	 * slices, while its WHERE's sets are located (§52.13)
 	 */
 	if (st->slice != NULL)
-		lion_slice_part(st);
+		lion_slice_part(st, 0);
 
 	/* its rows are its indexes' (lion_count_report_reads()) */
 	st->statrows += count;
@@ -549,7 +549,7 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		else
 			count = 0;
 		if (st->slice != NULL)
-			lion_slice_run(st);
+			lion_slice_run(st, 0);
 
 		/*
 		 * A plain aggregate always produces its one row; a GROUP BY whose
@@ -617,7 +617,7 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 
 				/* ... and of sliced columns, from their slices (§52) */
 				if (hasslice)
-					lion_slice_run(st);
+					lion_slice_run(st, 0);
 				st->done = true;
 
 				/*

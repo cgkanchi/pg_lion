@@ -1028,6 +1028,7 @@ lion_begin_slices(LionCountScanState *st, const LionCountPriv *priv,
 		ss->col[i].attno = priv->scol[i].attno;
 		ss->col[i].idxoid = priv->scol[i].idxoid;
 		ss->col[i].idxcol = priv->scol[i].idxcol;
+		ss->col[i].run = priv->scol[i].run;
 	}
 	ss->nagg = priv->nsagg;
 	ss->agg = (LionSAgg *) MemoryContextAllocZero(estate->es_query_cxt,
@@ -1059,11 +1060,19 @@ lion_begin_slices(LionCountScanState *st, const LionCountPriv *priv,
 		}
 	}
 
-	/* counts are wanted where the target list has anything else */
+	/*
+	 * the WHERE's counts are wanted where the target list has anything else
+	 * - a filtered count is its filter's run's (lion_run_counted()), but
+	 * where it is NULL over no row of the WHERE (LION_FCOUNT_SUM)
+	 */
 	ss->needcount = false;
 	for (i = 0; i < st->ntlist; i++)
 	{
-		if (!LION_TL_IS_SAGG(st->tlkind[i]))
+		int			kind = st->tlkind[i];
+
+		if (!LION_TL_IS_SAGG(kind) &&
+			!(LION_TL_IS_FCOUNT(kind) &&
+			  LION_TL_FCOUNT_FORM(kind) != LION_FCOUNT_SUM))
 			ss->needcount = true;
 	}
 	ss->cxt = AllocSetContextCreate(estate->es_query_cxt,

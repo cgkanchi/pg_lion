@@ -5898,6 +5898,13 @@ lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
  * that copy C0 = E ∧ WHERE in one walk of its container keys, and a descent
  * for each extreme asked.  Added to the count of the WHERE the path prices
  * (cpath) when the target list has counts too, and in its place when not.
+ * whererows[c] are the rows of column c's WHERE - the WHERE's, or with a
+ * filter's run (§52, "Filtered aggregates") the WHERE's and the filter's
+ * together - and runs[c] the run it is counted in (NULL: all in run 0);
+ * the columns of one run share its collection.  With filters' runs, each
+ * run's collection is priced from that run's count, runwhere[r], and the
+ * node counts only the runs runcounted[] says the target list takes the
+ * count of: the price is theirs, and the slices'.
  *
  *	- the collection: the WHERE's merge - what the count of it is priced at,
  *	  half of it again beside the count, whose pages it reads again cached -
@@ -5956,12 +5963,14 @@ lion_slice_read_cost(PlannerInfo *root, IndexOptInfo *idx, double keys,
 
 void
 lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
-					 List *idxs, List *cols, List *wants, double whererows,
-					 bool haswhere, bool counts, double ngroups, int batch,
-					 Cost rangecollect)
+					 List *idxs, List *cols, List *wants,
+					 const double *whererows, const int *runs,
+					 const Cost *runwhere, const bool *runcounted,
+					 int nrun, bool haswhere, bool counts, double ngroups,
+					 int batch, Cost rangecollect)
 {
 	Cost		where = cpath->path.total_cost;
-	Cost		run = counts ? where : 0.0;
+	Cost		run = 0.0;
 	double		units = Max(ngroups, 1.0);
 	double		outrows = cpath->path.rows;
 	double		heap_pages = Max((double) rel->pages, 1.0);
@@ -5973,13 +5982,30 @@ lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 	ListCell   *l1;
 	ListCell   *l2;
 	ListCell   *l3;
-	bool		collected = false;
+	Bitmapset  *collected = NULL;	/* the runs whose WHERE is collected */
+	int			i = 0;
+	int			r;
+
+	/* the counts the target list takes */
+	if (runwhere == NULL)
+		run = counts ? where : 0.0;
+	else
+	{
+		for (r = 0; r < nrun; r++)
+			run += runcounted[r] ? runwhere[r] : 0.0;
+	}
 
 	forthree(l1, idxs, l2, cols, l3, wants)
 	{
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(l1);
 		AttrNumber	col = (AttrNumber) lfirst_int(l2);
 		int			want = lfirst_int(l3);
+		double		colrows = whererows[i];
+		int			colrun = (runs != NULL) ? runs[i] : 0;
+		bool		runcollected = bms_is_member(colrun, collected);
+		Cost		colwhere = (runwhere != NULL) ? runwhere[colrun] : where;
+		bool		colcounts = (runwhere != NULL) ? runcounted[colrun] :
+			counts;
 		LionSliceShape shape;
 		Relation	index;
 		double		erows;
@@ -6009,8 +6035,9 @@ lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 
 		/* C0 = E ∧ WHERE: the WHERE's share of E's rows, and their keys */
 		erows = Max(shape.rows[nbits], 1.0);
-		crows = haswhere ? erows * Min(Max(whererows, 1.0) / tuples, 1.0) :
-			erows;
+		i++;
+		crows = (haswhere || colrun > 0) ?
+			erows * Min(Max(colrows, 1.0) / tuples, 1.0) : erows;
 		ckeys = Max(nkeys * (1.0 - exp(-crows / nkeys)), 1.0);
 
 		/*
@@ -6022,13 +6049,14 @@ lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 		 * the collection of a range of a column in no heap order from its
 		 * summaries at a fifth of its time).
 		 */
-		if (haswhere)
-			run += (counts || collected ? 0.5 : 1.0) * where +
-				ckeys * LION_PROBE_COST + (collected ? 0.0 : rangecollect);
+		if (haswhere || colrun > 0)
+			run += (colcounts || runcollected ? 0.5 : 1.0) * colwhere +
+				ckeys * LION_PROBE_COST +
+				(bms_is_empty(collected) ? rangecollect : 0.0);
 		else
 			run += Min(shape.items[nbits], nkeys) * LION_CONTAINER_COST;
 		run += ckeys * LION_FKJOIN_COPY_CONTAINER_COST;
-		collected = true;
+		collected = bms_add_member(collected, colrun);
 
 		/*
 		 * The decode route (DESIGN.md §52): a walk of C0's keys a batch of

@@ -358,9 +358,10 @@ INSERT INTO slp (id, g, h, r, b, c) VALUES
 SELECT * FROM slp_groups('one at a time');
 SELECT * FROM slp_groups('decoded');
 ROLLBACK;
--- declined: a filtered count beside a GROUP BY, three columns, a grouping
--- by an expression
+-- a filtered count beside a GROUP BY: its runs' groups go up as partial
+-- rows, which an int4 sum's value is the partial state of (section 8)
 SELECT slp_q('SELECT g, sum(b), count(*) FILTER (WHERE h = 1) FROM slp GROUP BY g');
+-- declined: three columns, a grouping by an expression
 SELECT slp_q('SELECT g, h, r, sum(b) FROM slp WHERE r < 5 GROUP BY g, h, r');
 SELECT slp_q('SELECT g % 2, sum(b) FROM slp GROUP BY g % 2');
 DROP FUNCTION slp_groups(text);
@@ -404,15 +405,50 @@ RESET pg_lion.enable_count_pushdown;
 DROP INDEX slp_v2;
 DROP FUNCTION slp_cost(text);
 
--- ---------- 8. declined ----------
+-- ---------- 8. filtered aggregates (DESIGN.md §52, "Filtered aggregates") ----------
+-- An aggregate with a FILTER is answered over the rows of its filter's run,
+-- the one a filtered count with the same condition is counted in (§10):
+-- every type, the same column in several runs, beside filtered counts.
+SELECT slp_q('SELECT sum(b) FILTER (WHERE h = 1), sum(b) FILTER (WHERE h = 2), sum(b), count(*) FILTER (WHERE h = 1) FROM slp WHERE g = 3');
+SELECT * FROM slp_plan('SELECT sum(b) FILTER (WHERE h = 1), sum(b) FILTER (WHERE h = 2), sum(b), count(*) FILTER (WHERE h = 1) FROM slp WHERE g = 3');
+SELECT slp_q('SELECT avg(a) FILTER (WHERE h = 2), min(c) FILTER (WHERE h = 1), max(d) FILTER (WHERE tags @> ''{3}''), sum(c) FILTER (WHERE tags @> ''{3}''), count(t) FILTER (WHERE h < 2), min(ts) FILTER (WHERE h < 2), max(tz) FILTER (WHERE h < 2) FROM slp WHERE r < 500');
+-- no WHERE; a filter that selects nothing, which answers 0 and NULLs
+SELECT slp_q('SELECT sum(c) FILTER (WHERE g = 2), avg(b) FILTER (WHERE g = 2) FROM slp');
+SELECT slp_q('SELECT sum(b) FILTER (WHERE h = 9), max(ts) FILTER (WHERE h = 9), count(b) FILTER (WHERE h = 9), count(*) FROM slp WHERE g = 3');
+-- a range in a filter, collected from its entries, and on a sliced column
+-- from its slices (§53) - in a filter of its own, and beside the WHERE's
+SELECT slp_q('SELECT sum(b) FILTER (WHERE r < 100), max(b) FILTER (WHERE r >= 900) FROM slp WHERE g = 3');
+SELECT slp_q('SELECT count(*) FILTER (WHERE b > 0), sum(a) FILTER (WHERE b BETWEEN -1000 AND 1000), count(*) FROM slp');
+SELECT * FROM slp_plan('SELECT count(*) FILTER (WHERE b > 0), sum(a) FILTER (WHERE b BETWEEN -1000 AND 1000), count(*) FROM slp WHERE c < 0');
+SELECT slp_q('SELECT count(*) FILTER (WHERE b > 0), sum(a) FILTER (WHERE b BETWEEN -1000 AND 1000), count(*) FROM slp WHERE c < 0');
+-- the HAVING's
+SELECT slp_q('SELECT sum(b) FILTER (WHERE h = 1) FROM slp WHERE g = 3 HAVING max(b) FILTER (WHERE h = 1) > 0');
+-- beside a GROUP BY, a run's groups go up as partial rows (§52, "Partial
+-- rows"): a count, an int2 or int4 sum, a minimum and a maximum, whose
+-- values are their partial states - of one column's groups and of two's
+SELECT slp_q('SELECT g, count(*), sum(b) FILTER (WHERE h = 1), max(tz) FILTER (WHERE h = 1), min(b), count(c) FILTER (WHERE r < 300) FROM slp GROUP BY g');
+SELECT * FROM slp_plan('SELECT g, count(*), sum(b) FILTER (WHERE h = 1), max(tz) FILTER (WHERE h = 1), min(b) FROM slp GROUP BY g');
+SELECT slp_q('SELECT g, sum(a) FILTER (WHERE h = 1), min(d) FILTER (WHERE h = 1) FROM slp WHERE r < 500 GROUP BY g HAVING sum(a) FILTER (WHERE h = 1) > 0');
+SELECT slp_q('SELECT g, h, sum(b) FILTER (WHERE r < 10), max(c) FILTER (WHERE r < 10), count(*) FROM slp WHERE tags @> ''{3}'' GROUP BY g, h');
+-- ... but not an average or an int8 sum, whose states are a count beside a
+-- sum: no path is made for them, so none comes up even with lion's price
+-- cut a thousandfold
+SET pg_lion.pushdown_margin = 1000;
+SELECT slp_q('SELECT g, avg(b) FILTER (WHERE h = 1) FROM slp GROUP BY g');
+SELECT slp_q('SELECT g, sum(c) FILTER (WHERE h = 1) FROM slp GROUP BY g');
+SELECT slp_q('SELECT g, avg(b), count(*) FILTER (WHERE h = 1) FROM slp GROUP BY g');
+RESET pg_lion.pushdown_margin;
+
+-- ---------- 9. declined ----------
 -- a column that is not sliced, and a float column, which no slice takes
 SELECT slp_q('SELECT sum(r), max(r) FROM slp WHERE g = 3');
 SELECT slp_q('SELECT sum(f), max(f) FROM slp WHERE g = 3');
--- an aggregate of an expression of the column, DISTINCT, FILTER, ORDER BY
+-- an aggregate of an expression of the column, DISTINCT, ORDER BY, a
+-- FILTER no posting set answers
 SELECT slp_q('SELECT sum(b / 2) FROM slp WHERE g = 3');
 SELECT slp_q('SELECT sum(DISTINCT b) FROM slp WHERE g = 3');
-SELECT slp_q('SELECT sum(b) FILTER (WHERE h = 1) FROM slp WHERE g = 3');
 SELECT slp_q('SELECT min(b ORDER BY b) FROM slp WHERE g = 3');
+SELECT slp_q('SELECT sum(b) FILTER (WHERE pad LIKE ''l%'') FROM slp WHERE g = 3');
 -- a residual clause no posting set answers
 SELECT slp_q('SELECT sum(b) FROM slp WHERE g = 3 AND pad LIKE ''l%''');
 -- a join
@@ -421,7 +457,8 @@ INSERT INTO slp_dim SELECT i, 'g' || i FROM generate_series(0, 9) i;
 ANALYZE slp_dim;
 SELECT slp_q('SELECT sum(s.b), max(s.b) FROM slp s JOIN slp_dim d ON d.g = s.g WHERE d.name = ''g3''');
 -- a partitioned table: its one row is answered from every partition's
--- slices (slices_partitioned.sql), its GROUP BY is not
+-- slices, and its GROUP BY where the aggregates' values are their partial
+-- states (slices_partitioned.sql)
 CREATE TABLE slp_part (k int, v int4) PARTITION BY RANGE (k);
 CREATE TABLE slp_part1 PARTITION OF slp_part FOR VALUES FROM (0) TO (50);
 CREATE TABLE slp_part2 PARTITION OF slp_part FOR VALUES FROM (50) TO (100);

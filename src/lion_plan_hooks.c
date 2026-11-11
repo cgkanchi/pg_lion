@@ -714,11 +714,13 @@ lion_wagg_add_target(Aggref *agg, LionCountPriv *priv,
 
 /*
  * An aggregate of DESIGN.md §52 in the tuple the node produces: agg of one of
- * priv's sliced columns, answered from its slices.  Appends it to *ctlist
- * with its LION_TL_SAGG kind, and what it computes to priv's aggregates - its
- * LION_SAGG_* kind and its column's position in priv's.  False for any other
- * aggregate; an aggregate already in *ctlist is done.  priv->sagg has room
- * for one more.
+ * priv's sliced columns, answered from its slices - over the WHERE's rows,
+ * or with a FILTER over its filter's run's, the run whose condition is
+ * equal() to the FILTER's (§52, "Filtered aggregates").  Appends it to
+ * *ctlist with its LION_TL_SAGG kind, and what it computes to priv's
+ * aggregates - its LION_SAGG_* kind and its column's position in priv's.
+ * False for any other aggregate; an aggregate already in *ctlist is done.
+ * priv->sagg has room for one more.
  */
 static bool
 lion_sagg_add_target(Aggref *agg, LionCountPriv *priv, List **ctlist,
@@ -726,17 +728,30 @@ lion_sagg_add_target(Aggref *agg, LionCountPriv *priv, List **ctlist,
 {
 	AttrNumber	attno;
 	Oid			argtype;
+	Node	   *filter;
 	int			skind = lion_sagg_classify(agg, priv->scanrelid, &attno,
-										   &argtype);
+										   &argtype, &filter);
 	LionCountPrivSAgg *a;
+	int			run = 0;
 	int			c;
 	ListCell   *lc;
 
 	if (skind == LION_SAGG_NONE)
 		return false;
+	if (filter != NULL)
+	{
+		foreach(lc, priv->filterexprs)
+		{
+			run++;
+			if (equal(lfirst(lc), filter))
+				break;
+		}
+		if (lc == NULL)
+			return false;		/* a filtered count's, or none */
+	}
 	for (c = 0; c < priv->nscol; c++)
 	{
-		if (priv->scol[c].attno == attno)
+		if (priv->scol[c].attno == attno && priv->scol[c].run == run)
 			break;
 	}
 	if (c == priv->nscol)

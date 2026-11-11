@@ -1334,6 +1334,30 @@ lion_run_count(LionCountScanState *st, bool sum, int r)
 }
 
 /*
+ * Does the node's row take run r's count?  Every run's but where the
+ * aggregates of sliced columns are all the target list has of it (DESIGN.md
+ * §52, "Filtered aggregates"): run 0's where nothing but those aggregates
+ * is there (needcount), and a filter's where no filtered count is of it.
+ */
+static bool
+lion_run_counted(LionCountScanState *st, int r)
+{
+	int			i;
+
+	if (st->slice == NULL)
+		return true;
+	if (r == 0)
+		return st->slice->needcount;
+	for (i = 0; i < st->ntlist; i++)
+	{
+		if (LION_TL_IS_FCOUNT(st->tlkind[i]) &&
+			LION_TL_FCOUNT_FILTER(st->tlkind[i]) == r)
+			return true;
+	}
+	return false;
+}
+
+/*
  * The counts of the runs of a node of one row with filtered counts
  * (DESIGN.md §10, "Filtered counts"): run 0's - the WHERE's - and each
  * filter's, the rows the WHERE and that filter select together, each
@@ -1361,24 +1385,26 @@ lion_count_runs(LionCountScanState *st, bool sum)
 			lion_open_relation(st, p);
 		for (r = 0; r < st->nrun; r++)
 		{
-			int64		n;
+			int64		n = 0;
 
 			lion_select_run(st, r);
 			lion_locate_where(st);
-			n = lion_run_count(st, sum, r);
+			if (lion_run_counted(st, r))
+				n = lion_run_count(st, sum, r);
 			st->runcount[r] += n;
 
 			/*
 			 * the aggregates of sliced columns (DESIGN.md §52), over the
-			 * WHERE's rows: run 0's, its sets still located - a partition's
-			 * added to the others' (§52.13)
+			 * rows of the run they are counted in - run 0's, the WHERE's,
+			 * or a filter's (§52, "Filtered aggregates") - its sets still
+			 * located: a partition's added to the others' (§52.13)
 			 */
-			if (r == 0 && st->slice != NULL)
+			if (st->slice != NULL)
 			{
 				if (p >= 0)
-					lion_slice_part(st);
+					lion_slice_part(st, r);
 				else
-					lion_slice_run(st);
+					lion_slice_run(st, r);
 			}
 			/* a partition's rows are its indexes' (lion_count_report_reads()) */
 			if (p >= 0)

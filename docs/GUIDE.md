@@ -208,8 +208,13 @@ price is an insert into each set bit's set on every write of the column: an `INS
 into a sliced `int4` and a sliced `int8` column took 4.6 times as long as without slices with
 `pg_lion` preloaded and about 11 times without it (DESIGN.md §51, "Insert cost, revisited"). Over a
 partitioned table whose every partition has its own sliced index, the aggregates without a `GROUP
-BY` are answered too, each partition from its own slices (DESIGN.md §52.13); a percentile, a join
-and a partitioned table's `GROUP BY` are not answered from the slices yet; `SELECT * FROM
+BY` are answered too, each partition from its own slices (DESIGN.md §52.13), and so are its
+groups but for `avg` and an `int8` `sum` (§52.15). An aggregate with a `FILTER` the count pushdown
+takes - `sum(amount) FILTER (WHERE device = 'ios')`, or a range on a sliced column - is answered
+over its filter's rows the same way (§52.14). Under a `GROUP BY`, any `FILTER` sends the groups up
+as partial rows, as over partitions, so there too `avg` and an `int8` `sum` are not answered from
+the slices (§52.15). A percentile and a join are not answered from the
+slices yet; `SELECT * FROM
 lion_index_slice_agg('events_amount', 'country = ''JP''')` answers the same aggregates for a filter
 given as text.
 

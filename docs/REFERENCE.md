@@ -1106,10 +1106,14 @@ working around a bad choice:
   aggregates over keys (`Aggregates Over Keys`, DESIGN.md §37) on price. On a partitioned table
   the one row is answered when every partition the planner keeps has a whole Lion index of its own
   slicing the column, each partition's answers added up in the node (DESIGN.md §52.13; EXPLAIN
-  names no index there). Not taken: a join, a partitioned table's `GROUP BY` or one partition
-  without such an index, a residual clause, `DISTINCT`, `FILTER` or `ORDER BY` in the aggregate, an
-  expression of the column, a filtered count beside a `GROUP BY`, three grouping columns, a float
-  column, and a hot standby, where the pushdown collects nothing. Off, these aggregates go to the
+  names no index there). An aggregate with a `FILTER` whose condition a filtered count could take
+  is answered over that filter's rows (`Aggregates From Slices: <index> (<column>, filter N:
+  ...)`, a range in it folded from the slices as `Range From Slices: ... (N slices, filter N)`;
+  DESIGN.md §52.14). A `GROUP BY` beside filters, or over a partitioned table, goes up as partial
+  rows below a Finalize Agg, so `avg` and an `int8` `sum` are not taken there (§52.15). Not taken:
+  a join, a partition without such an index, a residual clause, `DISTINCT` or `ORDER BY` in the
+  aggregate, a `FILTER` the posting sets do not answer, an expression of the column, three
+  grouping columns, a float column, and a hot standby, where the pushdown collects nothing. Off, these aggregates go to the
   aggregates over keys or to the ordinary plan.
 - `pg_lion.enable_slice_decode`: answer those aggregates of a `GROUP BY` of one column a batch of
   groups at a time (DESIGN.md §52, "The decode route"): one walk of the batch's groups and the

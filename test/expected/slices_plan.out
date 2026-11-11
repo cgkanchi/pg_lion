@@ -1011,14 +1011,15 @@ SELECT * FROM slp_groups('decoded');
 (14 rows)
 
 ROLLBACK;
--- declined: a filtered count beside a GROUP BY, three columns, a grouping
--- by an expression
+-- a filtered count beside a GROUP BY: its runs' groups go up as partial
+-- rows, which an int4 sum's value is the partial state of (section 8)
 SELECT slp_q('SELECT g, sum(b), count(*) FILTER (WHERE h = 1) FROM slp GROUP BY g');
         slp_q         
 ----------------------
- no pushdown, 10 rows
+ from slices, 10 rows
 (1 row)
 
+-- declined: three columns, a grouping by an expression
 SELECT slp_q('SELECT g, h, r, sum(b) FROM slp WHERE r < 5 GROUP BY g, h, r');
         slp_q        
 ---------------------
@@ -1077,7 +1078,141 @@ RESET enable_indexscan;
 RESET pg_lion.enable_count_pushdown;
 DROP INDEX slp_v2;
 DROP FUNCTION slp_cost(text);
--- ---------- 8. declined ----------
+-- ---------- 8. filtered aggregates (DESIGN.md §52, "Filtered aggregates") ----------
+-- An aggregate with a FILTER is answered over the rows of its filter's run,
+-- the one a filtered count with the same condition is counted in (§10):
+-- every type, the same column in several runs, beside filtered counts.
+SELECT slp_q('SELECT sum(b) FILTER (WHERE h = 1), sum(b) FILTER (WHERE h = 2), sum(b), count(*) FILTER (WHERE h = 1) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT * FROM slp_plan('SELECT sum(b) FILTER (WHERE h = 1), sum(b) FILTER (WHERE h = 2), sum(b), count(*) FILTER (WHERE h = 1) FROM slp WHERE g = 3');
+                                                                slp_plan                                                                
+----------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g = 3)
+   Count Filter 1: slp_h (h = 1)
+   Count Filter 2: slp_h (h = 2)
+   Aggregates From Slices: slp_v (b, filter 1: every bit counted), slp_v (b, filter 2: every bit counted), slp_v (b: every bit counted)
+(5 rows)
+
+SELECT slp_q('SELECT avg(a) FILTER (WHERE h = 2), min(c) FILTER (WHERE h = 1), max(d) FILTER (WHERE tags @> ''{3}''), sum(c) FILTER (WHERE tags @> ''{3}''), count(t) FILTER (WHERE h < 2), min(ts) FILTER (WHERE h < 2), max(tz) FILTER (WHERE h < 2) FROM slp WHERE r < 500');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- no WHERE; a filter that selects nothing, which answers 0 and NULLs
+SELECT slp_q('SELECT sum(c) FILTER (WHERE g = 2), avg(b) FILTER (WHERE g = 2) FROM slp');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b) FILTER (WHERE h = 9), max(ts) FILTER (WHERE h = 9), count(b) FILTER (WHERE h = 9), count(*) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- a range in a filter, collected from its entries, and on a sliced column
+-- from its slices (§53) - in a filter of its own, and beside the WHERE's
+SELECT slp_q('SELECT sum(b) FILTER (WHERE r < 100), max(b) FILTER (WHERE r >= 900) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT count(*) FILTER (WHERE b > 0), sum(a) FILTER (WHERE b BETWEEN -1000 AND 1000), count(*) FROM slp');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT * FROM slp_plan('SELECT count(*) FILTER (WHERE b > 0), sum(a) FILTER (WHERE b BETWEEN -1000 AND 1000), count(*) FROM slp WHERE c < 0');
+                                                            slp_plan                                                            
+--------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_v.c (c < 0)
+   Count Filter 1: slp_v.b (b > 0)
+   Count Filter 2: slp_v.b (b >= '-1000'::integer AND b <= 1000)
+   Range From Slices: c < 0 (64 slices), b > 0 (32 slices, filter 1), b >= '-1000'::integer AND b <= 1000 (32 slices, filter 2)
+   Aggregates From Slices: slp_v (a, filter 2: every bit counted)
+(6 rows)
+
+SELECT slp_q('SELECT count(*) FILTER (WHERE b > 0), sum(a) FILTER (WHERE b BETWEEN -1000 AND 1000), count(*) FROM slp WHERE c < 0');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- the HAVING's
+SELECT slp_q('SELECT sum(b) FILTER (WHERE h = 1) FROM slp WHERE g = 3 HAVING max(b) FILTER (WHERE h = 1) > 0');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- beside a GROUP BY, a run's groups go up as partial rows (§52, "Partial
+-- rows"): a count, an int2 or int4 sum, a minimum and a maximum, whose
+-- values are their partial states - of one column's groups and of two's
+SELECT slp_q('SELECT g, count(*), sum(b) FILTER (WHERE h = 1), max(tz) FILTER (WHERE h = 1), min(b), count(c) FILTER (WHERE r < 300) FROM slp GROUP BY g');
+        slp_q         
+----------------------
+ from slices, 10 rows
+(1 row)
+
+SELECT * FROM slp_plan('SELECT g, count(*), sum(b) FILTER (WHERE h = 1), max(tz) FILTER (WHERE h = 1), min(b) FROM slp GROUP BY g');
+                                                                                slp_plan                                                                                 
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: g
+   ->  Custom Scan (LionCount)
+         Lion Indexes: slp_g (g)
+         Count Filter 1: slp_h (h = 1)
+         Group Key: g
+         Aggregates From Slices: slp_v (b, filter 1: every bit counted), slp_v (tz, filter 1: existence counted, max descent), slp_v (b: existence counted, min descent)
+         Slice Groups: one at a time
+(8 rows)
+
+SELECT slp_q('SELECT g, sum(a) FILTER (WHERE h = 1), min(d) FILTER (WHERE h = 1) FROM slp WHERE r < 500 GROUP BY g HAVING sum(a) FILTER (WHERE h = 1) > 0');
+        slp_q        
+---------------------
+ from slices, 2 rows
+(1 row)
+
+SELECT slp_q('SELECT g, h, sum(b) FILTER (WHERE r < 10), max(c) FILTER (WHERE r < 10), count(*) FROM slp WHERE tags @> ''{3}'' GROUP BY g, h');
+        slp_q         
+----------------------
+ from slices, 20 rows
+(1 row)
+
+-- ... but not an average or an int8 sum, whose states are a count beside a
+-- sum: no path is made for them, so none comes up even with lion's price
+-- cut a thousandfold
+SET pg_lion.pushdown_margin = 1000;
+SELECT slp_q('SELECT g, avg(b) FILTER (WHERE h = 1) FROM slp GROUP BY g');
+        slp_q         
+----------------------
+ no pushdown, 10 rows
+(1 row)
+
+SELECT slp_q('SELECT g, sum(c) FILTER (WHERE h = 1) FROM slp GROUP BY g');
+        slp_q         
+----------------------
+ no pushdown, 10 rows
+(1 row)
+
+SELECT slp_q('SELECT g, avg(b), count(*) FILTER (WHERE h = 1) FROM slp GROUP BY g');
+        slp_q         
+----------------------
+ no pushdown, 10 rows
+(1 row)
+
+RESET pg_lion.pushdown_margin;
+-- ---------- 9. declined ----------
 -- a column that is not sliced, and a float column, which no slice takes
 SELECT slp_q('SELECT sum(r), max(r) FROM slp WHERE g = 3');
         slp_q        
@@ -1091,7 +1226,8 @@ SELECT slp_q('SELECT sum(f), max(f) FROM slp WHERE g = 3');
  no pushdown, 1 rows
 (1 row)
 
--- an aggregate of an expression of the column, DISTINCT, FILTER, ORDER BY
+-- an aggregate of an expression of the column, DISTINCT, ORDER BY, a
+-- FILTER no posting set answers
 SELECT slp_q('SELECT sum(b / 2) FROM slp WHERE g = 3');
         slp_q        
 ---------------------
@@ -1104,13 +1240,13 @@ SELECT slp_q('SELECT sum(DISTINCT b) FROM slp WHERE g = 3');
  counts only, 1 rows
 (1 row)
 
-SELECT slp_q('SELECT sum(b) FILTER (WHERE h = 1) FROM slp WHERE g = 3');
+SELECT slp_q('SELECT min(b ORDER BY b) FROM slp WHERE g = 3');
         slp_q        
 ---------------------
  no pushdown, 1 rows
 (1 row)
 
-SELECT slp_q('SELECT min(b ORDER BY b) FROM slp WHERE g = 3');
+SELECT slp_q('SELECT sum(b) FILTER (WHERE pad LIKE ''l%'') FROM slp WHERE g = 3');
         slp_q        
 ---------------------
  no pushdown, 1 rows
@@ -1134,7 +1270,8 @@ SELECT slp_q('SELECT sum(s.b), max(s.b) FROM slp s JOIN slp_dim d ON d.g = s.g W
 (1 row)
 
 -- a partitioned table: its one row is answered from every partition's
--- slices (slices_partitioned.sql), its GROUP BY is not
+-- slices, and its GROUP BY where the aggregates' values are their partial
+-- states (slices_partitioned.sql)
 CREATE TABLE slp_part (k int, v int4) PARTITION BY RANGE (k);
 CREATE TABLE slp_part1 PARTITION OF slp_part FOR VALUES FROM (0) TO (50);
 CREATE TABLE slp_part2 PARTITION OF slp_part FOR VALUES FROM (50) TO (100);
@@ -1151,7 +1288,7 @@ SELECT slp_q('SELECT sum(v), max(v) FROM slp_part WHERE k IN (7, 70)');
 SELECT slp_q('SELECT k, sum(v), max(v) FROM slp_part WHERE k IN (7, 70) GROUP BY k');
         slp_q        
 ---------------------
- no pushdown, 2 rows
+ from slices, 2 rows
 (1 row)
 
 SELECT slp_q('SELECT count(*) FROM slp_part WHERE k = 7');
