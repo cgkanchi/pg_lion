@@ -535,6 +535,39 @@ SELECT lca('SELECT r.z, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (S
  pushed down, 3 rows
 (1 row)
 
+-- groups nothing counts are counted too, not tested for a row: the anti join
+-- subtracts from each group's count, and the group of z = 99 still drops out
+SELECT lca('SELECT r.z FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.z');
+         lca         
+---------------------
+ pushed down, 3 rows
+(1 row)
+
+SELECT lca('SELECT DISTINCT r.g FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+           lca           
+-------------------------
+ not pushed down, 7 rows
+(1 row)
+
+SELECT lca('SELECT r.g, r.y FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.g, r.y');
+         lca          
+----------------------
+ pushed down, 56 rows
+(1 row)
+
+SELECT lca('SELECT r.z FROM lca_rows r WHERE r.z = 99 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.z');
+         lca         
+---------------------
+ pushed down, 0 rows
+(1 row)
+
+SELECT * FROM lca_explain('SELECT r.z FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.z') AS ln
+	WHERE ln ~ 'Join Type|Group Strategy';
+        ln         
+-------------------
+   Join Type: Anti
+(1 row)
+
 -- ---------- 4. the B-tree ----------
 -- none on the column: core's plan
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.y)');
@@ -2040,6 +2073,13 @@ SELECT * FROM lca_val('SELECT count(*), sum(n), min(n), max(n) FROM (SELECT r.g,
      lca_val      
 ------------------
  (3000,15000,5,5)
+(1 row)
+
+-- ... and with nothing counting the groups
+SELECT lca('SELECT r.g FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a < 9000) GROUP BY r.g');
+          lca           
+------------------------
+ pushed down, 3000 rows
 (1 row)
 
 -- ... with a WHERE, by two columns, by a column with NULLs and by a text

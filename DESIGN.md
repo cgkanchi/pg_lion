@@ -2286,7 +2286,8 @@ Planner integration
     is taken when it is a filtered count ("Filtered counts" at the end of this section).
     The target list holds those counts, the columns the rules below let it print, and any
     expression over them; window functions over them are computed above the node ("Shapes
-    rewritten to the node's counts" at the end of this section).
+    rewritten to the node's counts" at the end of this section). `count(*) OVER ()` over the
+    table's own rows is the node's count beside them ("A count of every row beside the rows").
   - **HAVING** is accepted when it is a filter the node can apply itself. By the time the hook runs,
     `havingQual` is an implicit-AND list of only those clauses that mention an aggregate (or are
     volatile, or contain a subquery): `subquery_planner()` has moved every other clause into WHERE,
@@ -3653,6 +3654,32 @@ Unique over a full index-only scan, priced as such, and the cost model decides. 
 DISTINCT c200` 128 ms to 4.6 ms (51 ms with a B-tree on c200); `c20, c200 ... GROUP BY 1, 2`
 127 ms to 15 ms (decoded walk).
 
+**Groups nothing counts.** In those queries nothing reads a group's count, only whether it is 0, so
+each group is §26's existence test in place of a count (`lion_count_path_tests()`, the plan's
+`LION_FLAG_EXISTS`): it stops at the first visible row of the group's intersection with the WHERE,
+a container or two where the count read all of them, and a group with no row reads what its count
+would have. It is a count compared with zero, read the same way, so §26's argument for §9 and §11
+covers it unchanged. It applies to a GROUP BY or DISTINCT with no aggregate in its target or HAVING
+that the node walks a group or a pair at a time - one column, two (§20), an IN list on the group
+column (§15), a GROUP BY folded to one group, `coalesce(col, c)` - and not to the decoded walk
+(§34), which counts every combination in one pass, the top k, which ranks by the counts, the
+cells, the sums over slices and the aggregates over entries, or a GROUP BY beside the anti join over
+a small inner side (§27), which subtracts the rows it drops from each group's count: from a test's
+one row that would lose a group that still has rows. As for a count(DISTINCT) of existence
+tests, the WHERE is not collected ("The WHERE sets, collected once"): a test reads a share of each
+intersection, and a collection could read more than every test together. The price is §26's for
+the same tests (`LION_DISTINCT_EXISTS`). The same plan with counts is priced beside it - it may
+collect the WHERE and count the groups of a walk together (below), or divide them among the
+participants of a Gather ("A GROUP BY in parallel") - and add_path() keeps the cheaper. EXPLAIN
+prints `Group Strategy: First Visible Row`, and EXPLAIN ANALYZE `Groups Tested`.
+`test/sql/countshapes.sql` checks the shapes against a sequential scan, with a key whose every row
+is deleted or updated away and never vacuumed, and `test/sql/countanti.sql` the anti join's groups
+counted. 2M rows, vacuumed, PostgreSQL 18 (release build), against the same plan counting:
+`SELECT DISTINCT country ... WHERE status = 'paid'` (50 keys) 8.3 ms to 0.23 ms, 150 containers
+visited (core: 113 ms); `country, kind ... GROUP BY 1, 2` with the same WHERE (1,000 pairs) 24 ms
+to 8.1 ms (core: 113 ms); `DISTINCT kind` under an IN list of three countries 5.7 ms to 0.7 ms
+(core: 69 ms).
+
 ### Other spellings of answered clauses (2026-11-10)
 
 Three clauses that test what the posting sets already answer, written another way, used to leave
@@ -3907,6 +3934,60 @@ the Finalize Agg under the node checks the equality of every column it groups by
 100k rows, `g200, count(DISTINCT k50) ... GROUP BY g200`, which §26's walk loses to core: 19 ms
 to 2.2 ms. `test/sql/countgsets.sql` compares each shape with the sequential plan over the same
 table, with and without `enable_presorted_aggregate`, and checks the declines.
+
+### A count of every row beside the rows (2026-11-10)
+
+`SELECT id, ts, count(*) OVER () FROM t WHERE ... ORDER BY ts DESC LIMIT 20`: a page of rows with
+the total beside each (`lion_window.c`). A count over a window with no PARTITION BY and no ORDER BY,
+whose frame holds every row, is one number for every row: the rows the FROM and WHERE select.
+Core's WindowAgg reads every one of them into its tuplestore before it returns the first, so the
+LIMIT above it stops nothing below it.
+
+**The plan.** At UPPERREL_WINDOW over one base relation, `lion_try_window_count_path()` checks that
+every window function of the windows' target is `count(*)`, or `count(c)` of a constant that is not
+NULL, with no FILTER and no run condition, over such a window: no PARTITION BY, no ORDER BY, no
+EXCLUDE, and a frame that holds the partition - ROWS from UNBOUNDED PRECEDING to UNBOUNDED
+FOLLOWING, or any RANGE frame, every row being a peer of every other without an ORDER BY. It counts
+the relation under its WHERE into a rel of its own, as the grouping sets do (the query is made
+`SELECT count(*) FROM t WHERE ...` while it plans, and its paths are priced in the units pinned for
+the window rel, §39), and puts the LionWindowCount node over each of the relation's paths, as core
+puts a WindowAgg over each. The node has two children: the count, run once before the first row,
+and the rows, handed up in their order with the count beside each. Its startup cost is the count's
+total plus the rows' startup, so under a LIMIT it is priced as what it reads - the count and the
+rows the LIMIT takes - against the WindowAgg's every row. PostgreSQL 17 prices that WindowAgg's
+first row after every row it reads (`get_windowclause_startup_tuples()`); 16 prices it as its
+input's first row, so under a LIMIT the WindowAgg would look as if it read a few rows and the node
+would never win. On 16, when the node is offered, core's WindowAgg paths for these windows are
+priced as 17 prices them (`lion_window_price_first_row()`).
+
+**Exact.** The count is the number of rows the second child returns: both are the same relation
+and clauses, read under the statement's snapshot, and the count is exact wherever a count is (§9,
+§11). A volatile clause, which could select other rows the second time, declines, and a relation
+the count declines (row-level security, §9) is left to the WindowAgg.
+
+**What it declines.** The window functions become a count(*) Aggref in the node's target, which
+`custom_scan_tlist` names last and setrefs.c matches; EXPLAIN prints them as `count(*)`, since no
+WindowAgg is left to name their window. The nodes above a window stage read its columns by position
+(a Sort, a Limit), so the query's target must reach them as the node returns it: a target finished
+by a projection above the windows (an expensive expression postponed past the LIMIT), a DISTINCT,
+or an ORDER BY of a window function, which look for the window function by its expression, decline.
+So do a window over groups, which has a grouped rel below it, a join, set-returning functions and
+row marks.
+
+**Execution.** EXECUTE on each window function is asked at startup as ExecInitWindowAgg() asks it,
+with its message (`lion_check_window_execute()`); the count asks it of count(*). A rescan in which no
+parameter of the count changed keeps the count and reads the rows again; a changed one counts again.
+The node reads forward only, so a scrollable cursor's plan has a Material above it.
+
+`pg_lion.enable_window_count` turns it off, as `enable_count_pushdown` does. `test/sql/windowcount.sql`
+compares each shape with the WindowAgg's answer over NULLs and dead and updated rows: the frames
+taken and declined, `count(1)` and a named window, an expression over the count, OFFSET, no WHERE,
+an empty result, a residual clause, a generic plan, the rescans, a scrollable cursor, a partitioned
+table and the EXECUTE check. 2M rows, vacuumed, PostgreSQL 18 (release build), against the
+WindowAgg: `... WHERE status = 'paid' AND country = 'c7' ORDER BY ts DESC LIMIT 20` (8,000 rows) 40
+ms to 1.2 ms; with `status = 'paid'` alone (400,000 rows) 249 ms to 0.3 ms; no WHERE 455 ms to 0.7
+ms; OFFSET 200 under two filters 70 ms to 3.9 ms. Without a LIMIT both read every row (42 ms and
+39 ms).
 
 ### Filtered counts
 

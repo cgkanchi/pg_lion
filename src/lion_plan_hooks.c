@@ -135,6 +135,40 @@ lion_try_small_anti(PlannerInfo *root, RelOptInfo *joinrel,
 	PG_END_TRY();
 }
 
+/*
+ * count(*) OVER () beside the rows of one base relation (DESIGN.md §10, "A
+ * count of every row beside the rows"), its count priced against the
+ * window's cheapest core path and with the ends the directory holds, as a
+ * GROUP BY's is below.
+ */
+static void
+lion_try_window_upper(PlannerInfo *root, RelOptInfo *input_rel,
+					  RelOptInfo *window_rel)
+{
+	if (!lion_enable_count_pushdown || !lion_enable_window_count ||
+		input_rel->reloptkind != RELOPT_BASEREL ||
+		lion_old_snapshot_threshold_active())
+		return;
+
+	lion_units_pin(root, window_rel);
+	if (!lion_probe_begin(root, input_rel, input_rel->baserestrictinfo))
+	{
+		lion_try_window_count_path(root, input_rel, window_rel);
+		lion_units_unpin();
+		return;
+	}
+	PG_TRY();
+	{
+		lion_try_window_count_path(root, input_rel, window_rel);
+	}
+	PG_FINALLY();
+	{
+		lion_probe_end();
+	}
+	PG_END_TRY();
+	lion_units_unpin();
+}
+
 void
 lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 					   RelOptInfo *input_rel, RelOptInfo *output_rel,
@@ -146,6 +180,12 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 
 	/* a competitor pinned by a hook an error left (§39) is never read */
 	lion_units_unpin();
+
+	if (stage == UPPERREL_WINDOW)
+	{
+		lion_try_window_upper(root, input_rel, output_rel);
+		return;
+	}
 
 	if (stage != UPPERREL_GROUP_AGG && stage != UPPERREL_DISTINCT)
 		return;
@@ -501,6 +541,8 @@ lion_count_scan_register(void)
 		RegisterCustomScanMethods(&lion_semijoin_scan_methods);
 	if (GetCustomScanMethods("LionAntiJoin", true) == NULL)
 		RegisterCustomScanMethods(&lion_antijoin_scan_methods);
+	if (GetCustomScanMethods("LionWindowCount", true) == NULL)
+		RegisterCustomScanMethods(&lion_window_count_scan_methods);
 }
 
 /*

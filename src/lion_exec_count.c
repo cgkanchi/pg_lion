@@ -431,7 +431,17 @@ lion_count_relation(LionCountScanState *st)
 	if (st->filter != NULL && !lion_where_has_positive(st))
 		count = lion_count_scan_filtered(st);
 	else
-		count = lion_node_count(st, st->nitem, &st->sources[1], false);
+	{
+		/*
+		 * A GROUP BY folded to one group that nothing counts
+		 * (LION_FLAG_EXISTS) asks only whether the group has a row.
+		 */
+		bool		exists = lion_plan_flag(st, LION_FLAG_EXISTS);
+
+		if (exists)
+			st->grouptests++;
+		count = lion_node_count(st, st->nitem, &st->sources[1], exists);
+	}
 	MemoryContextSwitchTo(oldcxt);
 
 	return count;
@@ -1744,10 +1754,21 @@ lion_group_count(LionCountScanState *st, int nsource, LionCountSource *sources,
 {
 	int			n = 0;
 	int			k;
+	bool		exists = lion_plan_flag(st, LION_FLAG_EXISTS);
 
-	if (!st->wtried && !st->wknown)
+	/*
+	 * Groups nothing counts (LION_FLAG_EXISTS; DESIGN.md §10, "Groups nothing
+	 * counts"): a group exists when one of its rows is visible, and its test
+	 * stops at the first (lion_exists_sources_cached()), as a count(DISTINCT
+	 * k)'s does (§26).  The WHERE is not collected for them: a test reads a
+	 * container or two of the items where they hold a row, and what it
+	 * reads is no guide to what collecting would save.
+	 */
+	if (exists)
+		st->grouptests++;
+	else if (!st->wtried && !st->wknown)
 		lion_where_describe(st, sources, nwhere);
-	if (!st->wtried)
+	if (!exists && !st->wtried)
 	{
 		double		own = Min(Min((double) ownrows, st->wckeys), st->wreach);
 
@@ -1761,7 +1782,7 @@ lion_group_count(LionCountScanState *st, int nsource, LionCountSource *sources,
 	st->wcounts++;
 
 	if (!st->wcollected)
-		return lion_node_count(st, nsource, sources, false);
+		return lion_node_count(st, nsource, sources, exists);
 
 	/* the group, the collected set, what it does not hold, a second group */
 	st->wsources[n++] = sources[0];
@@ -1778,7 +1799,7 @@ lion_group_count(LionCountScanState *st, int nsource, LionCountSource *sources,
 		st->wsources[n++] = sources[k];
 	Assert(n <= st->nsource + 1);
 
-	return lion_node_count(st, n, st->wsources, false);
+	return lion_node_count(st, n, st->wsources, exists);
 }
 
 /*

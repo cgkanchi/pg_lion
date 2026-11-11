@@ -1266,6 +1266,14 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 		pfree(buf.data);
 	}
 
+	/*
+	 * Groups nothing counts, each a test for a visible row (DESIGN.md §10,
+	 * "Groups nothing counts").
+	 */
+	if (lion_plan_flag(st, LION_FLAG_EXISTS) && st->decode == NULL &&
+		st->cells == NULL)
+		ExplainPropertyText("Group Strategy", "First Visible Row", es);
+
 	/* The column count(DISTINCT) counts (DESIGN.md §26). */
 	if (st->plan.distattno != 0)
 		ExplainPropertyText("Distinct Key",
@@ -1622,6 +1630,13 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 		ExplainPropertyInteger("Groups Counted in Batches", NULL,
 							   st->groupsbatched + w->groupsbatched, es);
 	}
+
+	/*
+	 * The groups tested for a visible row in place of their counts
+	 * (LION_FLAG_EXISTS; DESIGN.md §10, "Groups nothing counts").
+	 */
+	if (lion_plan_flag(st, LION_FLAG_EXISTS))
+		ExplainPropertyInteger("Groups Tested", NULL, st->grouptests, es);
 
 	/*
 	 * The decoded walk's passes (DESIGN.md §34): the container keys it

@@ -908,6 +908,17 @@ working around a bad choice:
   can be NULL (a NOT NULL column, or a filter that rules NULL out): 19 plans that one as the same
   anti join as `NOT EXISTS`, and it is counted as that is. Off, the pushdown does not count an anti
   join this way.
+- `pg_lion.enable_window_count`: answer `count(*) OVER ()` beside the rows of one table - `SELECT
+  *, count(*) OVER () FROM t WHERE ... ORDER BY ts DESC LIMIT 20`, a page with its total - with the
+  `LionWindowCount` node (DESIGN.md §10, "A count of every row beside the rows"): the pushdown's
+  count of the table under the same `WHERE`, made once before the first row, beside the rows of
+  any plan of the table, in its order, so that a `LIMIT` above stops it where PostgreSQL's
+  `WindowAgg` reads every row first. Every window function must be `count(*)` or `count(1)` with
+  no `FILTER`, over a window with no `PARTITION BY` or `ORDER BY` whose frame holds every row; not
+  under a `GROUP BY`, a join, `DISTINCT` or a set-returning function, nor with a volatile `WHERE`
+  clause or an `ORDER BY` of the window function. EXPLAIN shows the count as the node's first
+  child and prints the window function as `count(*)`. `pg_lion.enable_count_pushdown = off` turns
+  it off too.
 - `pg_lion.enable_probe_join`: group a join of a table to a dimension by the dimension's primary
   key with `LionProbeJoin` (DESIGN.md §46) - `SELECT CASE WHEN d.region IN ('north', 'east') THEN
   'ne' ELSE 'other' END, f.channel, count(*) FROM fact f JOIN dim d ON f.dim_id = d.id WHERE

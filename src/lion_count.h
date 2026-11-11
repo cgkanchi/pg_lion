@@ -2025,11 +2025,13 @@ extern Oid	lion_get_am_oid(void);
 /*
  * EXECUTE on a function, or on an aggregate and its support functions, that
  * the query a count stands for would call - the checks ExecInitFunc() and
- * ExecInitAgg() make, with the same errors and the object-access hook.  Made
- * when the count starts, never at plan time (DESIGN.md §9, "Privileges").
+ * ExecInitAgg() (or ExecInitWindowAgg()) make, with the same errors and the
+ * object-access hook.  Made when the count starts, never at plan time
+ * (DESIGN.md §9, "Privileges").
  */
 extern void lion_check_execute(Oid funcid);
 extern void lion_check_aggregate_execute(Oid aggfnoid);
+extern void lion_check_window_execute(Oid winfnoid);
 
 /* ---------------------------------------------------------------------
  * the LionCount custom scan, lion_plan_*.c and lion_exec_*.c (DESIGN.md
@@ -2119,6 +2121,7 @@ extern PGDLLIMPORT set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook;
  * small inner side"): pg_lion.enable_count_anti.
  */
 extern PGDLLIMPORT bool lion_enable_count_anti;
+extern PGDLLIMPORT bool lion_enable_window_count;
 
 /*
  * Whether a GROUP BY over a join of a table to a dimension by its primary key
