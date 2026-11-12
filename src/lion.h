@@ -3119,6 +3119,9 @@ extern BlockNumber lion_postree_create(Relation index, Relation heaprel,
 									   uint32 hash);
 extern bool lion_postree_put(Relation index, Relation heaprel, uint32 hash,
 							 BlockNumber root, const LionPosMember *m);
+extern void lion_postree_put_rows(Relation index, Relation heaprel,
+								  uint32 hash, BlockNumber root,
+								  LionPosMember *const *ms, int n);
 extern bool lion_postree_fetch(Relation index, uint32 hash, BlockNumber root,
 							   uint64 code, LionPosMember *m);
 

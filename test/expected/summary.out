@@ -17,6 +17,11 @@ RESET client_min_messages;
 -- VACUUM can only set all-visible once the commit record is on disk
 SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
+-- a row at a time, as on PostgreSQL 16, so that the buckets inserts make -
+-- and the summaries a count sums - are the same on every version; a
+-- statement's batch, which puts its rows in in key order, is
+-- insert_batch.sql's
+SET pg_lion.batch_inserts = off;
 /*
  * lion_sm() runs q with the pushdown on and every other scan disabled, and
  * again as a sequential scan with the pushdown off, and compares the answers.

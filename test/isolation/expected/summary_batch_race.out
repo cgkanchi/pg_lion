@@ -1,0 +1,37 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_attach s1_insert s2_insert s3_vacuum s3_counts s2_release s3_counts s3_verify
+step s1_attach: SELECT injection_points_attach('lion-insert-batch-summary', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_insert: INSERT INTO sbr SELECT 10000 + i, 4000 FROM generate_series(1, 2000) i; <waiting ...>
+step s2_insert: INSERT INTO sbr SELECT 20000 + i, 4000 + i FROM generate_series(1, 300) i;
+step s3_vacuum: VACUUM sbr;
+step s3_counts: SELECT sbr_counts(1, 4000) AS low, sbr_counts(3900, 5000) AS top;
+low       |top      
+----------+---------
+3600 agree|401 agree
+(1 row)
+
+step s2_release: SELECT sbr_release('lion-insert-batch-summary');
+sbr_release
+-----------
+           
+(1 row)
+
+step s1_insert: <... completed>
+step s3_counts: SELECT sbr_counts(1, 4000) AS low, sbr_counts(3900, 5000) AS top;
+low       |top       
+----------+----------
+5600 agree|2401 agree
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('sbr_t', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+

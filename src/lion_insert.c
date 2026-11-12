@@ -659,6 +659,26 @@ lion_insert_place_new(Relation index, Relation heaprel, LionState *state,
 }
 
 /*
+ * A new INLINE entry for the key of the batch row `row` (lion_insert_apply()),
+ * with the payload given: a key's entry, a reserved one, or a bit slice.
+ */
+static LionEntryTuple *
+lion_insert_row_entry(LionState *state, const LionInsertRow *row,
+					  const char *payload, Size paylen, Size *size)
+{
+	if (row->flag == LION_ENTRY_SLICE)
+		return lion_make_slice_entry((AttrNumber) state->attno,
+									 (int) DatumGetInt32(row->key),
+									 LION_ENTRY_INLINE, payload, paylen, size);
+	if (row->flag != 0)
+		return lion_make_reserved_entry((AttrNumber) state->attno, row->flag,
+										LION_ENTRY_INLINE, payload, paylen,
+										size);
+	return lion_make_entry(state, row->key, LION_ENTRY_INLINE, payload, paylen,
+						   size);
+}
+
+/*
  * lion_insert_new_entry() for the rows rows[0 .. n) of one key of a batch
  * (lion_insert_apply()), n at least one: the new INLINE entry takes as many
  * of them as its payload holds under the limit, all in its one record.
@@ -682,11 +702,7 @@ lion_insert_new_entry_rows(Relation index, Relation heaprel, LionState *state,
 
 	paylen = lion_put_singleton(first, lion_code_ckey(rows[0].code),
 								lion_code_lo(rows[0].code));
-	entry = (rows[0].flag != 0) ?
-		lion_make_reserved_entry((AttrNumber) state->attno, rows[0].flag,
-								 LION_ENTRY_INLINE, first, paylen, &size) :
-		lion_make_entry(state, rows[0].key, LION_ENTRY_INLINE, first, paylen,
-						&size);
+	entry = lion_insert_row_entry(state, &rows[0], first, paylen, &size);
 
 	limit = lion_inline_max(LionEntryPayloadOffset(entry),
 							(Size) state->ix->meta.inline_limit);
@@ -721,12 +737,7 @@ lion_insert_new_entry_rows(Relation index, Relation heaprel, LionState *state,
 			LionEntryTuple *exact;
 			Size		payoff;
 
-			exact = (rows[0].flag != 0) ?
-				lion_make_reserved_entry((AttrNumber) state->attno,
-										 rows[0].flag, LION_ENTRY_INLINE, cur,
-										 paylen, &size) :
-				lion_make_entry(state, rows[0].key, LION_ENTRY_INLINE, cur,
-								paylen, &size);
+			exact = lion_insert_row_entry(state, &rows[0], cur, paylen, &size);
 			pfree(entry);
 			entry = exact;
 
@@ -764,6 +775,71 @@ lion_insert_new_entry_rows(Relation index, Relation heaprel, LionState *state,
 }
 
 /*
+ * The INLINE entry with positions `entry` (itemsz bytes on page, a payload
+ * area of paylen bytes) rewritten around newpay (newlen bytes, ndelta more
+ * items) and the inline chunk `chunk` (poslen bytes), counting nadded more
+ * TIDs - the two fit under the limit together, which the caller checked - in
+ * one record (DESIGN.md §17, W1).
+ */
+static void
+lion_inline_pos_place(Relation index, Relation heaprel, LionState *state,
+					  Buffer entrybuf, OffsetNumber entryoff,
+					  LionEntryTuple *entry, Size itemsz, Size paylen,
+					  const char *newpay, Size newlen, int ndelta, uint64 nadded,
+					  const LionContainer *chunk, Size poslen)
+{
+	Page		page = BufferGetPage(entrybuf);
+	Size		payoff = LionEntryPayloadOffset(entry);
+	Size		limit = lion_inline_max(payoff,
+										(Size) state->ix->meta.inline_limit);
+	uint32		ncontainers = lion_entry_ncontainers(entry);
+	uint64		ntids = lion_entry_ntids(entry);
+	LionEntryTuple *newentry;
+	Size		newsize;
+	Size		payarea = paylen;	/* the payload area the entry has */
+
+	/*
+	 * Growth slack, as lion_insert_inline() gives it, for the payload area:
+	 * keep the area the entry has while the payload fits it, and grow it with
+	 * fresh slack - never past what leaves the positions room under the
+	 * limit - when it does not.
+	 */
+	if (newlen > payarea)
+	{
+		Size		room = limit - poslen;
+		Size		maxsize = MAXALIGN_DOWN(MAXALIGN(itemsz) +
+											PageGetExactFreeSpace(page));
+		Size		alloc;
+
+		maxsize = (maxsize > MAXALIGN(poslen)) ? maxsize - MAXALIGN(poslen) : 0;
+		alloc = lion_entry_alloc_size(payoff, newlen,
+									  Min((Size) state->ix->meta.inline_limit, room),
+									  Max(maxsize, payoff + newlen));
+		payarea = alloc - payoff;
+	}
+
+	/*
+	 * The caller's test is the payload's length; the entry is built at its
+	 * AREA, slack included.  An area the payload still fits, kept from the
+	 * last rewrite, plus positions that grew since can be past the limit -
+	 * next to a long key that limit is LION_MAX_ENTRY_SIZE, and the rebuild
+	 * then refuses the entry instead of anything spilling, for this row and
+	 * for every later one of the key.  The slack goes first: the payload at
+	 * its own length fits, which is what the caller checked.
+	 */
+	if ((MAXALIGN(payoff + payarea) - payoff) + poslen > limit)
+		payarea = newlen;
+
+	newentry = lion_entry_rebuild_pos(entry, newpay, newlen, payarea,
+									  (const char *) chunk, poslen, &newsize);
+	lion_entry_set_ncontainers(newentry, (uint32) ((int) ncontainers + ndelta));
+	lion_entry_set_ntids(newentry, ntids + nadded);
+	lion_dir_place(index, heaprel, state->ix, entrybuf, entryoff, true,
+				   newentry, newsize);
+	pfree(newentry);
+}
+
+/*
  * lion_insert_inline() for an entry that stores positions: newpay is its
  * payload with the row added (newlen bytes, ndelta more items), and pm is the
  * row's positions, which go into the entry's inline chunk.  Both land in one
@@ -780,13 +856,10 @@ lion_insert_inline_pos(Relation index, Relation heaprel, LionState *state,
 					   const char *newpay, Size newlen, int ndelta,
 					   const LionPosMember *pm)
 {
-	Page		page = BufferGetPage(entrybuf);
 	BlockNumber blk = BufferGetBlockNumber(entrybuf);
 	Size		payoff = LionEntryPayloadOffset(entry);
 	Size		limit = lion_inline_max(payoff,
 										(Size) state->ix->meta.inline_limit);
-	uint32		ncontainers = lion_entry_ncontainers(entry);
-	uint64		ntids = lion_entry_ntids(entry);
 	LionContainer *oldchunk = (LionContainer *) palloc0(LION_CONTAINER_MAX_SIZE);
 	LionContainer *chunk = (LionContainer *) palloc0(LION_CONTAINER_MAX_SIZE);
 	bool		hadchunk;
@@ -808,53 +881,9 @@ lion_insert_inline_pos(Relation index, Relation heaprel, LionState *state,
 	}
 
 	if (fits)
-	{
-		LionEntryTuple *newentry;
-		Size		newsize;
-		Size		payarea = paylen;	/* the payload area the entry has */
-
-		/*
-		 * Growth slack, as lion_insert_inline() gives it, for the payload
-		 * area: keep the area the entry has while the payload fits it, and
-		 * grow it with fresh slack - never past what leaves the positions
-		 * room under the limit - when it does not.
-		 */
-		if (newlen > payarea)
-		{
-			Size		room = limit - poslen;
-			Size		maxsize = MAXALIGN_DOWN(MAXALIGN(itemsz) +
-												PageGetExactFreeSpace(page));
-			Size		alloc;
-
-			maxsize = (maxsize > MAXALIGN(poslen)) ? maxsize - MAXALIGN(poslen) : 0;
-			alloc = lion_entry_alloc_size(payoff, newlen,
-										  Min((Size) state->ix->meta.inline_limit, room),
-										  Max(maxsize, payoff + newlen));
-			payarea = alloc - payoff;
-		}
-
-		/*
-		 * The test above is the payload's length; the entry is built at its
-		 * AREA, slack included.  An area the payload still fits, kept from
-		 * the last rewrite, plus positions that grew since can be past the
-		 * limit - next to a long key that limit is LION_MAX_ENTRY_SIZE, and
-		 * the rebuild then refuses the entry instead of anything spilling,
-		 * for this row and for every later one of the key.  The slack goes
-		 * first: the payload at its own length fits, which is what `fits`
-		 * says.
-		 */
-		if ((MAXALIGN(payoff + payarea) - payoff) + poslen > limit)
-			payarea = newlen;
-
-		newentry = lion_entry_rebuild_pos(entry, newpay, newlen, payarea,
-										  (const char *) chunk, poslen,
-										  &newsize);
-		lion_entry_set_ncontainers(newentry, (uint32) ((int) ncontainers + ndelta));
-		lion_entry_set_ntids(newentry, ntids + 1);
-		lion_dir_place(index, heaprel, state->ix, entrybuf, entryoff, true,
-					  newentry, newsize);
-		pfree(newentry);
-	}
+		lion_inline_pos_place(index, heaprel, state, entrybuf, entryoff, entry,
+							  itemsz, paylen, newpay, newlen, ndelta, 1, chunk,
+							  poslen);
 	else
 	{
 		LionEntryTuple *chain;
@@ -1821,6 +1850,69 @@ one:
 	return 1;
 }
 
+/*
+ * The row of a batch `row` of a column that stores positions, as the member
+ * lion_insert_one() would put in for it (m holds LION_POS_MAX_NPOS).
+ */
+static void
+lion_insert_row_member(const LionState *state, const LionInsertRow *row,
+					   LionPosMember *m)
+{
+	const LionDeferPos *dp = lion_defer_row_pos(state, row);
+
+	m->code = row->code;
+	m->npos = dp->npos;
+	m->dl = dp->dl;
+	memcpy(m->pos, dp->pos, sizeof(uint16) * dp->npos);
+}
+
+/*
+ * The rows rows[0 .. n) of one key of a column that stores positions
+ * (DESIGN.md §17) into its CHAIN entry at (entrybuf, entryoff), held
+ * EXCLUSIVE, as lion_insert_chain() puts in one: their positions first, into
+ * the entry's position tree - a run appended to the tree's last chunk in one
+ * rewrite of it (lion_postree_put_rows()) - so that a reader that finds a TID
+ * in the posting set finds its positions too; then the TIDs, a container's
+ * in one record (lion_insert_chain_rows()).
+ */
+static void
+lion_insert_chain_pos_rows(Relation index, Relation heaprel, LionState *state,
+						   Buffer entrybuf, OffsetNumber entryoff,
+						   const LionInsertRow *rows, int n)
+{
+	Page		page = BufferGetPage(entrybuf);
+	LionEntryTuple *entry;
+	const LionEntryPosExt *x;
+	LionPosMember **ms;
+	int			i;
+
+	entry = lion_page_entry_fetch(index, page, BufferGetBlockNumber(entrybuf),
+								  entryoff);
+	x = lion_entry_posext(entry);
+	if (x == NULL || !BlockNumberIsValid(x->pos_root))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": chain entry %u on block %u stores no position tree",
+						RelationGetRelationName(index), entryoff,
+						BufferGetBlockNumber(entrybuf))));
+
+	ms = (LionPosMember **) palloc(sizeof(LionPosMember *) * n);
+	for (i = 0; i < n; i++)
+	{
+		ms[i] = (LionPosMember *) palloc(sizeof(LionPosMember));
+		lion_insert_row_member(state, &rows[i], ms[i]);
+	}
+	lion_postree_put_rows(index, heaprel, lion_entry_owner(entry),
+						  x->pos_root, ms, n);
+	for (i = 0; i < n; i++)
+		pfree(ms[i]);
+	pfree(ms);
+
+	for (i = 0; i < n;)
+		i += lion_insert_chain_rows(index, heaprel, entrybuf, entryoff,
+									&rows[i], n - i);
+}
+
 /* ---------------------------------------------------------------------
  * Summary posting sets (DESIGN.md §32)
  * --------------------------------------------------------------------- */
@@ -2321,6 +2413,108 @@ lion_insert_inline_rows(Relation index, Relation heaprel, LionState *state,
 				   newentry, newsize);
 	pfree(newentry);
 	return taken;
+}
+
+/*
+ * lion_insert_inline_rows() for an INLINE entry that stores positions
+ * (DESIGN.md §17): the rows rows[0 .. n) of one key, as many as the payload
+ * and the inline chunk hold together under the limit, in one rewrite of the
+ * entry and one record.  The chunk is read and checked once, and a run of
+ * rows above its last member is appended to it with the place its members
+ * end kept (lion_poschunk_append_tail()) rather than merged in row by row;
+ * a row below goes in by lion_poschunk_insert().  pm is a member to build
+ * each row's in.  Returns how many it took, or 0, having written nothing,
+ * when the first row does not fit - it spills, which lion_insert_inline()
+ * does.
+ */
+static int
+lion_insert_inline_pos_rows(Relation index, Relation heaprel, LionState *state,
+							Buffer entrybuf, OffsetNumber entryoff,
+							const LionInsertRow *rows, int n,
+							LionPosMember *pm)
+{
+	Page		page = BufferGetPage(entrybuf);
+	BlockNumber blk = BufferGetBlockNumber(entrybuf);
+	LionEntryTuple *entry = lion_page_entry_fetch(index, page, blk, entryoff);
+	Size		itemsz = ItemIdGetLength(PageGetItemId(page, entryoff));
+	Size		payoff = LionEntryPayloadOffset(entry);
+	Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemsz);
+	Size		area = paylen;	/* the payload area the entry has */
+	Size		limit = lion_inline_max(payoff,
+										(Size) state->ix->meta.inline_limit);
+	Size		bufsz = Max(paylen, limit) + LION_CONTAINER_MAX_SIZE;
+	LionContainer *chunk = (LionContainer *) palloc0(LION_CONTAINER_MAX_SIZE);
+	LionContainer *nextchunk = (LionContainer *) palloc0(LION_CONTAINER_MAX_SIZE);
+	LionPosTail tail;
+	char	   *cur;
+	char	   *next;
+	Size		poslen;
+	int			ndelta = 0;
+	int			taken;
+	int			added = 0;
+
+	if (!lion_entry_inline_poschunk(index, entry, itemsz, blk, entryoff, chunk))
+		lion_poschunk_init(chunk, lion_pos_block(rows[0].code));
+	poslen = lion_poschunk_size(chunk);
+	tail.valid = false;
+
+	cur = (char *) palloc(bufsz);
+	next = (char *) palloc(bufsz);
+	memcpy(cur, LionEntryGetPayload(entry), paylen);
+	for (taken = 0; taken < n; taken++)
+	{
+		LionPosTail ntail = tail;
+		int			nd;
+		Size		len;
+		Size		nposlen;
+		bool		ok;
+		void	   *swap;
+
+		len = lion_inline_add(index, blk, entryoff, cur, paylen,
+							  lion_code_ckey(rows[taken].code),
+							  lion_code_lo(rows[taken].code), next, &nd);
+		if (len == 0)
+			continue;			/* already indexed, positions and all */
+
+		lion_insert_row_member(state, &rows[taken], pm);
+		memcpy(nextchunk, chunk, poslen);
+		ok = lion_poschunk_append_tail(nextchunk, LION_CONTAINER_MAX_SIZE, pm,
+									   &ntail);
+		if (!ok)
+		{
+			/* below the last member, or no room: merged in, as for one row */
+			ok = lion_poschunk_insert(nextchunk, LION_CONTAINER_MAX_SIZE, pm,
+									  NULL);
+			ntail.valid = false;
+		}
+		if (!ok)
+			break;
+		nposlen = lion_poschunk_size(nextchunk);
+		if ((MAXALIGN(payoff + len) - payoff) + nposlen > limit)
+			break;
+
+		swap = cur;
+		cur = next;
+		next = swap;
+		swap = chunk;
+		chunk = nextchunk;
+		nextchunk = swap;
+		paylen = len;
+		poslen = nposlen;
+		tail = ntail;
+		ndelta += nd;
+		added++;
+	}
+	pfree(next);
+	pfree(nextchunk);
+
+	if (added > 0)
+		lion_inline_pos_place(index, heaprel, state, entrybuf, entryoff, entry,
+							  itemsz, area, cur, paylen, ndelta, (uint64) added,
+							  chunk, poslen);
+	pfree(cur);
+	pfree(chunk);
+	return taken;				/* the rows written, and any the set held */
 }
 
 /* ---------------------------------------------------------------------
@@ -2941,6 +3135,41 @@ lion_slice_batch_write(Relation index, Buffer leafbuf, LionSliceBatch *b)
 }
 
 /*
+ * The slices a sliced column's row with value key goes into, in ascending
+ * position: the bits its encoding has set (DESIGN.md §51), then the existence
+ * slice.  Returns how many, LION_SLICE_MAX_POS at most.
+ */
+static int
+lion_slice_positions(LionState *state, Datum key, int *pos)
+{
+	int			nbits = state->slicebits;
+	int			npos = 0;
+	int64		v;
+	uint64		enc;
+
+	switch (nbits)
+	{
+		case 16:
+			v = DatumGetInt16(key);
+			break;
+		case 32:
+			v = DatumGetInt32(key);
+			break;
+		default:
+			v = DatumGetInt64(key);
+			break;
+	}
+	enc = lion_slice_encode(v, nbits);
+	while (enc != 0)
+	{
+		pos[npos++] = pg_rightmost_one_pos64(enc);
+		enc &= enc - 1;
+	}
+	pos[npos++] = LION_SLICE_EXISTS;
+	return npos;
+}
+
+/*
  * A row of a sliced column: into the slice of every bit its value's encoding
  * has set, in ascending position, and then into the existence slice, AFTER
  * the row went under its key.  Readers see no half-done row: its transaction
@@ -2976,35 +3205,12 @@ static void
 lion_slice_insert(Relation index, Relation heaprel, LionState *state,
 				  Datum key, uint32 ckey, uint16 lo)
 {
-	int			nbits = state->slicebits;
 	int			pos[LION_SLICE_MAX_POS];
-	int			npos = 0;
-	int64		v;
-	uint64		enc;
+	int			npos = lion_slice_positions(state, key, pos);
 	Buffer		leafbuf = InvalidBuffer;
 	OffsetNumber entryoff = InvalidOffsetNumber;
 	LionSliceBatch batch;
 	int			i;
-
-	switch (nbits)
-	{
-		case 16:
-			v = DatumGetInt16(key);
-			break;
-		case 32:
-			v = DatumGetInt32(key);
-			break;
-		default:
-			v = DatumGetInt64(key);
-			break;
-	}
-	enc = lion_slice_encode(v, nbits);
-	while (enc != 0)
-	{
-		pos[npos++] = pg_rightmost_one_pos64(enc);
-		enc &= enc - 1;
-	}
-	pos[npos++] = LION_SLICE_EXISTS;
 
 	batch.ckey = ckey;
 	batch.lo = lo;
@@ -3098,6 +3304,10 @@ lion_slice_insert(Relation index, Relation heaprel, LionState *state,
 static inline int
 lion_insert_row_kind(const LionInsertRow *row)
 {
+	if (row->flag == LION_ENTRY_SLICE)
+		return LION_KIND_SLICE;
+	if (row->flag == LION_ENTRY_SUMMARY)
+		return LION_KIND_SUMMARY;
 	return (row->flag != 0) ? lion_reserved_kind(row->flag) : LION_KIND_VALUE;
 }
 
@@ -3120,6 +3330,8 @@ lion_insert_row_keycmp(LionIndexState *ix, const LionInsertRow *a,
 		return (lion_insert_row_kind(a) < lion_insert_row_kind(b)) ? -1 : 1;
 	if (a->hash != b->hash)
 		return (a->hash < b->hash) ? -1 : 1;
+	if (a->flag == LION_ENTRY_SLICE)	/* by position, as the directory */
+		return (a->key < b->key) ? -1 : (a->key > b->key) ? 1 : 0;
 	if (a->flag != 0)
 		return 0;
 
@@ -3152,6 +3364,16 @@ lion_insert_row_cmp(const void *pa, const void *pb, void *arg)
 	if (c != 0)
 		return c;
 	return (a->code < b->code) ? -1 : (a->code > b->code) ? 1 : 0;
+}
+
+/* The TIDs of two batch rows, for a slice's rows that came out of order */
+static int
+lion_insert_code_cmp(const void *pa, const void *pb)
+{
+	uint64		a = ((const LionInsertRow *) pa)->code;
+	uint64		b = ((const LionInsertRow *) pb)->code;
+
+	return (a < b) ? -1 : (a > b) ? 1 : 0;
 }
 
 /* One key's rows of a batch: rows[start .. start + n) */
@@ -3203,21 +3425,328 @@ lion_insert_group_cmp(const void *pa, const void *pb, void *arg)
  * of an earlier hold of the same batch, so it sorts at or before b (the
  * groups are in the directory's order): the question is only whether the two
  * prefixes tie - the same column and kind, and for a value the same position
- * under proc 4 in an ordered column, the same hash in any other.  Only then
- * is the leaf that held a's entry one whose range begins before every entry
- * of b's prefix run, which lion_dir_find_from() needs.
+ * under proc 4 in an ordered column, the same hash in any other; for a bit
+ * slice the same slice.  Only when they do not is the leaf that held a's
+ * entry one whose range begins before every entry of b's prefix run, which
+ * lion_dir_find_from() needs.
  */
 static bool
 lion_insert_prefix_before(const LionSearchKey *a, const LionSearchKey *b)
 {
 	if (a->attno != b->attno || a->kind != b->kind)
 		return true;
+	if (a->kind == LION_KIND_SLICE)
+		return *(const uint8 *) a->raw != *(const uint8 *) b->raw;
 	if (a->kind != LION_KIND_VALUE)
 		return false;
 	if (a->cmpproc != NULL)
 		return DatumGetInt32(FunctionCall2Coll(a->cmpproc, a->collation,
 											   a->key, b->key)) != 0;
 	return a->hash != b->hash;
+}
+
+/* A summarized column's batch rows by key, then TID (lion_summary_insert_rows()) */
+static int
+lion_insert_summary_cmp(const void *pa, const void *pb, void *arg)
+{
+	const LionInsertRow *a = (const LionInsertRow *) pa;
+	const LionInsertRow *b = (const LionInsertRow *) pb;
+	LionState  *state = (LionState *) arg;
+	int32		c = DatumGetInt32(FunctionCall2Coll(&state->cmpproc,
+													state->collation,
+													a->key, b->key));
+
+	if (c != 0)
+		return c < 0 ? -1 : 1;
+	return (a->code < b->code) ? -1 : (a->code > b->code) ? 1 : 0;
+}
+
+/*
+ * The rows rows[0 .. n) of a batch, all of whose keys are at or below segkey,
+ * into the summary that a descent to (SUMMARY, segkey) lands on - the bucket
+ * of every one of them (lion_summary_insert_rows()).  They go in in TID
+ * order, an INLINE summary's as many as its payload holds under the limit in
+ * one rewrite (lion_insert_inline_rows()), a CHAIN one's up to
+ * LION_APPLY_HOLD a hold, a record to a container (lion_insert_chain_rows()),
+ * and the summary is looked up again for the next hold.  buf, when valid,
+ * holds that summary at off EXCLUSIVE already, for the first hold; rows that
+ * have to be sorted first are sorted with it released, so that a hold of the
+ * leaf stays one hold's rows long, and the first hold looks it up too.  A
+ * lookup lands on the bucket the keys are in even if theirs was emptied and
+ * deleted meanwhile, the next one's reaching down (DESIGN.md §32); one that
+ * lands anywhere but on a summary of the column at or above segkey leaves the
+ * rest to lion_summary_insert(), a row at a time.
+ */
+static void
+lion_summary_put_rows(Relation index, Relation heaprel, LionState *state,
+					  MemoryContext holdcxt, LionInsertRow *rows, int n,
+					  Datum segkey, Buffer buf, OffsetNumber off)
+{
+	int			i;
+
+	for (i = 1; i < n; i++)
+		if (rows[i - 1].code > rows[i].code)
+			break;
+	if (i < n)
+	{
+		if (BufferIsValid(buf))
+		{
+			UnlockReleaseBuffer(buf);
+			buf = InvalidBuffer;
+		}
+		qsort(rows, n, sizeof(LionInsertRow), lion_insert_code_cmp);
+	}
+
+	i = 0;
+	while (i < n)
+	{
+		LionEntryTuple *e;
+		int			taken;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!BufferIsValid(buf))
+		{
+			LionSearchKey sk;
+			Page		page;
+
+			lion_search_key_init(state, &sk, LION_KIND_SUMMARY, segkey, 0);
+			buf = lion_dir_search_first(index, heaprel, state->ix, &sk,
+										BUFFER_LOCK_EXCLUSIVE, true, &off);
+			page = BufferGetPage(buf);
+			e = (off <= PageGetMaxOffsetNumber(page)) ?
+				lion_page_entry(page, off) : NULL;
+			if (e == NULL || LionEntryIsPivot(e) ||
+				e->attno != state->attno || !LionEntryIsSummary(e) ||
+				DatumGetInt32(FunctionCall2Coll(&state->cmpproc,
+												state->collation, segkey,
+												lion_entry_key(state, e))) > 0)
+			{
+				UnlockReleaseBuffer(buf);
+				for (; i < n; i++)
+					lion_summary_insert(index, heaprel, state, rows[i].key,
+										lion_code_ckey(rows[i].code),
+										lion_code_lo(rows[i].code));
+				return;
+			}
+		}
+
+		/* SERIALIZABLE (DESIGN.md §9): the summary the rows go into */
+		lion_writer_check(index, buf, off, true);
+		e = lion_page_entry(BufferGetPage(buf), off);
+		if ((e->flags & LION_ENTRY_INLINE) != 0)
+		{
+			taken = (n - i == 1) ? 0 :
+				lion_insert_inline_rows(index, heaprel, state, buf, off,
+										&rows[i], Min(n - i, LION_APPLY_HOLD),
+										false);
+			if (taken == 0)
+			{
+				/* a row alone, or a first row that spills the summary */
+				lion_insert_inline(index, heaprel, state, buf, off,
+								   lion_code_ckey(rows[i].code),
+								   lion_code_lo(rows[i].code), NULL);
+				taken = 1;
+			}
+		}
+		else
+		{
+			int			stop = Min(n - i, LION_APPLY_HOLD);
+
+			for (taken = 0; taken < stop;)
+				taken += lion_insert_chain_rows(index, heaprel, buf, off,
+												&rows[i + taken], stop - taken);
+		}
+		UnlockReleaseBuffer(buf);
+		buf = InvalidBuffer;
+		MemoryContextReset(holdcxt);
+		i += taken;
+		LION_INJECTION_POINT("lion-insert-batch-summary");
+	}
+}
+
+/*
+ * The first of rows[lo .. n), which are sorted by key, whose key is above
+ * key, or n: found by halving, so that a bucket's run costs a few comparisons
+ * under its leaf's lock however many rows it has.
+ */
+static int
+lion_summary_run_end(LionState *state, const LionInsertRow *rows, int lo,
+					 int n, Datum key)
+{
+	int			hi = n;
+
+	while (lo < hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (DatumGetInt32(FunctionCall2Coll(&state->cmpproc, state->collation,
+											rows[mid].key, key)) <= 0)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/*
+ * lion_summary_insert() for a batch (DESIGN.md §55, "A column with
+ * summaries"): rows[0 .. n) are the summary rows of one column, which the
+ * batch writes after the column's keys, so each row is under its key's entry
+ * first, as the row's own steps go.  They come sorted by key, then TID, and
+ * go into their buckets a run at a time:
+ *
+ *	- a closed summary takes every row up to its key in one run;
+ *	- the open one (SUMLAST) takes the rows up to its key, and the rows above
+ *	  it while it holds fewer than summary_tids - its key raised once, to the
+ *	  largest of them, as the row that raises it goes in
+ *	  (lion_summary_rekey_insert()) - and then the rest of the run;
+ *	- a row above a full open bucket closes it and opens the next
+ *	  (lion_summary_close_last()), and the rows after it go on from there.
+ *
+ * Which bucket a row lands in can differ from where row-by-row inserts in
+ * TID order would have put it - a key that a later row would have raised the
+ * open bucket past may close it here - but every bucket still holds just the
+ * keys in (the key before it, its own key], which is all a count asks.  A
+ * column with no summary at or above a row's key goes through
+ * lion_summary_insert(), which makes one.
+ */
+static void
+lion_summary_insert_rows(Relation index, Relation heaprel, LionState *state,
+						 MemoryContext holdcxt, LionInsertRow *rows, int n)
+{
+	uint32		bucket_tids = state->ix->meta.summary_tids;
+	int			i;
+
+	for (i = 1; i < n; i++)
+		if (lion_insert_summary_cmp(&rows[i - 1], &rows[i], state) > 0)
+			break;
+	if (i < n)
+		qsort_arg(rows, n, sizeof(LionInsertRow), lion_insert_summary_cmp,
+				  state);
+
+	i = 0;
+	while (i < n)
+	{
+		LionSearchKey sk;
+		Buffer		buf;
+		Page		page;
+		OffsetNumber off;
+		LionEntryTuple *e = NULL;
+		int			kind = -1;
+		int			j;
+
+		CHECK_FOR_INTERRUPTS();
+		lion_search_key_init(state, &sk, LION_KIND_SUMMARY, rows[i].key, 0);
+		buf = lion_dir_search_first(index, heaprel, state->ix, &sk,
+									BUFFER_LOCK_EXCLUSIVE, true, &off);
+		page = BufferGetPage(buf);
+		if (off <= PageGetMaxOffsetNumber(page))
+		{
+			e = lion_page_entry(page, off);
+			if (e->attno == state->attno && LionEntryIsSummary(e) &&
+				!LionEntryIsPivot(e))
+				kind = lion_entry_kind(e);
+		}
+
+		if (kind == LION_KIND_SUMMARY)
+		{
+			/* lion_dir_search_first() found its key at or above the row's */
+			j = lion_summary_run_end(state, rows, i + 1, n,
+									 lion_entry_key(state, e));
+			lion_summary_put_rows(index, heaprel, state, holdcxt, &rows[i],
+								  j - i, rows[j - 1].key, buf, off);
+			i = j;
+			continue;
+		}
+
+		if (kind == LION_KIND_SUMLAST)
+		{
+			Datum		top = lion_entry_key(state, e);
+			uint64		ntids = lion_entry_ntids(e);
+			int			raise = -1; /* the row that raises its key, if any */
+
+			/* SERIALIZABLE (DESIGN.md §9), as lion_summary_insert() checks */
+			lion_writer_check(index, buf, off, true);
+
+			/*
+			 * The run it takes: the rows up to its key, then while it holds
+			 * fewer than bucket_tids each key above, with that key's rows.
+			 */
+			j = lion_summary_run_end(state, rows, i, n, top);
+			ntids += j - i;
+			while (j < n && ntids < (uint64) bucket_tids)
+			{
+				int			k;
+
+				top = rows[j].key;
+				raise = j;
+				k = lion_summary_run_end(state, rows, j + 1, n, top);
+				ntids += k - j;
+				j = k;
+			}
+
+			if (j == i)
+			{
+				/* full, and the row is above it: the next bucket */
+				lion_writer_check(index, buf, off, false);
+				lion_summary_close_last(index, heaprel, state, buf, off,
+										rows[i].key, LION_SUMMARY_HASH,
+										lion_code_ckey(rows[i].code),
+										lion_code_lo(rows[i].code));
+				UnlockReleaseBuffer(buf);
+				MemoryContextReset(holdcxt);
+				i++;
+				continue;
+			}
+
+			if (raise < 0)
+			{
+				lion_summary_put_rows(index, heaprel, state, holdcxt, &rows[i],
+									  j - i, rows[j - 1].key, buf, off);
+				i = j;
+				continue;
+			}
+
+			/*
+			 * Its key raised to the largest of the run's, with that row in -
+			 * the last of the run, the rows after it being its key's - and
+			 * then the rest.  An entry the rewrite moved off the leaf is
+			 * looked up again with the rows as they stand (nothing went in
+			 * but its key).
+			 */
+			{
+				LionInsertRow last = rows[raise];
+				bool		done;
+
+				lion_writer_check(index, buf, off, false);
+				done = lion_summary_rekey_insert(index, heaprel, state, buf, off,
+												 last.key, LION_SUMMARY_HASH,
+												 lion_code_ckey(last.code),
+												 lion_code_lo(last.code));
+				UnlockReleaseBuffer(buf);
+				MemoryContextReset(holdcxt);
+				if (!done)
+					continue;
+				memmove(&rows[raise], &rows[raise + 1],
+						sizeof(LionInsertRow) * (j - raise - 1));
+				rows[j - 1] = last;
+				if (j - 1 > i)
+					lion_summary_put_rows(index, heaprel, state, holdcxt,
+										  &rows[i], j - 1 - i, last.key,
+										  InvalidBuffer, InvalidOffsetNumber);
+				i = j;
+				continue;
+			}
+		}
+
+		/* no summary at or above the key: a row's own path makes one */
+		UnlockReleaseBuffer(buf);
+		lion_summary_insert(index, heaprel, state, rows[i].key,
+							lion_code_ckey(rows[i].code),
+							lion_code_lo(rows[i].code));
+		MemoryContextReset(holdcxt);
+		i++;
+	}
 }
 
 /*
@@ -3233,12 +3762,16 @@ lion_insert_apply_known(Relation index, Relation heaprel, LionState *state,
 						Buffer leafbuf, OffsetNumber entryoff,
 						const LionInsertRow *rows, int n)
 {
+	bool		haspos = state->positions && rows[0].flag == 0;
 	int			i;
 	int			stop;
 
 	if ((lion_page_entry(BufferGetPage(leafbuf), entryoff)->flags &
 		 LION_ENTRY_INLINE) != 0)
 	{
+		/* positions inline go in by a descent (lion_insert_known()) */
+		if (haspos)
+			return 0;
 		/* a key of one row: the single insert's path, which copies less */
 		if (n == 1)
 			return lion_insert_known(index, heaprel, state, leafbuf, entryoff,
@@ -3252,9 +3785,13 @@ lion_insert_apply_known(Relation index, Relation heaprel, LionState *state,
 
 	lion_writer_check(index, leafbuf, entryoff, true);
 	stop = Min(n, LION_APPLY_HOLD);
-	for (i = 0; i < stop;)
-		i += lion_insert_chain_rows(index, heaprel, leafbuf, entryoff,
-									&rows[i], stop - i);
+	if (haspos)
+		lion_insert_chain_pos_rows(index, heaprel, state, leafbuf, entryoff,
+								   rows, stop);
+	else
+		for (i = 0; i < stop;)
+			i += lion_insert_chain_rows(index, heaprel, leafbuf, entryoff,
+										&rows[i], stop - i);
 	return stop;
 }
 
@@ -3287,10 +3824,16 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 	MemoryContext holdcxt;
 	MemoryContext oldcxt;
 	int			ngroups = 0;
+	int			nother;
+	int			nslice = 0;
+	int			nslicebuckets = 0;
+	int		   *sliceat = NULL;
 	int			g;
 	int			i;
 	LionLastLeaf last;
 	LionSearchKey lastsk;
+	uint8		lastposbyte;	/* lastsk's, for a slice */
+	LionPosMember *pm = NULL;	/* a row's positions, for one insert */
 
 	if (nrows == 0)
 		return;
@@ -3304,16 +3847,65 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 									LION_INSERT_CONTEXT_SIZE,
 									ALLOCSET_DEFAULT_MAXSIZE);
 	oldcxt = MemoryContextSwitchTo(cxt);
+	pm = (LionPosMember *) palloc(sizeof(LionPosMember));
 	memset(&last, 0, sizeof(last));
 	memset(&lastsk, 0, sizeof(lastsk));
 	last.blk = InvalidBlockNumber;
 	last.cxt = cxt;
 
-	/* the keys' rows together, in TID order, by a cheap comparison ... */
-	qsort_arg(rows, nrows, sizeof(LionInsertRow), lion_insert_row_cmp, ix);
+	/*
+	 * A sliced column's rows go into a dozen or more bit slices each
+	 * (DESIGN.md §51), so most of a batch of one can be slice rows: they go
+	 * to the end, each slice's together, by a counting pass rather than the
+	 * sort.  A slice's rows are its column's, which come in the order the
+	 * heap took them - TID order nearly always, which is checked.
+	 */
+	nother = nrows;
+	for (i = 0; i < nrows; i++)
+		if (rows[i].flag == LION_ENTRY_SLICE)
+			nslice++;
+	if (nslice > 0)
+	{
+		int			nbuckets = ix->ncolumns * LION_SLICE_MAX_POS;
+		int		   *fill = (int *) palloc0(sizeof(int) * (nbuckets + 1));
+		LionInsertRow *slices = (LionInsertRow *)
+			palloc(sizeof(LionInsertRow) * nslice);
+		int			b;
+
+		/* a slice's bucket: its column's, then its position's index */
+#define LION_SLICE_BUCKET(r) \
+	((r)->col * LION_SLICE_MAX_POS + \
+	 (DatumGetInt32((r)->key) == LION_SLICE_EXISTS ? LION_SLICE_MAX_BITS : \
+	  DatumGetInt32((r)->key)))
+
+		sliceat = (int *) palloc(sizeof(int) * (nbuckets + 1));
+		for (i = 0; i < nrows; i++)
+			if (rows[i].flag == LION_ENTRY_SLICE)
+				fill[LION_SLICE_BUCKET(&rows[i]) + 1]++;
+		for (b = 0; b < nbuckets; b++)
+			fill[b + 1] += fill[b];
+		memcpy(sliceat, fill, sizeof(int) * (nbuckets + 1));
+		nother = 0;
+		for (i = 0; i < nrows; i++)
+		{
+			if (rows[i].flag == LION_ENTRY_SLICE)
+				slices[fill[LION_SLICE_BUCKET(&rows[i])]++] = rows[i];
+			else if (nother++ != i)
+				rows[nother - 1] = rows[i];
+		}
+#undef LION_SLICE_BUCKET
+		Assert(nother + nslice == nrows);
+		memcpy(&rows[nother], slices, sizeof(LionInsertRow) * nslice);
+		pfree(slices);
+		pfree(fill);
+		nslicebuckets = nbuckets;
+	}
+
+	/* the other keys' rows together, in TID order, by a cheap comparison ... */
+	qsort_arg(rows, nother, sizeof(LionInsertRow), lion_insert_row_cmp, ix);
 
 	groups = (LionInsertGroup *) palloc(sizeof(LionInsertGroup) * nrows);
-	for (i = 0; i < nrows; i++)
+	for (i = 0; i < nother; i++)
 	{
 		if (i == 0 || lion_insert_row_keycmp(ix, &rows[i - 1], &rows[i]) != 0)
 		{
@@ -3321,6 +3913,22 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 			groups[ngroups++].n = 0;
 		}
 		groups[ngroups - 1].n++;
+	}
+	for (i = 0; i < nslicebuckets; i++)
+	{
+		LionInsertRow *srows = &rows[nother + sliceat[i]];
+		int			n = sliceat[i + 1] - sliceat[i];
+		int			j;
+
+		if (n == 0)
+			continue;
+		for (j = 1; j < n; j++)
+			if (srows[j - 1].code > srows[j].code)
+				break;
+		if (j < n)
+			qsort(srows, n, sizeof(LionInsertRow), lion_insert_code_cmp);
+		groups[ngroups].start = nother + sliceat[i];
+		groups[ngroups++].n = n;
 	}
 
 	/* ... and the keys in the directory's order, by its own */
@@ -3338,6 +3946,17 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 		LionState  *state = &ix->cols[grows[0].col];
 		uint16		flag = grows[0].flag;
 		int			end = groups[g].n;
+		uint8		posbyte;	/* a slice's search key points at it */
+		bool		haspos = state->positions && flag == 0;
+
+		if (flag == LION_ENTRY_SUMMARY)
+		{
+			/* a summarized column's buckets, after its keys */
+			lion_summary_insert_rows(index, heaprel, state, holdcxt, grows,
+									 end);
+			MemoryContextReset(holdcxt);
+			continue;
+		}
 
 		i = 0;
 		while (i < end)
@@ -3350,7 +3969,11 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 			BlockNumber hint;
 			int			r = LION_FIND_NOT_HERE;
 
-			if (flag != 0)
+			if (flag == LION_ENTRY_SLICE)
+				lion_search_key_slice(state, &sk,
+									  (int) DatumGetInt32(grows[i].key),
+									  &posbyte);
+			else if (flag != 0)
 				lion_search_key_init(state, &sk, lion_reserved_kind(flag),
 									 (Datum) 0, grows[i].hash);
 			else
@@ -3405,7 +4028,47 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 				found = (r == LION_FIND_FOUND);
 			lion_writer_check(index, leafbuf, entryoff, found);
 
-			if (!found)
+			if (haspos && !found)
+			{
+				/* a new entry with positions: its first row, as one insert */
+				lion_insert_row_member(state, &grows[i], pm);
+				lion_insert_new_entry(index, heaprel, state, &leafbuf,
+									  entryoff, movedright, grows[i].key, 0,
+									  grows[i].hash,
+									  lion_code_ckey(grows[i].code),
+									  lion_code_lo(grows[i].code), pm);
+				i++;
+			}
+			else if (haspos && (lion_page_entry(BufferGetPage(leafbuf),
+												 entryoff)->flags &
+								 LION_ENTRY_INLINE) != 0)
+			{
+				/* as for an INLINE entry without positions, below */
+				int			n = (end - i == 1) ? 0 :
+					lion_insert_inline_pos_rows(index, heaprel, state, leafbuf,
+												entryoff, &grows[i],
+												Min(end - i, LION_APPLY_HOLD),
+												pm);
+
+				if (n == 0)
+				{
+					lion_insert_row_member(state, &grows[i], pm);
+					lion_insert_inline(index, heaprel, state, leafbuf, entryoff,
+									   lion_code_ckey(grows[i].code),
+									   lion_code_lo(grows[i].code), pm);
+					n = 1;
+				}
+				i += n;
+			}
+			else if (haspos)
+			{
+				int			n = Min(end - i, LION_APPLY_HOLD);
+
+				lion_insert_chain_pos_rows(index, heaprel, state, leafbuf,
+										   entryoff, &grows[i], n);
+				i += n;
+			}
+			else if (!found)
 				i += lion_insert_new_entry_rows(index, heaprel, state,
 												&leafbuf, entryoff, movedright,
 												&grows[i],
@@ -3441,6 +4104,11 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 
 			lion_dir_note_leaf(&last, leafbuf);
 			lastsk = sk;
+			if (sk.kind == LION_KIND_SLICE)
+			{
+				lastposbyte = posbyte;
+				lastsk.raw = (const char *) &lastposbyte;
+			}
 			lion_leaf_hint_set(ix, &sk, last.blk);
 			UnlockReleaseBuffer(leafbuf);
 			MemoryContextReset(holdcxt);
@@ -3470,13 +4138,6 @@ typedef struct LionInsertCache
 	uint64		nrows;
 } LionInsertCache;
 
-/* Does lioninsert() buffer this column's keys of the row? */
-static inline bool
-lion_column_batched(bool batch, LionState *state)
-{
-	return batch && !state->positions && !state->summarized && !state->sliced;
-}
-
 /*
  * aminsert
  *
@@ -3498,12 +4159,11 @@ lion_column_batched(bool batch, LionState *state)
  * and the same visibility argument covers them.  A NULL in one column says
  * nothing about the others.
  *
- * After the statement's first row, a column's (key, TID) pairs are buffered
- * rather than written, when lion_defer_allowed() says the statement may and
- * the column stores nothing beside its keys' posting sets - no positions,
- * summaries or slices: the buffer is written sorted by key at the end of the
- * statement, or before anything reads the index (DESIGN.md §55,
- * lion_defer.c).  The visibility argument is the same once more: no snapshot
+ * After the statement's first row, a column's (key, TID) pairs - and its
+ * summary's and slices' - are buffered rather than written, when
+ * lion_defer_allowed() says the statement may: the buffer is written sorted
+ * by key at the end of the statement, or before anything reads the index
+ * (DESIGN.md §55, lion_defer.c).  The visibility argument is the same once more: no snapshot
  * that can see the row exists before the statement is done.
  */
 bool
@@ -3571,12 +4231,8 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		LionState  *state = &ix->cols[c];
 		Datum		key;
 
-		/*
-		 * Buffered, or written now: a column whose inserts write more than
-		 * its key's entry - positions, a summary, slices - is always written
-		 * now.
-		 */
-		if (lion_column_batched(batch, state) && defer == NULL)
+		/* buffered, or written now */
+		if (batch && defer == NULL)
 			defer = lion_defer_get(index, heapRel);
 
 		/*
@@ -3588,9 +4244,9 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		 */
 		if (isnull[c])
 		{
-			if (lion_column_batched(batch, state))
+			if (batch)
 				lion_defer_add(defer, index, heapRel, state, c, (Datum) 0,
-							   LION_ENTRY_NULLKEY, code);
+							   LION_ENTRY_NULLKEY, code, NULL);
 			else
 				lion_insert_one(index, heapRel, state, (Datum) 0,
 							   LION_ENTRY_NULLKEY, ckey, lo, NULL);
@@ -3617,14 +4273,18 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 			for (i = 0; i < nkeys; i++)
 				keys[i] = lion_key_prepare(state, keys[i], heapRel, ht_ctid);
 
-			if (lion_column_batched(batch, state))
+			if (batch)
 			{
 				if (nkeys == 0)
 					lion_defer_add(defer, index, heapRel, state, c, (Datum) 0,
-								   nokey, code);
+								   nokey, code, NULL);
 				for (i = 0; i < nkeys; i++)
+				{
+					if (pm != NULL)
+						lion_posmember_from_key(pm, code, &kpos[i]);
 					lion_defer_add(defer, index, heapRel, state, c, keys[i], 0,
-								   code);
+								   code, pm);
+				}
 			}
 			else
 			{
@@ -3646,10 +4306,34 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 			/* stored as it is, or compressed when long (DESIGN.md §4) */
 			key = lion_key_prepare(state, values[c], heapRel, ht_ctid);
 
-			if (lion_column_batched(batch, state))
-				lion_defer_add(defer, index, heapRel, state, c, key, 0, code);
-			else
-				lion_insert_one(index, heapRel, state, key, 0, ckey, lo, NULL);
+			if (batch)
+			{
+				lion_defer_add(defer, index, heapRel, state, c, key, 0, code,
+							   NULL);
+
+				/*
+				 * ... and its bucket's summary (DESIGN.md §32), and its bit
+				 * slices (§51), a pair a slice, which the batch writes after
+				 * the column's keys, as the row's own steps below go.
+				 */
+				if (state->summarized)
+					lion_defer_add(defer, index, heapRel, state, c, key,
+								   LION_ENTRY_SUMMARY, code, NULL);
+				if (state->sliced)
+				{
+					int			pos[LION_SLICE_MAX_POS];
+					int			npos = lion_slice_positions(state, key, pos);
+					int			i;
+
+					for (i = 0; i < npos; i++)
+						lion_defer_add(defer, index, heapRel, state, c,
+									   Int32GetDatum(pos[i]),
+									   LION_ENTRY_SLICE, code, NULL);
+				}
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+			lion_insert_one(index, heapRel, state, key, 0, ckey, lo, NULL);
 
 			/*
 			 * ... and in its bucket's summary (DESIGN.md §32), which is a
