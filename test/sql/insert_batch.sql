@@ -307,6 +307,53 @@ SELECT lb_cmp('lb_mix', 't = ''w1''');
 SELECT lb_cmp('lb_mix', 'd @@ ''w3 <-> x1''::tsquery');
 
 -- ---------------------------------------------------------------------
+-- Several rows of one key in one write: a new key's rows go into its
+-- entry as it is made, an INLINE entry takes as many as its payload holds
+-- under the limit in one rewrite (the rest after it spills), and a CHAIN
+-- entry's rows for one container go in in one record.  inline_limit = 256
+-- makes the three keys of 3,000 rows spill in the middle of the batch.
+-- ---------------------------------------------------------------------
+CREATE EXTENSION IF NOT EXISTS pg_walinspect;
+CREATE TABLE lb_rows (i int4, k int4) WITH (autovacuum_enabled = off);
+CREATE INDEX lb_rows_k ON lb_rows USING lion (k) WITH (inline_limit = 256);
+INSERT INTO lb_rows
+SELECT g, CASE WHEN g <= 9000 THEN 1000 + g % 3 ELSE g % 100 END
+FROM generate_series(1, 12000) g;
+SELECT entries, inline_entries, ntids FROM lion_index_stats('lb_rows_k');
+SELECT lion_index_verify('lb_rows_k', true);
+SELECT lb_cmp('lb_rows', 'k = 7');
+SELECT lb_cmp('lb_rows', 'k = 1001');
+SELECT lb_cmp('lb_rows', 'k BETWEEN 0 AND 99');
+
+-- more rows under the same keys, and new ones
+INSERT INTO lb_rows
+SELECT g, CASE WHEN g % 2 = 0 THEN 1000 + g % 3 ELSE g % 150 END
+FROM generate_series(12001, 14000) g;
+SELECT entries, inline_entries, ntids FROM lion_index_stats('lb_rows_k');
+SELECT lion_index_verify('lb_rows_k', true);
+SELECT lb_cmp('lb_rows', 'k = 7');
+SELECT lb_cmp('lb_rows', 'k = 121');
+SELECT lb_cmp('lb_rows', 'k = 1002');
+
+-- 400 rows of one CHAIN key, adjacent on the heap: a record for each
+-- container they go into, not one for each row (on 16, which writes row
+-- by row, the count is not asked).  The start is the insert position, not
+-- the write position, which lags while earlier commits are unflushed; only
+-- the insert's own transaction's records count, not another session's.
+SET synchronous_commit = on;	-- the commit flushes what is read back
+SELECT pg_current_wal_insert_lsn() AS lb_lsn0 \gset
+BEGIN;
+INSERT INTO lb_rows SELECT g, 1000 FROM generate_series(14001, 14400) g;
+SELECT xid(pg_current_xact_id()) AS lb_xid \gset
+COMMIT;
+SELECT batched(1) = 0 OR count(*) BETWEEN 1 AND 39 AS a_record_a_container
+  FROM pg_get_wal_records_info(:'lb_lsn0', pg_current_wal_lsn())
+ WHERE resource_manager IN ('Generic', 'pg_lion') AND xid = :'lb_xid';
+RESET synchronous_commit;
+SELECT lion_index_verify('lb_rows_k', true);
+SELECT lb_cmp('lb_rows', 'k = 1000');
+
+-- ---------------------------------------------------------------------
 -- A partitioned table: one buffer per partition's index.
 -- ---------------------------------------------------------------------
 CREATE TABLE lb_part (i int4, k int4) PARTITION BY RANGE (i);
@@ -317,6 +364,6 @@ INSERT INTO lb_part SELECT (g * 7919) % 10000, g % 5 FROM generate_series(1, 999
 SELECT lion_index_verify('lb_part_1_k_idx', true), lion_index_verify('lb_part_2_k_idx', true);
 SELECT lb_cmp('lb_part', 'k = 4');
 
-DROP TABLE lb, lb_mid, lb_log, lb_left, lb_ex, lb_mix, lb_part;
+DROP TABLE lb, lb_mid, lb_log, lb_left, lb_ex, lb_mix, lb_rows, lb_part;
 DROP FUNCTION lb_probe(int4), lb_trig(), lb_after(), lb_cmp(text, text), batched(int8);
 DROP FUNCTION lion_debug_defer_pending(regclass), lion_debug_defer_cleanup(bool);

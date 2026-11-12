@@ -89,6 +89,10 @@ static void lion_insert_inline(Relation index, Relation heaprel,
 							  LionState *state, Buffer entrybuf,
 							  OffsetNumber entryoff, uint32 ckey, uint16 lo,
 							  const LionPosMember *pm);
+static void lion_insert_place_new(Relation index, Relation heaprel,
+								  LionState *state, Buffer *leafbuf,
+								  OffsetNumber off, bool movedright,
+								  LionEntryTuple *entry, Size size);
 static bool lion_insert_inline_ext(Relation index, Relation heaprel,
 								   LionState *state, Buffer entrybuf,
 								   OffsetNumber entryoff, uint32 ckey,
@@ -109,6 +113,8 @@ static bool lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumb
 
 static int	lion_container_inplace_check(Relation index, Buffer buf,
 										 OffsetNumber off, uint16 lo);
+static int	lion_container_inplace_decide(const LionContainer *onpage,
+										  Size alloc, uint16 lo);
 static void lion_container_inplace_apply(LionWalState *xstate, Buffer buf,
 										 OffsetNumber off, uint16 lo);
 static int	lion_segment_inplace_check(Relation index, Buffer buf,
@@ -566,7 +572,6 @@ lion_insert_new_entry(Relation index, Relation heaprel, LionState *state,
 	LionEntryTuple *entry;
 	Size		paylen;
 	Size		size;
-	int			max_entries = lion_max_entries(index);
 
 	paylen = lion_put_singleton(payload, ckey, lo);
 
@@ -602,6 +607,23 @@ lion_insert_new_entry(Relation index, Relation heaprel, LionState *state,
 	lion_entry_set_ncontainers(entry, 1);
 	lion_entry_set_ntids(entry, 1);
 
+	lion_insert_place_new(index, heaprel, state, leafbuf, off, movedright,
+						  entry, size);
+	pfree(entry);
+}
+
+/*
+ * Put the new entry `entry` (size bytes) at the place the find-or-create
+ * found for it, *leafbuf held EXCLUSIVE since: lion_insert_new_entry()'s
+ * second half.
+ */
+static void
+lion_insert_place_new(Relation index, Relation heaprel, LionState *state,
+					  Buffer *leafbuf, OffsetNumber off, bool movedright,
+					  LionEntryTuple *entry, Size size)
+{
+	int			max_entries = lion_max_entries(index);
+
 	/*
 	 * Cardinality guard (DESIGN.md §17), on the one path that can make the
 	 * index grow a key: a brand new entry.
@@ -634,8 +656,111 @@ lion_insert_new_entry(Relation index, Relation heaprel, LionState *state,
 
 	lion_dir_add_entry(index, heaprel, state->ix, leafbuf, off, movedright,
 					  entry, size);
+}
 
+/*
+ * lion_insert_new_entry() for the rows rows[0 .. n) of one key of a batch
+ * (lion_insert_apply()), n at least one: the new INLINE entry takes as many
+ * of them as its payload holds under the limit, all in its one record.
+ * Returns how many it took, one at least.
+ */
+static int
+lion_insert_new_entry_rows(Relation index, Relation heaprel, LionState *state,
+						   Buffer *leafbuf, OffsetNumber off, bool movedright,
+						   const LionInsertRow *rows, int n)
+{
+	char		first[LION_SPARSE_SINGLETON_MAX];
+	LionEntryTuple *entry;
+	Size		size;
+	Size		paylen;
+	Size		limit;
+	char	   *cur;
+	char	   *next;
+	uint32		ncontainers = 1;
+	int			taken = 1;
+	int			added = 1;
+
+	paylen = lion_put_singleton(first, lion_code_ckey(rows[0].code),
+								lion_code_lo(rows[0].code));
+	entry = (rows[0].flag != 0) ?
+		lion_make_reserved_entry((AttrNumber) state->attno, rows[0].flag,
+								 LION_ENTRY_INLINE, first, paylen, &size) :
+		lion_make_entry(state, rows[0].key, LION_ENTRY_INLINE, first, paylen,
+						&size);
+
+	limit = lion_inline_max(LionEntryPayloadOffset(entry),
+							(Size) state->ix->meta.inline_limit);
+	if (n > 1 && paylen < limit)
+	{
+		cur = (char *) palloc(limit + LION_CONTAINER_MAX_SIZE);
+		next = (char *) palloc(limit + LION_CONTAINER_MAX_SIZE);
+		memcpy(cur, first, paylen);
+		for (; taken < n; taken++)
+		{
+			int			ndelta;
+			Size		len;
+			char	   *swap;
+
+			len = lion_inline_add(index, BufferGetBlockNumber(*leafbuf), off,
+								  cur, paylen,
+								  lion_code_ckey(rows[taken].code),
+								  lion_code_lo(rows[taken].code), next, &ndelta);
+			if (len == 0)
+				continue;		/* the same TID twice */
+			if (len > limit)
+				break;
+			swap = cur;
+			cur = next;
+			next = swap;
+			paylen = len;
+			ncontainers += ndelta;
+			added++;
+		}
+		if (added > 1)
+		{
+			LionEntryTuple *exact;
+			Size		payoff;
+
+			exact = (rows[0].flag != 0) ?
+				lion_make_reserved_entry((AttrNumber) state->attno,
+										 rows[0].flag, LION_ENTRY_INLINE, cur,
+										 paylen, &size) :
+				lion_make_entry(state, rows[0].key, LION_ENTRY_INLINE, cur,
+								paylen, &size);
+			pfree(entry);
+			entry = exact;
+
+			/*
+			 * Growth slack, as an insert's rewrite of an INLINE entry gives
+			 * it (lion_inline_rebuilt()), where the leaf the entry goes on
+			 * has the room for it: the key's next rows then go inside it.
+			 */
+			payoff = LionEntryPayloadOffset(exact);
+			if (OffsetNumberIsValid(off))
+			{
+				Size		maxsize = MAXALIGN_DOWN(PageGetFreeSpace(BufferGetPage(*leafbuf)));
+				Size		writesz = lion_entry_alloc_size(payoff, paylen,
+															(Size) state->ix->meta.inline_limit,
+															Max(maxsize, size));
+
+				if (writesz > size)
+				{
+					entry = lion_entry_rebuild_slack(exact, cur, paylen,
+													 writesz, &size);
+					pfree(exact);
+				}
+			}
+		}
+		pfree(cur);
+		pfree(next);
+	}
+	lion_entry_set_ncontainers(entry, ncontainers);
+	lion_entry_set_ntids(entry, (uint64) added);
+
+	lion_insert_place_new(index, heaprel, state, leafbuf, off, movedright,
+						  entry, size);
 	pfree(entry);
+	return taken;
 }
 
 /*
@@ -750,8 +875,8 @@ lion_insert_inline_pos(Relation index, Relation heaprel, LionState *state,
 
 /*
  * The INLINE entry `entry`, itemsz bytes on page, rebuilt around newpay
- * (newlen bytes, ndelta more items than it had) and counting one more TID, at
- * the length the growth slack gives it - palloc'd, *newsize bytes.
+ * (newlen bytes, ndelta more items than it had) and counting nadded more
+ * TIDs, at the length the growth slack gives it - palloc'd, *newsize bytes.
  *
  * GROWTH SLACK, the INLINE half of DESIGN.md §4.
  *
@@ -771,7 +896,7 @@ lion_insert_inline_pos(Relation index, Relation heaprel, LionState *state,
 static LionEntryTuple *
 lion_inline_rebuilt(LionState *state, Page page, LionEntryTuple *entry,
 					Size itemsz, const char *newpay, Size newlen, int ndelta,
-					Size *newsize)
+					uint64 nadded, Size *newsize)
 {
 	Size		payoff = LionEntryPayloadOffset(entry);
 	Size		need = payoff + newlen;
@@ -795,7 +920,7 @@ lion_inline_rebuilt(LionState *state, Page page, LionEntryTuple *entry,
 	newentry = lion_entry_rebuild_slack(entry, newpay, newlen, writesz,
 										newsize);
 	lion_entry_set_ncontainers(newentry, (uint32) ((int) ncontainers + ndelta));
-	lion_entry_set_ntids(newentry, ntids + 1);
+	lion_entry_set_ntids(newentry, ntids + nadded);
 
 	return newentry;
 }
@@ -891,7 +1016,7 @@ lion_insert_inline_ext(Relation index, Relation heaprel, LionState *state,
 		Size		newsize;
 
 		newentry = lion_inline_rebuilt(state, page, entry, itemsz, newpay,
-									   newlen, ndelta, &newsize);
+									   newlen, ndelta, 1, &newsize);
 
 		if (nosplit && !lion_page_overwrite_fits(page, entryoff, newsize))
 		{
@@ -1021,8 +1146,31 @@ lion_container_inplace_check(Relation index, Buffer buf, OffsetNumber off,
 {
 	Page		page = BufferGetPage(buf);
 	ItemId		iid = PageGetItemId(page, off);
-	LionContainer *onpage = (LionContainer *) PageGetItem(page, iid);
-	Size		alloc = ItemIdGetLength(iid);
+	int			r;
+
+	r = lion_container_inplace_decide((LionContainer *) PageGetItem(page, iid),
+									  ItemIdGetLength(iid), lo);
+
+	/*
+	 * The member goes into the bytes the line pointer allots the item, which
+	 * lion_page_item_fetch() has bounded - and which must not reach into the
+	 * next item: this wrote into that one's header before, and logged it.
+	 */
+	if (r == LION_INPLACE_YES)
+		lion_page_check_alone(index, page, BufferGetBlockNumber(buf), off);
+
+	return r;
+}
+
+/*
+ * lion_container_inplace_check()'s decision for the container c, allotted
+ * alloc bytes: the page's, or a copy that earlier members of a batch went
+ * into (lion_insert_chain_rows()).
+ */
+static int
+lion_container_inplace_decide(const LionContainer *onpage, Size alloc,
+							  uint16 lo)
+{
 	Size		need;
 
 	need = lion_container_inplace_need(onpage, lo);
@@ -1056,13 +1204,6 @@ lion_container_inplace_check(Relation index, Buffer buf, OffsetNumber off,
 	/* Already indexed: do not start a record at all. */
 	if (lion_container_contains(onpage, lo))
 		return LION_INPLACE_DUP;
-
-	/*
-	 * The member goes into the bytes the line pointer allots the item, which
-	 * lion_page_item_fetch() has bounded - and which must not reach into the
-	 * next item: this wrote into that one's header before, and logged it.
-	 */
-	lion_page_check_alone(index, page, BufferGetBlockNumber(buf), off);
 
 	return LION_INPLACE_YES;
 }
@@ -1564,6 +1705,122 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 	pfree(ecopy);
 }
 
+/*
+ * The rows rows[0 .. n) of one key of a batch (lion_insert_apply()) into its
+ * CHAIN entry at (entrybuf, entryoff), held EXCLUSIVE, from the first: the
+ * rows of the first one's container key that its container takes in place,
+ * in ONE record - a CONTAINER_ADD for each member, and the entry's counter
+ * once - where lion_insert_chain() writes a record a row; or, when that is
+ * not two rows or more (the key has a sparse segment there, or none, or the
+ * container must be rewritten), the first row alone through
+ * lion_insert_chain().  Returns how many rows it took, one at least.  A TID
+ * the set holds already counts as taken.
+ */
+static int
+lion_insert_chain_rows(Relation index, Relation heaprel, Buffer entrybuf,
+					   OffsetNumber entryoff, const LionInsertRow *rows, int n)
+{
+	Page		page = BufferGetPage(entrybuf);
+	BlockNumber entryblk = BufferGetBlockNumber(entrybuf);
+	uint32		ckey = lion_code_ckey(rows[0].code);
+	LionEntryTuple *entry;
+	LionEntryTuple *ecopy;
+	LionContainer *copy;
+	uint16	   *los;
+	Size		esize;
+	Size		alloc;
+	Buffer		buf;
+	Page		cpage;
+	OffsetNumber off;
+	LionWalState *xstate;
+	bool		ontail;
+	bool		found;
+	int			run;
+	int			taken = 0;
+	int			nlos = 0;
+	int			i;
+
+	for (run = 1; run < n && lion_code_ckey(rows[run].code) == ckey; run++)
+		;
+	if (run < 2)
+		goto one;
+
+	entry = lion_page_entry_fetch(index, page, entryblk, entryoff);
+	lion_page_check_alone(index, page, entryblk, entryoff);
+	ecopy = lion_entry_rebuild(entry, NULL, 0, &esize);
+	Assert(esize == ItemIdGetLength(PageGetItemId(page, entryoff)));
+	Assert((ecopy->flags & LION_ENTRY_CHAIN) != 0);
+
+	buf = lion_insert_lock_chain_page(index, heaprel, entryblk,
+									  lion_entry_owner(ecopy),
+									  lion_entry_head(ecopy),
+									  lion_entry_tail(ecopy), ckey, &ontail);
+	cpage = BufferGetPage(buf);
+	off = lion_page_find_item(index, cpage, BufferGetBlockNumber(buf), ckey,
+							  &found);
+	if (!found ||
+		lion_page_item_fetch(index, cpage, BufferGetBlockNumber(buf),
+							 off)->type == LION_CT_SPARSE)
+	{
+		UnlockReleaseBuffer(buf);
+		pfree(ecopy);
+		goto one;
+	}
+
+	/*
+	 * Which members go in in place, decided on a copy of the container that
+	 * takes each in turn, as the page will - before the record opens.
+	 */
+	alloc = ItemIdGetLength(PageGetItemId(cpage, off));
+	if (alloc > LION_CONTAINER_MAX_SIZE)
+		elog(ERROR, "lion index: container of %zu bytes at %u/%u",
+			 alloc, BufferGetBlockNumber(buf), off);
+	copy = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	memcpy(copy, PageGetItem(cpage, PageGetItemId(cpage, off)), alloc);
+	los = (uint16 *) palloc(sizeof(uint16) * run);
+	for (; taken < run; taken++)
+	{
+		uint16		lo = lion_code_lo(rows[taken].code);
+		int			r = lion_container_inplace_decide(copy, alloc, lo);
+
+		if (r == LION_INPLACE_NO)
+			break;
+		if (r == LION_INPLACE_DUP)
+			continue;
+		if (!lion_container_add(copy, lo))
+			elog(ERROR, "lion index: could not add a member to a copy of container %u",
+				 ckey);
+		los[nlos++] = lo;
+	}
+	pfree(copy);
+
+	if (nlos > 0 && (nlos > 1 || taken > 1))
+	{
+		lion_page_check_alone(index, cpage, BufferGetBlockNumber(buf), off);
+		xstate = lion_wal_begin(index);
+		for (i = 0; i < nlos; i++)
+			lion_container_inplace_apply(xstate, buf, off, los[i]);
+		lion_entry_set_ntids(ecopy, lion_entry_ntids(ecopy) + nlos);
+		if (!lion_replace_entry(index, xstate, entrybuf, entryoff, ecopy,
+								esize))
+			elog(ERROR, "lion index: could not update entry %u on block %u",
+				 entryoff, entryblk);
+		lion_wal_finish(xstate, LION_XLOG_ITEM_SET);
+	}
+	else if (nlos > 0)
+		taken = 0;				/* one member: the ordinary path's */
+	UnlockReleaseBuffer(buf);
+	pfree(los);
+	pfree(ecopy);
+	if (taken > 0)
+		return taken;
+
+one:
+	lion_insert_chain(index, heaprel, entrybuf, entryoff, ckey,
+					  lion_code_lo(rows[0].code), NULL);
+	return 1;
+}
+
 /* ---------------------------------------------------------------------
  * Summary posting sets (DESIGN.md §32)
  * --------------------------------------------------------------------- */
@@ -1983,6 +2240,87 @@ lion_summary_insert(Relation index, Relation heaprel, LionState *state,
 			return;
 		}
 	}
+}
+
+/*
+ * The rows rows[0 .. n) of one key of a batch (lion_insert_apply()) into the
+ * INLINE entry at (entrybuf, entryoff), held EXCLUSIVE: as many as the
+ * payload holds under the limit, in one rewrite of the entry and one record.
+ * Returns how many it took - a TID the set holds already counts as taken -
+ * or 0, having written nothing, when the first row would take the payload
+ * past the limit (it spills, which lion_insert_inline() does) or, with
+ * nosplit, when the rewritten entry does not fit where it stands
+ * (lion_insert_inline_ext()).  No entry with positions comes here.
+ */
+static int
+lion_insert_inline_rows(Relation index, Relation heaprel, LionState *state,
+						Buffer entrybuf, OffsetNumber entryoff,
+						const LionInsertRow *rows, int n, bool nosplit)
+{
+	Page		page = BufferGetPage(entrybuf);
+	BlockNumber blk = BufferGetBlockNumber(entrybuf);
+	LionEntryTuple *entry = lion_page_entry_fetch(index, page, blk, entryoff);
+	Size		itemsz = ItemIdGetLength(PageGetItemId(page, entryoff));
+	Size		payoff = LionEntryPayloadOffset(entry);
+	Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemsz);
+	Size		limit = lion_inline_max(payoff,
+										(Size) state->ix->meta.inline_limit);
+	Size		bufsz = Max(paylen, limit) + LION_CONTAINER_MAX_SIZE;
+	LionEntryTuple *newentry;
+	Size		newsize;
+	char	   *cur;
+	char	   *next;
+	int			ndelta = 0;
+	int			taken;
+	int			added = 0;
+
+	Assert(lion_entry_posext(entry) == NULL);
+
+	cur = (char *) palloc(bufsz);
+	next = (char *) palloc(bufsz);
+	memcpy(cur, LionEntryGetPayload(entry), paylen);
+	for (taken = 0; taken < n; taken++)
+	{
+		int			nd;
+		Size		len;
+		char	   *swap;
+
+		len = lion_inline_add(index, blk, entryoff, cur, paylen,
+							  lion_code_ckey(rows[taken].code),
+							  lion_code_lo(rows[taken].code), next, &nd);
+		if (len == 0)
+			continue;			/* already indexed */
+		if (len > limit)
+			break;
+		swap = cur;
+		cur = next;
+		next = swap;
+		paylen = len;
+		ndelta += nd;
+		added++;
+	}
+	pfree(next);
+
+	if (added == 0)
+	{
+		pfree(cur);
+		return taken;			/* every row taken was there already, or 0 */
+	}
+
+	newentry = lion_inline_rebuilt(state, page, entry, itemsz, cur, paylen,
+								   ndelta, (uint64) added, &newsize);
+	pfree(cur);
+	if (nosplit && !lion_page_overwrite_fits(page, entryoff, newsize))
+	{
+		pfree(newentry);
+		return 0;
+	}
+
+	/* as lion_insert_inline_ext(): a leaf that has no room splits */
+	lion_dir_place(index, heaprel, state->ix, entrybuf, entryoff, true,
+				   newentry, newsize);
+	pfree(newentry);
+	return taken;
 }
 
 /* ---------------------------------------------------------------------
@@ -2482,7 +2820,7 @@ lion_slice_batch_inline(Relation index, LionState *state, LionSliceBatch *b,
 	}
 
 	newentry = lion_inline_rebuilt(state, page, entry, itemsz, newpay, newlen,
-								   ndelta, &newsize);
+								   ndelta, 1, &newsize);
 	pfree(newpay);
 	if (newsize != itemsz)
 	{
@@ -2886,8 +3224,9 @@ lion_insert_prefix_before(const LionSearchKey *a, const LionSearchKey *b)
  * The rows rows[0 .. n) of one key, whose entry the writer found on a leaf it
  * took without a descent (lion_dir_find_on_leaf()) and holds EXCLUSIVE: as
  * many as one hold takes - a CHAIN entry's up to LION_APPLY_HOLD, an INLINE
- * entry's one - or none, with nothing written, when the INLINE entry would
- * have to grow past what the leaf has room for (lion_insert_known()).
+ * entry's as many as its payload holds under the limit - or none, with
+ * nothing written, when the INLINE entry would spill or grow past what the
+ * leaf has room for (lion_insert_known()).
  */
 static int
 lion_insert_apply_known(Relation index, Relation heaprel, LionState *state,
@@ -2899,16 +3238,23 @@ lion_insert_apply_known(Relation index, Relation heaprel, LionState *state,
 
 	if ((lion_page_entry(BufferGetPage(leafbuf), entryoff)->flags &
 		 LION_ENTRY_INLINE) != 0)
-		return lion_insert_known(index, heaprel, state, leafbuf, entryoff,
-								 lion_code_ckey(rows[0].code),
-								 lion_code_lo(rows[0].code), NULL) ? 1 : 0;
+	{
+		/* a key of one row: the single insert's path, which copies less */
+		if (n == 1)
+			return lion_insert_known(index, heaprel, state, leafbuf, entryoff,
+									 lion_code_ckey(rows[0].code),
+									 lion_code_lo(rows[0].code), NULL) ? 1 : 0;
+		lion_writer_check(index, leafbuf, entryoff, true);
+		return lion_insert_inline_rows(index, heaprel, state, leafbuf,
+									   entryoff, rows,
+									   Min(n, LION_APPLY_HOLD), true);
+	}
 
 	lion_writer_check(index, leafbuf, entryoff, true);
 	stop = Min(n, LION_APPLY_HOLD);
-	for (i = 0; i < stop; i++)
-		lion_insert_chain(index, heaprel, leafbuf, entryoff,
-						  lion_code_ckey(rows[i].code),
-						  lion_code_lo(rows[i].code), NULL);
+	for (i = 0; i < stop;)
+		i += lion_insert_chain_rows(index, heaprel, leafbuf, entryoff,
+									&rows[i], stop - i);
 	return stop;
 }
 
@@ -2916,12 +3262,15 @@ lion_insert_apply_known(Relation index, Relation heaprel, LionState *state,
  * Write a batch of buffered rows (lion_defer.c), reordering rows[] in place.
  *
  * Each key's rows are what lion_insert_one() would do for them one at a
- * time, with the descents shared: a CHAIN entry - the posting set of a key of
- * many rows - takes up to LION_APPLY_HOLD of them under one hold of its leaf,
- * the entry rewritten in place at its size by each (lion_insert_chain()), so
- * its offset stays good.  A new entry, or an INLINE one, takes one row per
- * descent, as either may move the entry; an INLINE entry that spills becomes
- * a CHAIN one and takes the rest in holds.  The keys go in directory order,
+ * time, with the descents and the records shared: a CHAIN entry - the
+ * posting set of a key of many rows - takes up to LION_APPLY_HOLD of them
+ * under one hold of its leaf, the entry rewritten in place at its size, so
+ * its offset stays good, and the rows one container takes in place go in in
+ * one record (lion_insert_chain_rows()).  A new entry, or an INLINE one,
+ * takes as many as its payload holds under the limit in one rewrite of the
+ * entry, which may move it (lion_insert_new_entry_rows(),
+ * lion_insert_inline_rows()); an INLINE entry that spills becomes a CHAIN one
+ * and takes the rest in holds.  The keys go in directory order,
  * their rows in TID order.
  *
  * The rows are untouched but for their order, so a write that fails can be
@@ -3057,30 +3406,37 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 			lion_writer_check(index, leafbuf, entryoff, found);
 
 			if (!found)
-			{
-				lion_insert_new_entry(index, heaprel, state, &leafbuf,
-									  entryoff, movedright, grows[i].key, flag,
-									  grows[i].hash,
-									  lion_code_ckey(grows[i].code),
-									  lion_code_lo(grows[i].code), NULL);
-				i++;
-			}
+				i += lion_insert_new_entry_rows(index, heaprel, state,
+												&leafbuf, entryoff, movedright,
+												&grows[i],
+												Min(end - i, LION_APPLY_HOLD));
 			else if ((lion_page_entry(BufferGetPage(leafbuf),
 									  entryoff)->flags & LION_ENTRY_INLINE) != 0)
 			{
-				lion_insert_inline(index, heaprel, state, leafbuf, entryoff,
-								   lion_code_ckey(grows[i].code),
-								   lion_code_lo(grows[i].code), NULL);
-				i++;
+				/* a key of one row goes the single insert's way, below */
+				int			n = (end - i == 1) ? 0 :
+					lion_insert_inline_rows(index, heaprel, state, leafbuf,
+											entryoff, &grows[i],
+											Min(end - i, LION_APPLY_HOLD),
+											false);
+
+				if (n == 0)
+				{
+					/* its only row, or a first row that spills it */
+					lion_insert_inline(index, heaprel, state, leafbuf, entryoff,
+									   lion_code_ckey(grows[i].code),
+									   lion_code_lo(grows[i].code), NULL);
+					n = 1;
+				}
+				i += n;
 			}
 			else
 			{
 				int			stop = Min(end, i + LION_APPLY_HOLD);
 
-				for (; i < stop; i++)
-					lion_insert_chain(index, heaprel, leafbuf, entryoff,
-									  lion_code_ckey(grows[i].code),
-									  lion_code_lo(grows[i].code), NULL);
+				while (i < stop)
+					i += lion_insert_chain_rows(index, heaprel, leafbuf,
+												entryoff, &grows[i], stop - i);
 			}
 
 			lion_dir_note_leaf(&last, leafbuf);
