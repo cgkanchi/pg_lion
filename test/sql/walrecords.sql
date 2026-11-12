@@ -258,14 +258,17 @@ SELECT lion_index_verify('lion_wu_k', true);
  * blocks every record keeps to; seven and the leaf with the resource
  * manager.  So a row's 32 slices write some eleven records, or five, not 32.
  * Where they are INLINE entries that grow within their slack, the row's
- * slices on one leaf are one record of that leaf alone.
+ * slices on one leaf are one record of that leaf alone.  This is the path
+ * of a row at a time, so the statement is not batched; the batch below is.
  */
 CREATE TABLE lion_wsl (id int, v int4);
 INSERT INTO lion_wsl SELECT i, -1 FROM generate_series(1, 20000) i;
 CREATE INDEX lion_wsl_v ON lion_wsl USING lion (v) WITH (slices = on, inline_limit = 64);
 CREATE INDEX lion_wsl_w ON lion_wsl USING lion (v) WITH (slices = on);
 SELECT pg_current_wal_lsn() AS lsn12 \gset
+SET pg_lion.batch_inserts = off;
 INSERT INTO lion_wsl SELECT i, -1 FROM generate_series(20001, 20200) i;
+RESET pg_lion.batch_inserts;
 SELECT pg_switch_wal() IS NOT NULL AS wal_switched_seven_times;
 SELECT pg_current_wal_lsn() AS lsn13 \gset
 
@@ -286,6 +289,21 @@ SELECT max(nblocks) FILTER (WHERE chain) AS chain_most_blocks,
 		   AS max_blocks) m;
 SELECT lion_index_verify('lion_wsl_v', true);
 SELECT lion_index_verify('lion_wsl_w', true);
+
+/*
+ * The same 200 rows as one statement's batch (DESIGN.md §55; PostgreSQL 17
+ * and later): each slice's rows go in together, a record to a container, so
+ * the 32 slices write fewer records than there are rows.
+ */
+SELECT pg_current_wal_lsn() AS lsn14 \gset
+INSERT INTO lion_wsl SELECT i, -1 FROM generate_series(20201, 20400) i;
+SELECT pg_switch_wal() IS NOT NULL AS wal_switched_eight_times;
+SELECT pg_current_wal_lsn() AS lsn15 \gset
+SELECT current_setting('server_version_num')::int < 170000 OR
+	   count(DISTINCT start_lsn) < 200 AS batched_fewer_records_than_rows
+  FROM pg_get_wal_block_info(:'lsn14', :'lsn15', false)
+ WHERE relfilenode = pg_relation_filenode('lion_wsl_v');
+SELECT lion_index_verify('lion_wsl_v', true);
 
 DROP TABLE lion_wr, lion_wd, lion_wi, lion_wl, lion_ws, lion_wu, lion_wsl;
 DROP EXTENSION pg_walinspect;

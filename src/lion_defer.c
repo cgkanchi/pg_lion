@@ -46,8 +46,8 @@
  *	  under this row's key;
  *	- for the first row of a statement, so that a one-row statement costs
  *	  what it did;
- *	- for a column with stored positions, summaries or bit slices, whose
- *	  inserts write more than the key's entry;
+ *	- for a column with stored positions or summaries, whose inserts write
+ *	  more than the key's entry and its slices;
  *	- in the rest of the transaction that loads the library, when it is not
  *	  preloaded (lion_defer_init()).
  *
@@ -288,7 +288,8 @@ lion_defer_get(Relation index, Relation heap)
 
 /*
  * Buffer one (key, TID) pair of column col (0-based), whose state is state:
- * key as lion_key_prepare() made it, for flag 0, or a reserved entry's flag.
+ * key as lion_key_prepare() made it, for flag 0; or a reserved entry's flag;
+ * or LION_ENTRY_SLICE, with the slice's position as key.
  */
 void
 lion_defer_add(LionDefer *d, Relation index, Relation heap, LionState *state,
@@ -335,6 +336,8 @@ lion_defer_add(LionDefer *d, Relation index, Relation heap, LionState *state,
 			bytes += MAXALIGN(len);
 		}
 	}
+	else if (flag == LION_ENTRY_SLICE)
+		hash = 0;				/* key is the position */
 	else
 		key = (Datum) 0;
 

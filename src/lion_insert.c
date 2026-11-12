@@ -659,6 +659,26 @@ lion_insert_place_new(Relation index, Relation heaprel, LionState *state,
 }
 
 /*
+ * A new INLINE entry for the key of the batch row `row` (lion_insert_apply()),
+ * with the payload given: a key's entry, a reserved one, or a bit slice.
+ */
+static LionEntryTuple *
+lion_insert_row_entry(LionState *state, const LionInsertRow *row,
+					  const char *payload, Size paylen, Size *size)
+{
+	if (row->flag == LION_ENTRY_SLICE)
+		return lion_make_slice_entry((AttrNumber) state->attno,
+									 (int) DatumGetInt32(row->key),
+									 LION_ENTRY_INLINE, payload, paylen, size);
+	if (row->flag != 0)
+		return lion_make_reserved_entry((AttrNumber) state->attno, row->flag,
+										LION_ENTRY_INLINE, payload, paylen,
+										size);
+	return lion_make_entry(state, row->key, LION_ENTRY_INLINE, payload, paylen,
+						   size);
+}
+
+/*
  * lion_insert_new_entry() for the rows rows[0 .. n) of one key of a batch
  * (lion_insert_apply()), n at least one: the new INLINE entry takes as many
  * of them as its payload holds under the limit, all in its one record.
@@ -682,11 +702,7 @@ lion_insert_new_entry_rows(Relation index, Relation heaprel, LionState *state,
 
 	paylen = lion_put_singleton(first, lion_code_ckey(rows[0].code),
 								lion_code_lo(rows[0].code));
-	entry = (rows[0].flag != 0) ?
-		lion_make_reserved_entry((AttrNumber) state->attno, rows[0].flag,
-								 LION_ENTRY_INLINE, first, paylen, &size) :
-		lion_make_entry(state, rows[0].key, LION_ENTRY_INLINE, first, paylen,
-						&size);
+	entry = lion_insert_row_entry(state, &rows[0], first, paylen, &size);
 
 	limit = lion_inline_max(LionEntryPayloadOffset(entry),
 							(Size) state->ix->meta.inline_limit);
@@ -721,12 +737,7 @@ lion_insert_new_entry_rows(Relation index, Relation heaprel, LionState *state,
 			LionEntryTuple *exact;
 			Size		payoff;
 
-			exact = (rows[0].flag != 0) ?
-				lion_make_reserved_entry((AttrNumber) state->attno,
-										 rows[0].flag, LION_ENTRY_INLINE, cur,
-										 paylen, &size) :
-				lion_make_entry(state, rows[0].key, LION_ENTRY_INLINE, cur,
-								paylen, &size);
+			exact = lion_insert_row_entry(state, &rows[0], cur, paylen, &size);
 			pfree(entry);
 			entry = exact;
 
@@ -2941,6 +2952,41 @@ lion_slice_batch_write(Relation index, Buffer leafbuf, LionSliceBatch *b)
 }
 
 /*
+ * The slices a sliced column's row with value key goes into, in ascending
+ * position: the bits its encoding has set (DESIGN.md §51), then the existence
+ * slice.  Returns how many, LION_SLICE_MAX_POS at most.
+ */
+static int
+lion_slice_positions(LionState *state, Datum key, int *pos)
+{
+	int			nbits = state->slicebits;
+	int			npos = 0;
+	int64		v;
+	uint64		enc;
+
+	switch (nbits)
+	{
+		case 16:
+			v = DatumGetInt16(key);
+			break;
+		case 32:
+			v = DatumGetInt32(key);
+			break;
+		default:
+			v = DatumGetInt64(key);
+			break;
+	}
+	enc = lion_slice_encode(v, nbits);
+	while (enc != 0)
+	{
+		pos[npos++] = pg_rightmost_one_pos64(enc);
+		enc &= enc - 1;
+	}
+	pos[npos++] = LION_SLICE_EXISTS;
+	return npos;
+}
+
+/*
  * A row of a sliced column: into the slice of every bit its value's encoding
  * has set, in ascending position, and then into the existence slice, AFTER
  * the row went under its key.  Readers see no half-done row: its transaction
@@ -2976,35 +3022,12 @@ static void
 lion_slice_insert(Relation index, Relation heaprel, LionState *state,
 				  Datum key, uint32 ckey, uint16 lo)
 {
-	int			nbits = state->slicebits;
 	int			pos[LION_SLICE_MAX_POS];
-	int			npos = 0;
-	int64		v;
-	uint64		enc;
+	int			npos = lion_slice_positions(state, key, pos);
 	Buffer		leafbuf = InvalidBuffer;
 	OffsetNumber entryoff = InvalidOffsetNumber;
 	LionSliceBatch batch;
 	int			i;
-
-	switch (nbits)
-	{
-		case 16:
-			v = DatumGetInt16(key);
-			break;
-		case 32:
-			v = DatumGetInt32(key);
-			break;
-		default:
-			v = DatumGetInt64(key);
-			break;
-	}
-	enc = lion_slice_encode(v, nbits);
-	while (enc != 0)
-	{
-		pos[npos++] = pg_rightmost_one_pos64(enc);
-		enc &= enc - 1;
-	}
-	pos[npos++] = LION_SLICE_EXISTS;
 
 	batch.ckey = ckey;
 	batch.lo = lo;
@@ -3098,6 +3121,8 @@ lion_slice_insert(Relation index, Relation heaprel, LionState *state,
 static inline int
 lion_insert_row_kind(const LionInsertRow *row)
 {
+	if (row->flag == LION_ENTRY_SLICE)
+		return LION_KIND_SLICE;
 	return (row->flag != 0) ? lion_reserved_kind(row->flag) : LION_KIND_VALUE;
 }
 
@@ -3120,6 +3145,8 @@ lion_insert_row_keycmp(LionIndexState *ix, const LionInsertRow *a,
 		return (lion_insert_row_kind(a) < lion_insert_row_kind(b)) ? -1 : 1;
 	if (a->hash != b->hash)
 		return (a->hash < b->hash) ? -1 : 1;
+	if (a->flag == LION_ENTRY_SLICE)	/* by position, as the directory */
+		return (a->key < b->key) ? -1 : (a->key > b->key) ? 1 : 0;
 	if (a->flag != 0)
 		return 0;
 
@@ -3152,6 +3179,16 @@ lion_insert_row_cmp(const void *pa, const void *pb, void *arg)
 	if (c != 0)
 		return c;
 	return (a->code < b->code) ? -1 : (a->code > b->code) ? 1 : 0;
+}
+
+/* The TIDs of two batch rows, for a slice's rows that came out of order */
+static int
+lion_insert_code_cmp(const void *pa, const void *pb)
+{
+	uint64		a = ((const LionInsertRow *) pa)->code;
+	uint64		b = ((const LionInsertRow *) pb)->code;
+
+	return (a < b) ? -1 : (a > b) ? 1 : 0;
 }
 
 /* One key's rows of a batch: rows[start .. start + n) */
@@ -3203,15 +3240,18 @@ lion_insert_group_cmp(const void *pa, const void *pb, void *arg)
  * of an earlier hold of the same batch, so it sorts at or before b (the
  * groups are in the directory's order): the question is only whether the two
  * prefixes tie - the same column and kind, and for a value the same position
- * under proc 4 in an ordered column, the same hash in any other.  Only then
- * is the leaf that held a's entry one whose range begins before every entry
- * of b's prefix run, which lion_dir_find_from() needs.
+ * under proc 4 in an ordered column, the same hash in any other; for a bit
+ * slice the same slice.  Only when they do not is the leaf that held a's
+ * entry one whose range begins before every entry of b's prefix run, which
+ * lion_dir_find_from() needs.
  */
 static bool
 lion_insert_prefix_before(const LionSearchKey *a, const LionSearchKey *b)
 {
 	if (a->attno != b->attno || a->kind != b->kind)
 		return true;
+	if (a->kind == LION_KIND_SLICE)
+		return *(const uint8 *) a->raw != *(const uint8 *) b->raw;
 	if (a->kind != LION_KIND_VALUE)
 		return false;
 	if (a->cmpproc != NULL)
@@ -3287,10 +3327,15 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 	MemoryContext holdcxt;
 	MemoryContext oldcxt;
 	int			ngroups = 0;
+	int			nother;
+	int			nslice = 0;
+	int			nslicebuckets = 0;
+	int		   *sliceat = NULL;
 	int			g;
 	int			i;
 	LionLastLeaf last;
 	LionSearchKey lastsk;
+	uint8		lastposbyte;	/* lastsk's, for a slice */
 
 	if (nrows == 0)
 		return;
@@ -3309,11 +3354,59 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 	last.blk = InvalidBlockNumber;
 	last.cxt = cxt;
 
-	/* the keys' rows together, in TID order, by a cheap comparison ... */
-	qsort_arg(rows, nrows, sizeof(LionInsertRow), lion_insert_row_cmp, ix);
+	/*
+	 * A sliced column's rows go into a dozen or more bit slices each
+	 * (DESIGN.md §51), so most of a batch of one can be slice rows: they go
+	 * to the end, each slice's together, by a counting pass rather than the
+	 * sort.  A slice's rows are its column's, which come in the order the
+	 * heap took them - TID order nearly always, which is checked.
+	 */
+	nother = nrows;
+	for (i = 0; i < nrows; i++)
+		if (rows[i].flag == LION_ENTRY_SLICE)
+			nslice++;
+	if (nslice > 0)
+	{
+		int			nbuckets = ix->ncolumns * LION_SLICE_MAX_POS;
+		int		   *fill = (int *) palloc0(sizeof(int) * (nbuckets + 1));
+		LionInsertRow *slices = (LionInsertRow *)
+			palloc(sizeof(LionInsertRow) * nslice);
+		int			b;
+
+		/* a slice's bucket: its column's, then its position's index */
+#define LION_SLICE_BUCKET(r) \
+	((r)->col * LION_SLICE_MAX_POS + \
+	 (DatumGetInt32((r)->key) == LION_SLICE_EXISTS ? LION_SLICE_MAX_BITS : \
+	  DatumGetInt32((r)->key)))
+
+		sliceat = (int *) palloc(sizeof(int) * (nbuckets + 1));
+		for (i = 0; i < nrows; i++)
+			if (rows[i].flag == LION_ENTRY_SLICE)
+				fill[LION_SLICE_BUCKET(&rows[i]) + 1]++;
+		for (b = 0; b < nbuckets; b++)
+			fill[b + 1] += fill[b];
+		memcpy(sliceat, fill, sizeof(int) * (nbuckets + 1));
+		nother = 0;
+		for (i = 0; i < nrows; i++)
+		{
+			if (rows[i].flag == LION_ENTRY_SLICE)
+				slices[fill[LION_SLICE_BUCKET(&rows[i])]++] = rows[i];
+			else if (nother++ != i)
+				rows[nother - 1] = rows[i];
+		}
+#undef LION_SLICE_BUCKET
+		Assert(nother + nslice == nrows);
+		memcpy(&rows[nother], slices, sizeof(LionInsertRow) * nslice);
+		pfree(slices);
+		pfree(fill);
+		nslicebuckets = nbuckets;
+	}
+
+	/* the other keys' rows together, in TID order, by a cheap comparison ... */
+	qsort_arg(rows, nother, sizeof(LionInsertRow), lion_insert_row_cmp, ix);
 
 	groups = (LionInsertGroup *) palloc(sizeof(LionInsertGroup) * nrows);
-	for (i = 0; i < nrows; i++)
+	for (i = 0; i < nother; i++)
 	{
 		if (i == 0 || lion_insert_row_keycmp(ix, &rows[i - 1], &rows[i]) != 0)
 		{
@@ -3321,6 +3414,22 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 			groups[ngroups++].n = 0;
 		}
 		groups[ngroups - 1].n++;
+	}
+	for (i = 0; i < nslicebuckets; i++)
+	{
+		LionInsertRow *srows = &rows[nother + sliceat[i]];
+		int			n = sliceat[i + 1] - sliceat[i];
+		int			j;
+
+		if (n == 0)
+			continue;
+		for (j = 1; j < n; j++)
+			if (srows[j - 1].code > srows[j].code)
+				break;
+		if (j < n)
+			qsort(srows, n, sizeof(LionInsertRow), lion_insert_code_cmp);
+		groups[ngroups].start = nother + sliceat[i];
+		groups[ngroups++].n = n;
 	}
 
 	/* ... and the keys in the directory's order, by its own */
@@ -3338,6 +3447,7 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 		LionState  *state = &ix->cols[grows[0].col];
 		uint16		flag = grows[0].flag;
 		int			end = groups[g].n;
+		uint8		posbyte;	/* a slice's search key points at it */
 
 		i = 0;
 		while (i < end)
@@ -3350,7 +3460,11 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 			BlockNumber hint;
 			int			r = LION_FIND_NOT_HERE;
 
-			if (flag != 0)
+			if (flag == LION_ENTRY_SLICE)
+				lion_search_key_slice(state, &sk,
+									  (int) DatumGetInt32(grows[i].key),
+									  &posbyte);
+			else if (flag != 0)
 				lion_search_key_init(state, &sk, lion_reserved_kind(flag),
 									 (Datum) 0, grows[i].hash);
 			else
@@ -3441,6 +3555,11 @@ lion_insert_apply(Relation index, Relation heaprel, LionInsertRow *rows,
 
 			lion_dir_note_leaf(&last, leafbuf);
 			lastsk = sk;
+			if (sk.kind == LION_KIND_SLICE)
+			{
+				lastposbyte = posbyte;
+				lastsk.raw = (const char *) &lastposbyte;
+			}
 			lion_leaf_hint_set(ix, &sk, last.blk);
 			UnlockReleaseBuffer(leafbuf);
 			MemoryContextReset(holdcxt);
@@ -3474,7 +3593,7 @@ typedef struct LionInsertCache
 static inline bool
 lion_column_batched(bool batch, LionState *state)
 {
-	return batch && !state->positions && !state->summarized && !state->sliced;
+	return batch && !state->positions && !state->summarized;
 }
 
 /*
@@ -3572,9 +3691,9 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		Datum		key;
 
 		/*
-		 * Buffered, or written now: a column whose inserts write more than
-		 * its key's entry - positions, a summary, slices - is always written
-		 * now.
+		 * Buffered, or written now: a column with stored positions or
+		 * summaries, whose inserts write more than its key's entry and its
+		 * slices, is always written now.
 		 */
 		if (lion_column_batched(batch, state) && defer == NULL)
 			defer = lion_defer_get(index, heapRel);
@@ -3647,9 +3766,29 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 			key = lion_key_prepare(state, values[c], heapRel, ht_ctid);
 
 			if (lion_column_batched(batch, state))
+			{
 				lion_defer_add(defer, index, heapRel, state, c, key, 0, code);
-			else
-				lion_insert_one(index, heapRel, state, key, 0, ckey, lo, NULL);
+
+				/*
+				 * ... and its bit slices (DESIGN.md §51), a pair a slice,
+				 * which the batch writes after the column's keys, as the
+				 * row's own steps below go.
+				 */
+				if (state->sliced)
+				{
+					int			pos[LION_SLICE_MAX_POS];
+					int			npos = lion_slice_positions(state, key, pos);
+					int			i;
+
+					for (i = 0; i < npos; i++)
+						lion_defer_add(defer, index, heapRel, state, c,
+									   Int32GetDatum(pos[i]),
+									   LION_ENTRY_SLICE, code);
+				}
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+			lion_insert_one(index, heapRel, state, key, 0, ckey, lo, NULL);
 
 			/*
 			 * ... and in its bucket's summary (DESIGN.md §32), which is a
