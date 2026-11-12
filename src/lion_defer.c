@@ -46,8 +46,8 @@
  *	  under this row's key;
  *	- for the first row of a statement, so that a one-row statement costs
  *	  what it did;
- *	- for a column with stored positions or summaries, whose inserts write
- *	  more than the key's entry and its slices;
+ *	- for a column with summaries, whose inserts write more than the key's
+ *	  entry and its slices;
  *	- in the rest of the transaction that loads the library, when it is not
  *	  preloaded (lion_defer_init()).
  *
@@ -286,14 +286,38 @@ lion_defer_get(Relation index, Relation heap)
 	return d;
 }
 
+/* The bytes of a by-reference key of the column state, as copied below */
+static inline Size
+lion_defer_key_len(const LionState *state, Datum key)
+{
+	return (state->typlen == -1) ? VARSIZE_ANY(DatumGetPointer(key)) :
+		(state->typlen == -2) ? strlen(DatumGetCString(key)) + 1 :
+		(Size) state->typlen;
+}
+
+/*
+ * The positions lion_defer_add() kept with a row of a column that stores
+ * them: after the key's copy, at the next MAXALIGN boundary.
+ */
+const LionDeferPos *
+lion_defer_row_pos(const LionState *state, const LionInsertRow *row)
+{
+	Assert(state->positions && row->flag == 0 && !state->typbyval);
+	return (const LionDeferPos *)
+		((const char *) DatumGetPointer(row->key) +
+		 MAXALIGN(lion_defer_key_len(state, row->key)));
+}
+
 /*
  * Buffer one (key, TID) pair of column col (0-based), whose state is state:
- * key as lion_key_prepare() made it, for flag 0; or a reserved entry's flag;
+ * key as lion_key_prepare() made it, for flag 0, with the row's positions pm
+ * for a column that stores them (NULL otherwise); or a reserved entry's flag;
  * or LION_ENTRY_SLICE, with the slice's position as key.
  */
 void
 lion_defer_add(LionDefer *d, Relation index, Relation heap, LionState *state,
-			   int col, Datum key, uint16 flag, uint64 code)
+			   int col, Datum key, uint16 flag, uint64 code,
+			   const LionPosMember *pm)
 {
 	LionInsertRow *row;
 	uint32		hash = LION_NULLKEY_HASH;
@@ -325,16 +349,29 @@ lion_defer_add(LionDefer *d, Relation index, Relation heap, LionState *state,
 		hash = lion_hash_key(state, key);
 		if (!state->typbyval)
 		{
-			Size		len = (state->typlen == -1) ?
-				VARSIZE_ANY(DatumGetPointer(key)) :
-				(state->typlen == -2) ?
-				strlen(DatumGetCString(key)) + 1 : (Size) state->typlen;
-			char	   *copy = MemoryContextAlloc(d->keycxt, len);
+			Size		len = lion_defer_key_len(state, key);
+			Size		poslen = 0;
+			char	   *copy;
 
+			Assert((pm != NULL) == state->positions);
+			if (pm != NULL)
+				poslen = offsetof(LionDeferPos, pos) +
+					sizeof(uint16) * pm->npos;
+			copy = MemoryContextAlloc(d->keycxt, MAXALIGN(len) + poslen);
 			memcpy(copy, DatumGetPointer(key), len);
+			if (pm != NULL)
+			{
+				LionDeferPos *dp = (LionDeferPos *) (copy + MAXALIGN(len));
+
+				dp->npos = pm->npos;
+				dp->dl = pm->dl;
+				memcpy(dp->pos, pm->pos, sizeof(uint16) * pm->npos);
+			}
 			key = PointerGetDatum(copy);
-			bytes += MAXALIGN(len);
+			bytes += MAXALIGN(len) + MAXALIGN(poslen);
 		}
+		else
+			Assert(pm == NULL);
 	}
 	else if (flag == LION_ENTRY_SLICE)
 		hash = 0;				/* key is the position */

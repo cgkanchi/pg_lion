@@ -332,6 +332,94 @@ lion_postree_put(Relation index, Relation heaprel, uint32 hash,
 }
 
 /*
+ * lion_postree_put() for the members ms[0 .. n) of one key, codes ascending -
+ * a statement's batch (DESIGN.md §55).  A run of them above every member the
+ * tree holds - rows added to the end of the table, the usual case - goes into
+ * the tree's last chunk in one rewrite of it: the chunk is decoded once, to
+ * find where its last member ends (lion_poschunk_append_tail(), as the build
+ * appends), the run encoded after it up to the size at which a chunk is split,
+ * and the chunk written in one record.  A member that is not above the tree's
+ * last, or that the chunk has no room for, goes in through
+ * lion_postree_put(), which places, replaces and splits as for a single row.
+ * The caller holds the key's directory leaf EXCLUSIVE.
+ */
+void
+lion_postree_put_rows(Relation index, Relation heaprel, uint32 hash,
+					  BlockNumber root, LionPosMember *const *ms, int n)
+{
+	LionContainer *work = NULL;
+	int			i = 0;
+
+	while (i < n)
+	{
+		uint32		block = lion_pos_block(ms[i]->code);
+		LionTreeRef tree;
+		LionPosTail tail;
+		Buffer		buf;
+		Page		page;
+		OffsetNumber last;
+		LionContainer *c;
+		int			taken = 0;
+
+		CHECK_FOR_INTERRUPTS();
+		buf = lion_posting_search_before(index, heaprel, hash, root, block,
+										 BUFFER_LOCK_EXCLUSIVE, true);
+		if (!BufferIsValid(buf))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": the position tree at %u is gone",
+							RelationGetRelationName(index), root)));
+		lion_postree_check_leaf(index, buf, root);
+		page = BufferGetPage(buf);
+		last = PageGetMaxOffsetNumber(page);
+
+		/*
+		 * The tree's last chunk is the target of every member above its last
+		 * member, whose block is at or past its header: no chunk follows it.
+		 */
+		if (LionPageIsRightmost(page) && last >= FirstOffsetNumber)
+		{
+			c = lion_page_poschunk_fetch(index, page,
+										 BufferGetBlockNumber(buf), last);
+			if (c->ckey <= block)
+			{
+				if (work == NULL)
+					work = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+				memcpy(work, c, lion_poschunk_size(c));
+				tail.valid = false;
+				while (i + taken < n &&
+					   lion_poschunk_append_tail(work,
+												 LION_POS_HDRSZ + LION_POS_TREE_BYTES,
+												 ms[i + taken], &tail))
+					taken++;
+			}
+		}
+
+		if (taken > 0)
+		{
+			tree.hash = hash;
+			tree.root = root;
+			tree.kind = LION_PAGE_POSITIONS;
+			tree.entrybuf = InvalidBuffer;
+			tree.entryoff = InvalidOffsetNumber;
+			tree.entry = NULL;
+			lion_tree_put_items_locked(index, heaprel, buf, &tree, last, true,
+									   &work, 1, true);
+			UnlockReleaseBuffer(buf);
+			i += taken;
+		}
+		else
+		{
+			UnlockReleaseBuffer(buf);
+			(void) lion_postree_put(index, heaprel, hash, root, ms[i]);
+			i++;
+		}
+	}
+	if (work != NULL)
+		pfree(work);
+}
+
+/*
  * Find the member of the given code in the position tree at root, copying it
  * into *m.  A reader: SHARE locks, one page at a time.  False when there is
  * none, or when the tree is gone (the key was dropped meanwhile).

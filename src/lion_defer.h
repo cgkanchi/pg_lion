@@ -37,6 +37,18 @@ typedef struct LionInsertRow
 	uint16		col;			/* 0-based key column */
 } LionInsertRow;
 
+/*
+ * The positions of a row of a column that stores them (DESIGN.md §17),
+ * kept after the key's copy in the buffer (lion_defer_row_pos()): what a
+ * LionPosMember holds but its code, which is the row's.
+ */
+typedef struct LionDeferPos
+{
+	uint16		npos;
+	uint16		dl;
+	uint16		pos[FLEXIBLE_ARRAY_MEMBER];
+} LionDeferPos;
+
 typedef struct LionDefer LionDefer;
 
 extern PGDLLIMPORT bool lion_batch_inserts;	/* pg_lion.batch_inserts */
@@ -46,7 +58,10 @@ extern bool lion_defer_allowed(IndexInfo *indexInfo);
 extern LionDefer *lion_defer_get(Relation index, Relation heap);
 extern void lion_defer_add(LionDefer *d, Relation index, Relation heap,
 						   LionState *state, int col, Datum key,
-						   uint16 flag, uint64 code);
+						   uint16 flag, uint64 code,
+						   const struct LionPosMember *pm);
+extern const LionDeferPos *lion_defer_row_pos(const LionState *state,
+											  const LionInsertRow *row);
 extern void lion_defer_flush_index(Relation index);
 extern void lion_defer_flush_heap(Oid heapoid);
 extern void lion_defer_flush_all(void);
