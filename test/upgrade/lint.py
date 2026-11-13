@@ -6,9 +6,10 @@ Usage: test/upgrade/lint.py [BASE]
 For each extension the Makefile builds (DESIGN.md section 23, "Extension
 versions"):
 
-  - default_version is X.Y.Z or X.Y.Z-devN, and META.json's version is that
-    without the -devN, as are the extension's version under "provides", whose
-    "file" is the install script;
+  - default_version is X.Y.Z or X.Y.Z-devN, and the extension's version under
+    META.json's "provides" is that without the -devN, whose "file" is the
+    install script; META.json's own version, the distribution's, is the
+    newest of the extensions' (they are versioned separately);
   - the install script of default_version is the only install script;
   - every upgrade script is named <ext>--<from>--<to>.sql, and a chain of them
     leads from every version that has one to default_version.
@@ -113,6 +114,7 @@ def main():
         meta = json.load(f)
     files = os.listdir(ROOT)
     floor = release_tuple(read_floor())
+    releases = []
     if base:
         base_files = subprocess.run(['git', 'ls-tree', '--name-only', base], cwd=ROOT,
                                     capture_output=True, text=True, check=True).stdout.split()
@@ -125,8 +127,7 @@ def main():
             fail('%s.control: default_version %r is not X.Y.Z or X.Y.Z-devN' % (ext, cur))
             continue
         release = m.group(1)
-        if meta.get('version') != release:
-            fail('META.json: version %r, but %s.control says %s' % (meta.get('version'), ext, cur))
+        releases.append(release)
         prov = meta.get('provides', {}).get(ext)
         if prov is None:
             fail('META.json: %s is not under "provides"' % ext)
@@ -185,6 +186,10 @@ def main():
                 if f.read() != git_show(base, name):
                     fail('%s changed: an upgrade script, once on %s, is never changed; '
                          'add a new version instead' % (name, base))
+
+    newest = max(releases, key=release_tuple) if releases else None
+    if newest is not None and meta.get('version') != newest:
+        fail('META.json: version %r, but the newest extension version is %s' % (meta.get('version'), newest))
 
     for e in errors:
         print('lint: ' + e, file=sys.stderr)

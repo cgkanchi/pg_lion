@@ -20,6 +20,10 @@ and these functions are for testing, diagnostics and the occasional direct count
     lion_index_verify(idx [, heapallindexed])       structural check, optionally against the heap
     lion_index_wal_mode(idx)                        'generic' or 'rmgr' (DESIGN.md §25)
     lion_index_posting_root(idx, key)               a key's posting-set head block (the root, or the first leaf), for tests
+    lion_day_first(d), lion_day_last(d)             the first and last timestamp whose date is d
+    lion_day_first(unit, c), lion_day_last(unit, c) ... whose date_trunc(unit, ...) is c or later, c or earlier
+    lion_day_lo(d, op, piece), lion_day_hi(...)     a timestamptz day range's pieces (pg_lion.enable_date_ranges)
+    lion_day_lo(unit, c, op, piece), lion_day_hi(...)  ... and a date_trunc() one's
 
 The counts answer exactly what the equivalent `SELECT count(*)` answers under the same snapshot,
 and take the key as `col = key` takes it: the same operator, and the key converted as the query
@@ -1201,15 +1205,22 @@ working around a bad choice:
   key the visibility map vouches for, in one pass of the bit-plane kernel (`lion_planes_count_strided()`,
   DESIGN.md §50, §52). Off, each slice's container is ANDed with the `WHERE` and counted on its own;
   the answers are the same.
-- `pg_lion.enable_date_ranges`: plan `ts::date <op> constant` and `date_trunc(unit, ts) <op>
-  constant`, with `<op>` one of `=`, `<`, `<=`, `>`, `>=` and the constant on either side, over a
-  `timestamp` column with a lion index, as the range of `ts` they are (`ts::date = '2026-03-05'` is
-  `ts >= '2026-03-05' AND ts < '2026-03-06'`), which every index of `ts` and partition pruning
-  answer (DESIGN.md §54). EXPLAIN shows the range. Off, the clause is left as written. Also left as
-  written: `timestamptz` columns; a constant that is infinite or within 2000 years of either end of
-  `timestamp`'s range; parameters and stable expressions such as `current_date`; `<>`, IN lists and
-  comparisons across types (`ts::date = timestamp '...'`); `date_trunc()` with a unit that isn't a
-  constant; and a clause some index has as an expression key.
+- `pg_lion.enable_date_ranges`: plan `ts::date <op> value` and `date_trunc(unit, ts) <op> value`,
+  with `<op>` one of `=`, `<`, `<=`, `>`, `>=` and the value on either side, over a `timestamp` or
+  `timestamptz` column with a lion index, as the ranges of `ts` they are (`ts::date = '2026-03-05'`
+  is `ts >= '2026-03-05' AND ts < '2026-03-06'`), which every index of `ts` and partition pruning
+  answer (DESIGN.md §54). The value may be a constant or anything the query knows when it starts:
+  a parameter, `current_date`, `now()`, a subquery's value. Over a `timestamp` column and a
+  constant, EXPLAIN shows the range; otherwise its bounds are calls of the `lion_day_*()`
+  functions below, evaluated once per scan. A `timestamptz` column's day is its date in the
+  session's TimeZone when the query runs, so a plan cached in one zone and run in another gives
+  the second zone's rows, as the clause does; its clause becomes two ranges ORed, the second
+  empty except across a step of the clocks back over midnight. Off, the clause is left as written.
+  Also left as written: `date_trunc()` of a `timestamptz` to less than a day, or with a zone of its
+  own; `<>`, IN lists and comparisons across types (`ts::date = timestamp '...'`); `date_trunc()`
+  with a unit that isn't a constant; a value that depends on the row or is volatile; and a clause
+  some index has as an expression key. A row whose own `date_trunc()` the clause could not compute
+  (a month or more of the first days of 4714 BC, where the clause fails) is placed by the range.
 - `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot
