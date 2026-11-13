@@ -674,7 +674,11 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 									 * entries, §17 "Non-empty arrays" */
 #define LION_CLAUSE_NOTRESERVED	11	/* cardinality(col) > 0 and the like:
 									 * every row outside them */
-#define LION_CLAUSE_MAXKIND		LION_CLAUSE_NOTRESERVED
+#define LION_CLAUSE_NOTIN	12	/* col's key none of a list's, NULL rows
+								 * kept: a NOT EXISTS folded into the count
+								 * (DESIGN.md §27, "The anti join as a
+								 * negated list"); never a query's own */
+#define LION_CLAUSE_MAXKIND		LION_CLAUSE_NOTIN
 
 /*
  * The value of a RESERVED or NOTRESERVED clause: an int4 Const, the reserved
@@ -742,14 +746,15 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * is the complement of the sets it locates, which lion_locate_leaf() returns
  * as they are: `IS NOT NULL` the NULL entry's, `<>` c's entry and the NULL
  * one, `IS DISTINCT FROM c` c's entry alone (the NULL entry for a NULL c),
- * `NOT (multi-key query)` the query's exact sets and the NULL entry, and
- * NOTRESERVED the reserved entries its mask names (§17).  As a leaf of an OR such a clause is a complement arm's (§35, "Complements in
- * an OR").
+ * `NOT (multi-key query)` the query's exact sets and the NULL entry,
+ * NOTRESERVED the reserved entries its mask names (§17), and NOTIN its
+ * list's entries, an IN list's sets.  As a leaf of an OR such a clause is a
+ * complement arm's (§35, "Complements in an OR").
  */
 #define LION_CLAUSE_IS_NEGATED(k) \
 	((k) == LION_CLAUSE_NOTNULL || (k) == LION_CLAUSE_NE || \
 	 (k) == LION_CLAUSE_DISTINCT || (k) == LION_CLAUSE_NOTMULTI || \
-	 (k) == LION_CLAUSE_NOTRESERVED)
+	 (k) == LION_CLAUSE_NOTRESERVED || (k) == LION_CLAUSE_NOTIN)
 
 /*
  * The ORs with a complement arm one query may have (DESIGN.md §35,
@@ -1518,7 +1523,13 @@ typedef struct LionVColScope
  *		lion_plan_custom_path() adds a List of one IntList per aggregate -
  *		its LION_SAGG_* kind and the column's position in the first list -
  *		whose results are LION_TL_SAGG columns
- *	26	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	26	IntList, or empty: the NOT EXISTS folded into NOTIN clauses
+ *		(DESIGN.md §27, "The anti join as a negated list"), whose inner sides
+ *		are the plan's children, one an arm: for each, the clause, the inner
+ *		side's relid - 0 at the PLAN stage - and the key's column, its attnum
+ *		at the PATH stage and its resno in the child's target list at the
+ *		PLAN stage
+ *	27	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -1547,7 +1558,8 @@ typedef struct LionVColScope
 #define LION_PRIV_CELLS		23
 #define LION_PRIV_ANTI		24
 #define LION_PRIV_SLICES	25
-#define LION_PRIV_TLKINDS	26
+#define LION_PRIV_ANTIFOLD	26
+#define LION_PRIV_TLKINDS	27
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -1689,6 +1701,11 @@ typedef struct LionVColScope
  * (DESIGN.md §10, "A test of each key"), which an older build would have
  * read as an unknown kind.
  *
+ * Shape 36 added the ANTIFOLD member (26) in front of the target-list kinds,
+ * and the NOTIN clause kind: a NOT EXISTS folded into the count as a negated
+ * list (DESIGN.md §27, "The anti join as a negated list"), which an older
+ * build would have counted as no clause at all.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1701,8 +1718,8 @@ typedef struct LionVColScope
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424923
-#define LION_PRIV_NMEMBERS	27
+#define LION_PRIV_MAGIC		0x52424924
+#define LION_PRIV_NMEMBERS	28
 
 /*
  * The anti join over a small inner side (LION_PRIV_ANTI): its scan keys at
@@ -3152,6 +3169,19 @@ typedef struct LionCountPriv
 								 * inner side") */
 	LionCountPrivAnti anti;
 
+	/*
+	 * ANTIFOLD (§27, "The anti join as a negated list"): each NOT EXISTS
+	 * folded into a NOTIN clause of the WHERE, its child the arm'th of
+	 * custom_plans - the clause, and the key's column of the child: at the
+	 * PATH stage the inner side's Var (relid and attnum), at the PLAN stage
+	 * its resno in the child's target list (antifoldrelid 0).  Or nantifold
+	 * 0.
+	 */
+	int			nantifold;
+	int			antifoldclause[LION_MAX_ANTI_ARMS];
+	Index		antifoldrelid[LION_MAX_ANTI_ARMS];
+	AttrNumber	antifoldcol[LION_MAX_ANTI_ARMS];
+
 	int			nscol;			/* SLICES (§52), or 0 */
 	LionCountPrivSCol *scol;
 	int			nsagg;			/* PLAN stage only */
@@ -3656,6 +3686,20 @@ typedef struct LionCountScanState
 	 * subtract, or NULL for every other shape.
 	 */
 	struct LionAntiState *anti;
+
+	/*
+	 * The NOT EXISTS folded into NOTIN clauses (DESIGN.md §27, "The anti join
+	 * as a negated list"): nantifold children, the inner sides, each run
+	 * whole at the start of each run and its key's column, antifoldcol[i] of
+	 * its target list, made clause antifoldclause[i]'s list, its NULL keys
+	 * left out (lion_antifold_values()); antifoldkeys counts the keys, for
+	 * EXPLAIN ANALYZE.
+	 */
+	int			nantifold;
+	int			antifoldclause[LION_MAX_ANTI_ARMS];
+	AttrNumber	antifoldcol[LION_MAX_ANTI_ARMS];
+	PlanState  *antifoldps[LION_MAX_ANTI_ARMS];
+	int64		antifoldkeys;
 
 	/*
 	 * The FK-side join grouped by a fact column (DESIGN.md §27, "Grouped by a
@@ -4855,6 +4899,10 @@ extern double lion_residual_pages(PlannerInfo *root, RelOptInfo *toprel,
  */
 #define LION_PARTIAL_TRIES		3
 
+/* lion_plan_fkjoin.c */
+extern Node *lion_keys_costclause(Var *var, Oid opno, Oid collation,
+								  Oid elemtype, double nkeys, Selectivity sel);
+
 /* lion_plan_fkjoin_cost.c */
 extern double lion_fkjoin_fk_ndistinct(PlannerInfo *root, RelOptInfo *rel,
 									   Var *fkvar);
@@ -4981,6 +5029,11 @@ extern void lion_rescan_join_agg(CustomScanState *node);
 extern void lion_join_locate_where(LionCountScanState *st);
 extern void lion_join_filter_values(LionCountScanState *st);
 extern int	lion_join_filter_of(const LionCountScanState *st, int clauseno);
+extern int64 lion_child_key_values(LionCountScanState *st,
+								   LionClauseState *cl, PlanState *ps,
+								   AttrNumber col);
+extern void lion_antifold_values(LionCountScanState *st);
+extern int	lion_antifold_of(const LionCountScanState *st, int clauseno);
 extern void lion_join_switch_reset(LionCountScanState *st);
 extern void lion_join_batch_reset(LionCountScanState *st);
 extern void lion_join_unite_release(LionCountScanState *st);

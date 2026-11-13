@@ -940,6 +940,17 @@ lion_rescan_custom_scan(CustomScanState *node)
 
 	/* the anti join's child, and its run made again (DESIGN.md §27) */
 	lion_anti_rescan(st, node);
+
+	/* ... or the children of one folded into negated lists, run whole again */
+	for (i = 0; i < st->nantifold; i++)
+	{
+		if (st->antifoldps[i] == NULL)
+			continue;
+		if (node->ss.ps.chgParam != NULL)
+			UpdateChangedParamSet(st->antifoldps[i], node->ss.ps.chgParam);
+		if (st->antifoldps[i]->chgParam == NULL)
+			ExecReScan(st->antifoldps[i]);
+	}
 }
 
 /*
@@ -1518,6 +1529,12 @@ lion_end_custom_scan(CustomScanState *node)
 		lion_list_pin_participants(1);
 
 	lion_anti_end(st);
+	for (int a = 0; a < st->nantifold; a++)
+	{
+		if (st->antifoldps[a] != NULL)
+			ExecEndNode(st->antifoldps[a]);
+		st->antifoldps[a] = NULL;
+	}
 
 	if (st->join != NULL)
 	{

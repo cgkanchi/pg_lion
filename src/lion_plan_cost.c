@@ -3424,6 +3424,8 @@ typedef struct LionCountRelCost
 	int		   *clauseneg;		/* ... and each clause's negated source, or
 								 * -1 */
 	double	   *negprobes;		/* how often each is sought */
+	bool	   *negmem;			/* ... and whether it is a copy in memory: a
+								 * NOTIN clause's (§27) */
 
 	/* the groups */
 	bool		groupdrive;		/* §15: the IN list is the GROUP BY driver */
@@ -3477,6 +3479,7 @@ lion_count_rel_alloc(LionCountRelCost *c)
 	for (i = 0; i < Max(c->nclause, 1); i++)
 		c->clauseneg[i] = -1;
 	c->negprobes = (double *) palloc0(sizeof(double) * Max(c->nclause, 1));
+	c->negmem = (bool *) palloc0(sizeof(bool) * Max(c->nclause, 1));
 	c->orgrp = lion_or_group_map(c->ors, c->nclause);
 }
 
@@ -3821,6 +3824,49 @@ lion_count_rel_negated(LionCountRelCost *c, IndexOptInfo *idx,
 }
 
 /*
+ * A NOTIN clause (DESIGN.md §27, "The anti join as a negated list"): its keys
+ * located as an IN list's are - a lookup each, every container of their sets
+ * read and their union built (lion_cost_set_clause() over its costclause,
+ * `k = ANY (keys)`, charged as lion_count_rel_set_clause() charges a list's)
+ * - into one set the run collects (lion_locate_list()) of the rows it
+ * rejects, held in memory, which the merges subtract as any negated
+ * source's (lion_count_rel_subtract()).  c->ci is the clause's position, and
+ * is left past it.
+ */
+static void
+lion_count_rel_notin(LionCountRelCost *c, IndexOptInfo *idx, AttrNumber col,
+					 Node *clause)
+{
+	LionSetClause *sc = &c->clauseset[c->ci];
+	double		ckeys = Max(c->heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
+
+	lion_cost_set_clause(c->root, c->rel, idx, col, clause, sc);
+	c->lookup_cost += sc->lookup;
+	c->lookup_pages += sc->lookuppages;
+	c->descent_cost += sc->descent;
+	c->read_cpu += sc->readall;
+	c->union_read += sc->readall;
+	if (sc->nkeys > 1.0)
+	{
+		c->merge_ops += sc->unionops;
+		c->union_ops += sc->unionops;
+	}
+
+	/* ... one set of their rows, in at most every container key */
+	sc->containers = Min(Max(sc->containers, 1.0), ckeys);
+	sc->setcontainers = sc->containers;
+	sc->nsets = 1.0;
+	sc->words = lion_column_set_words(c, idx, col, sc->members,
+									  sc->containers);
+	c->clauseindex[c->ci] = idx;
+	c->clausesel[c->ci] = sc->sel;
+	c->clauseneg[c->ci] = c->nneg;
+	c->negmem[c->nneg] = true;
+	c->negclause[c->nneg++] = c->ci;
+	c->ci++;
+}
+
+/*
  * What subtracting the negated sources (DESIGN.md §14, §35) costs a merge
  * whose positive sources leave rows at `keys` container keys, `mu` members
  * at each, in bitmaps of `accw` words or, with accw 0, ARRAYs - `times` such
@@ -3851,9 +3897,10 @@ lion_count_rel_subtract(LionCountRelCost *c, double keys, double mu,
 	for (k = 0; k < c->nneg; k++)
 	{
 		const LionSetClause *sc = &c->clauseset[c->negclause[k]];
+		bool		mem = inmem || c->negmem[k];
 		double		seeks = Min(keys, Max(sc->containers, 1.0));
 		double		hits = keys * Min(sc->containers / ckeys, 1.0);
-		double		away = inmem ? seeks : Min(seeks, Max(sc->pages, 1.0));
+		double		away = mem ? seeks : Min(seeks, Max(sc->pages, 1.0));
 		Cost		andnot;
 
 		if (accw > 0.0 && sc->words > 0.0)
@@ -3865,7 +3912,7 @@ lion_count_rel_subtract(LionCountRelCost *c, double keys, double mu,
 			andnot = ((sc->words > 0.0) ? LION_BITMAP_MEMBER_COST :
 					  LION_AND_MEMBER_COST) *
 				Min(Max(mu, 0.0), LION_MEMBER_CAP);
-		cost += away * (inmem ? LION_MEMORY_PROBE_COST : LION_PROBE_COST) +
+		cost += away * (mem ? LION_MEMORY_PROBE_COST : LION_PROBE_COST) +
 			(seeks - away) * LION_PROBE_STEP_COST + hits * andnot;
 		c->negprobes[k] += seeks * times;
 	}
@@ -3931,8 +3978,12 @@ lion_count_rel_clauses(LionCountRelCost *c)
 			 * (lion_count_rel_negated()).  As an OR's leaf it is a complement
 			 * arm's, which lion_cost_count_rel() prices as two counts.
 			 */
-			if (LION_CLAUSE_IS_NEGATED(lfirst_int(lc3)) && idx != NULL &&
+			if (lfirst_int(lc3) == LION_CLAUSE_NOTIN && idx != NULL &&
 				c->orgrp[c->ci] < 0)
+				lion_count_rel_notin(c, idx, (AttrNumber) lfirst_int(lc4),
+									 clause);
+			else if (LION_CLAUSE_IS_NEGATED(lfirst_int(lc3)) && idx != NULL &&
+					 c->orgrp[c->ci] < 0)
 				lion_count_rel_negated(c, idx, (AttrNumber) lfirst_int(lc4),
 									   clause, lfirst_int(lc3));
 			else
@@ -4594,9 +4645,15 @@ lion_count_rel_set_pages(LionCountRelCost *c)
 
 		if (c->clauseneg[i] >= 0)
 		{
-			/* a negated source, sought where the merges subtract it */
+			/*
+			 * a negated source, sought where the merges subtract it - or, a
+			 * NOTIN clause's, read whole into the copy they seek
+			 */
+			bool		mem = c->negmem[c->clauseneg[i]];
+
 			c->probe_cost += lion_cost_set_pages(c->root, c->rel,
-												 &c->clauseset[i], false,
+												 &c->clauseset[i], mem,
+												 mem ? 0.0 :
 												 c->negprobes[c->clauseneg[i]],
 												 &c->seq_pages,
 												 &c->probed_pages,
@@ -4631,6 +4688,7 @@ lion_count_rel_set_pages(LionCountRelCost *c)
 	pfree(c->negclause);
 	pfree(c->clauseneg);
 	pfree(c->negprobes);
+	pfree(c->negmem);
 }
 
 /*

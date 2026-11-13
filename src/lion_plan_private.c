@@ -33,7 +33,7 @@ static const char *const lion_priv_name[LION_PRIV_NMEMBERS] = {
 	"VERSION", "OIDS", "INTS", "CONSTS", "CLAUSEKINDS", "PARTS", "CLAUSEOPS",
 	"ORS", "HAVING", "DISTINCT", "JOIN", "EXECUTE", "COALESCE", "IMPLIED",
 	"FACTGROUP", "GROUPN", "ALLROWS", "TOPK", "WAGG", "VCOLS", "FILTERS",
-	"RESID", "PARTIAL", "CELLS", "ANTI", "SLICES",
+	"RESID", "PARTIAL", "CELLS", "ANTI", "SLICES", "ANTIFOLD",
 	"TLKINDS"
 };
 
@@ -64,6 +64,7 @@ static const NodeTag lion_priv_tag[LION_PRIV_NMEMBERS] = {
 	T_List,						/* CELLS */
 	T_List,						/* ANTI */
 	T_List,						/* SLICES */
+	T_IntList,					/* ANTIFOLD */
 	T_IntList					/* TLKINDS */
 };
 
@@ -1146,6 +1147,47 @@ lion_priv_decode_anti(List *priv, LionPrivStage stage, LionCountPriv *out)
 }
 
 /*
+ * The NOT EXISTS folded into NOTIN clauses (DESIGN.md §27, "The anti join as
+ * a negated list"): three ints an arm - the clause, the inner side's relid
+ * (0 at the PLAN stage) and the key's column, its attnum at the PATH stage
+ * and its resno in the child's target list at the PLAN stage - each clause a
+ * NOTIN one, and none folded twice.
+ */
+static void
+lion_priv_decode_antifold(List *priv, LionPrivStage stage, LionCountPriv *out)
+{
+	List	   *m = (List *) list_nth(priv, LION_PRIV_ANTIFOLD);
+	int			i;
+
+	if (m == NIL)
+		return;
+	if (list_length(m) % 3 != 0 || list_length(m) / 3 > LION_MAX_ANTI_ARMS)
+		elog(ERROR, "LionCount: malformed ANTIFOLD member of custom_private");
+	out->nantifold = list_length(m) / 3;
+	for (i = 0; i < out->nantifold; i++)
+	{
+		int			clause = list_nth_int(m, 3 * i);
+		int			relid = list_nth_int(m, 3 * i + 1);
+		int			col = list_nth_int(m, 3 * i + 2);
+		int			j;
+
+		if (clause < 0 || clause >= out->nclause ||
+			out->clause[clause].kind != LION_CLAUSE_NOTIN ||
+			(stage == LION_PRIV_STAGE_PLAN ? relid != 0 : relid < 1) ||
+			col < 1 || col > MaxAttrNumber)
+			elog(ERROR, "LionCount: malformed ANTIFOLD member of custom_private");
+		for (j = 0; j < i; j++)
+		{
+			if (out->antifoldclause[j] == clause)
+				elog(ERROR, "LionCount: malformed ANTIFOLD member of custom_private");
+		}
+		out->antifoldclause[i] = clause;
+		out->antifoldrelid[i] = (Index) relid;
+		out->antifoldcol[i] = (AttrNumber) col;
+	}
+}
+
+/*
  * Take custom_private apart into *out, checking as it goes that it is the
  * list this build writes at `stage` (lion_plan_private.h): the shape marker
  * and the number of members before anything else, then every member's node
@@ -1322,6 +1364,7 @@ lion_count_priv_decode(List *priv, LionPrivStage stage, LionCountPriv *out)
 	lion_priv_decode_cells(priv, stage, out);
 	lion_priv_decode_anti(priv, stage, out);
 	lion_priv_decode_slices(priv, stage, out);
+	lion_priv_decode_antifold(priv, stage, out);
 
 	if (stage == LION_PRIV_STAGE_PLAN)
 		lion_priv_decode_tlkinds(priv, out);
@@ -1646,6 +1689,16 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 													  p->sagg[i].col));
 			m = lappend(m, specs);
 		}
+	}
+	priv = lappend(priv, m);
+
+	/* the NOT EXISTS folded into NOTIN clauses (§27): three ints each */
+	m = NIL;
+	for (i = 0; i < p->nantifold; i++)
+	{
+		m = lappend_int(m, p->antifoldclause[i]);
+		m = lappend_int(m, (int) p->antifoldrelid[i]);
+		m = lappend_int(m, (int) p->antifoldcol[i]);
 	}
 	priv = lappend(priv, m);
 
@@ -2046,7 +2099,37 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 		   (OidIsValid(p->anti.groupeq[0]) != (p->groupattno != 0)) ||
 		   (OidIsValid(p->anti.groupeq[1]) != (p->groupattno2 != 0))))))
 		elog(ERROR, "LionCount: malformed anti join");
-	if (!p->hasjoin && !p->hasanti && ncustom_plans != 0)
+
+	/*
+	 * The anti join as a negated list (DESIGN.md §27, "The anti join as a
+	 * negated list") is a count of one plain table, ungrouped or grouped by
+	 * one or two of its own columns, with a NOTIN clause a NOT EXISTS - a
+	 * child each, and no other child: never beside the anti join over a
+	 * small inner side, the FK-side join, partitions, a parallel plan, a
+	 * count(DISTINCT), the decoded walk, cells, a top k, filtered counts,
+	 * the aggregates over keys or of slices, a coalesce group or expression
+	 * columns.  Every NOTIN clause is one it folded.
+	 */
+	if (p->nantifold > 0 &&
+		(p->hasanti || p->hasjoin || ncustom_plans != p->nantifold ||
+		 p->npart > 0 || parallel_aware || p->distattno != 0 || decode ||
+		 p->ngroupn > 0 || p->ncelldim > 0 || p->topkn > 0 ||
+		 p->nfilter > 0 || p->nwcol > 0 || p->nscol > 0 ||
+		 p->coalconst != NULL || p->vcols != NIL))
+		elog(ERROR, "LionCount: malformed anti join list");
+	for (i = 0; i < p->nclause; i++)
+	{
+		if (p->clause[i].kind != LION_CLAUSE_NOTIN)
+			continue;
+		for (j = 0; j < p->nantifold; j++)
+		{
+			if (p->antifoldclause[j] == i)
+				break;
+		}
+		if (j == p->nantifold)
+			elog(ERROR, "LionCount: a negated list no anti join folded");
+	}
+	if (!p->hasjoin && !p->hasanti && p->nantifold == 0 && ncustom_plans != 0)
 		elog(ERROR, "LionCount: a child without a join");
 	for (i = 0; i < p->ntl; i++)
 	{

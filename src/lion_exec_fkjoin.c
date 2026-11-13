@@ -169,97 +169,145 @@ lion_join_filter_of(const LionCountScanState *st, int clauseno)
 }
 
 /*
- * The values of the fact filters the dimensions that only filter were folded
- * into (DESIGN.md §27, "A second dimension that only filters"): each one's
- * child run whole, and the keys of its rows made the array of its IN list, in
+ * The keys of child `ps`'s rows, its column `col`, as clause cl's list, in
  * the current memory context - the clause values' (lion_eval_clause_values()),
- * once a run.  A NULL key joins no fact row and is left out.  The keys are
- * of the type the clause compares them as - a binary-compatible relabel of
- * the column's, the same Datum - and distinct, the column being unique; the
- * list's lookup drops a duplicate anyway (lion_locate_array()).
+ * once a run: the child run whole, and a NULL key left out, which joins no
+ * row.  The keys are of the type the clause compares them as - a
+ * binary-compatible relabel of the column's, the same Datum - and as many as
+ * the child has rows: the list's lookup drops a duplicate anyway
+ * (lion_locate_array(), lion_locate_list()).  Returns how many there were.
  *
- * The planner folds a dimension expected to return no more keys than a count
- * locates at once (lion_array_batch_size()), but an estimate can be wrong by
- * any factor.  Past that many keys they go to a tuplestore instead
+ * The planner expects as many keys as the child's path rows, but an
+ * estimate can be wrong by any factor.  Past as many keys as a count locates
+ * at once (lion_array_batch_size()) they go to a tuplestore instead
  * (cl->valstore), which keeps work_mem of them and spills the rest to a
  * temporary file, and the list is collected from it a batch at a time rather
  * than located (lion_locate_list()).
  *
- * The child runs under the query's snapshot, as the dimension's child does,
- * so its rows are the ones the join would have read.  It is a child of the
- * node's, initialised and ended with it and rescanned with it - and it runs
- * in the query's memory, as every node does: what a scan allocates the first
- * time it is asked for a row (its scan descriptor) lives until the node is
- * ended, past any reset of the values' context.
+ * The child runs under the query's snapshot, so its rows are the ones the
+ * join would have read.  It is a child of the node's, initialised and ended
+ * with it and rescanned with it - and it runs in the query's memory, as every
+ * node does: what a scan allocates the first time it is asked for a row (its
+ * scan descriptor) lives until the node is ended, past any reset of the
+ * values' context.
+ */
+int64
+lion_child_key_values(LionCountScanState *st, LionClauseState *cl,
+					  PlanState *ps, AttrNumber col)
+{
+	MemoryContext valcxt = CurrentMemoryContext;
+	MemoryContext querycxt = st->css.ss.ps.state->es_query_cxt;
+	int			batch = lion_array_batch_size();
+	ArrayBuildState *astate;
+	bool		null = false;
+	int64		nkeys = 0;
+
+	/* the reset of valcxt took the last run's, once it was ended */
+	Assert(cl->valstore == NULL);
+
+	/* a context of its own, given back whole when the keys move */
+	astate = initArrayResult(cl->valtype, valcxt, true);
+	for (;;)
+	{
+		TupleTableSlot *slot;
+		Datum		key;
+		bool		isnull;
+
+		CHECK_FOR_INTERRUPTS();
+		MemoryContextSwitchTo(querycxt);
+		slot = ExecProcNode(ps);
+		MemoryContextSwitchTo(valcxt);
+		if (TupIsNull(slot))
+			break;
+		key = slot_getattr(slot, col, &isnull);
+		if (isnull)
+			continue;
+		nkeys++;
+		if (cl->valstore != NULL)
+		{
+			tuplestore_putvalues(cl->valstore, cl->valstoredesc, &key,
+								 &null);
+			continue;
+		}
+		/* copied into the array's context, a by-reference key too */
+		astate = accumArrayResult(astate, key, false, cl->valtype, valcxt);
+		if (astate->nelems <= batch)
+			continue;
+
+		/*
+		 * More keys than are located at once: these and the rest to a
+		 * tuplestore of the key's type, its own copies taken, in valcxt.
+		 */
+		cl->valstoredesc = CreateTemplateTupleDesc(1);
+		TupleDescInitEntry(cl->valstoredesc, 1, "key", cl->valtype, -1, 0);
+		TupleDescFinalize(cl->valstoredesc);
+		cl->valstore = tuplestore_begin_heap(false, false, work_mem);
+		for (int i = 0; i < astate->nelems; i++)
+			tuplestore_putvalues(cl->valstore, cl->valstoredesc,
+								 &astate->dvalues[i], &null);
+		MemoryContextDelete(astate->mcontext);
+		astate = NULL;
+	}
+	if (cl->valstore != NULL)
+		cl->val = (Datum) 0;
+	else
+		cl->val = makeArrayResult(astate, valcxt);
+	cl->valisnull = false;
+	return nkeys;
+}
+
+/*
+ * The values of the fact filters the dimensions that only filter were folded
+ * into (DESIGN.md §27, "A second dimension that only filters"): each one's
+ * keys, its child's rows' (lion_child_key_values()) - distinct, the column
+ * being unique.  The planner folds a dimension expected to return no more
+ * keys than a count locates at once, but an estimate can be wrong by any
+ * factor, which the tuplestore takes.
  */
 void
 lion_join_filter_values(LionCountScanState *st)
 {
 	LionJoinState *js = st->join;
-	MemoryContext valcxt = CurrentMemoryContext;
-	MemoryContext querycxt = st->css.ss.ps.state->es_query_cxt;
-	int			batch = lion_array_batch_size();
 	int			f;
 
 	for (f = 0; f < js->nfilter; f++)
+		js->filterkeys +=
+			lion_child_key_values(st, &st->clause[js->filterclause[f]],
+								  js->filterps[f], js->filtercol[f]);
+}
+
+/*
+ * Which NOT EXISTS folded into a negated list clause `clauseno` is the keys
+ * of (DESIGN.md §27, "The anti join as a negated list"), or -1.
+ */
+int
+lion_antifold_of(const LionCountScanState *st, int clauseno)
+{
+	int			a;
+
+	for (a = 0; a < st->nantifold; a++)
 	{
-		LionClauseState *cl = &st->clause[js->filterclause[f]];
-		PlanState  *ps = js->filterps[f];
-		ArrayBuildState *astate;
-		bool		null = false;
-
-		/* the reset of valcxt took the last run's, once it was ended */
-		Assert(cl->valstore == NULL);
-
-		/* a context of its own, given back whole when the keys move */
-		astate = initArrayResult(cl->valtype, valcxt, true);
-		for (;;)
-		{
-			TupleTableSlot *slot;
-			Datum		key;
-			bool		isnull;
-
-			CHECK_FOR_INTERRUPTS();
-			MemoryContextSwitchTo(querycxt);
-			slot = ExecProcNode(ps);
-			MemoryContextSwitchTo(valcxt);
-			if (TupIsNull(slot))
-				break;
-			key = slot_getattr(slot, js->filtercol[f], &isnull);
-			if (isnull)
-				continue;
-			js->filterkeys++;
-			if (cl->valstore != NULL)
-			{
-				tuplestore_putvalues(cl->valstore, cl->valstoredesc, &key,
-									 &null);
-				continue;
-			}
-			/* copied into the array's context, a by-reference key too */
-			astate = accumArrayResult(astate, key, false, cl->valtype, valcxt);
-			if (astate->nelems <= batch)
-				continue;
-
-			/*
-			 * More keys than are located at once: these and the rest to a
-			 * tuplestore of the key's type, its own copies taken, in valcxt.
-			 */
-			cl->valstoredesc = CreateTemplateTupleDesc(1);
-			TupleDescInitEntry(cl->valstoredesc, 1, "key", cl->valtype, -1, 0);
-			TupleDescFinalize(cl->valstoredesc);
-			cl->valstore = tuplestore_begin_heap(false, false, work_mem);
-			for (int i = 0; i < astate->nelems; i++)
-				tuplestore_putvalues(cl->valstore, cl->valstoredesc,
-									 &astate->dvalues[i], &null);
-			MemoryContextDelete(astate->mcontext);
-			astate = NULL;
-		}
-		if (cl->valstore != NULL)
-			cl->val = (Datum) 0;
-		else
-			cl->val = makeArrayResult(astate, valcxt);
-		cl->valisnull = false;
+		if (st->antifoldclause[a] == clauseno)
+			return a;
 	}
+	return -1;
+}
+
+/*
+ * ... and the values of those clauses: each arm's inner side's keys, its
+ * child's rows' (lion_child_key_values()), NULL ones left out - an inner row
+ * with a NULL key matches no row of the table - and duplicates kept to the
+ * list's lookup, which drops them.
+ */
+void
+lion_antifold_values(LionCountScanState *st)
+{
+	int			a;
+
+	for (a = 0; a < st->nantifold; a++)
+		st->antifoldkeys +=
+			lion_child_key_values(st, &st->clause[st->antifoldclause[a]],
+								  st->antifoldps[a], st->antifoldcol[a]);
 }
 
 /* The child's next row, counted, and timed when the node is. */

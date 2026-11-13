@@ -360,6 +360,13 @@ typedef struct LionCountPathBuild
 	List	   *antiextra;		/* ... the clauses the count adds to the
 								 * WHERE, which its lookups test too */
 	LionAntiPlan antiplan;		/* ... its B-tree and the lookups' price */
+	bool		antifold;		/* ... or folded into the WHERE as NOTIN
+								 * clauses, each arm's (§27, "The anti join
+								 * as a negated list"), which these say: */
+	int			nantifold;
+	int			antifoldclause[LION_MAX_ANTI_ARMS];
+	Var		   *antifoldvar[LION_MAX_ANTI_ARMS];	/* the inner key */
+	Oid			antifoldfunc[LION_MAX_ANTI_ARMS];	/* its operator's */
 	Query	   *parse;
 	RangeTblEntry *rte;
 	Index		rti;
@@ -5462,6 +5469,162 @@ lion_anti_group_order(Oid typid, Oid eqop)
 }
 
 /*
+ * THE ANTI JOIN AS A NEGATED LIST (DESIGN.md §27).  The build that folds the
+ * anti join over a small inner side into the count (cx->antifold) makes each
+ * arm one NOTIN clause of the WHERE - `k` none of the inner side's keys,
+ * NULL rows kept - whose values are the keys of the arm's child's rows,
+ * collected at the start of each run as a dimension that only filters has
+ * its keys collected, its value expression a NULL placeholder nothing
+ * evaluates.  A row of t is a row of the join where no inner row's key
+ * equals its k: never for a NULL k, the operator being strict, and
+ * otherwise where k is none of the keys - the complement of the IN list
+ * `k = ANY (keys)`'s rows, which the lion index answers exactly, with the
+ * NULL keys left out of the list as they match no row.  So an arm folds
+ * where its one join clause is its key, a plain column of t compared with a
+ * plain column of the inner side, which the child returns; whether a lion
+ * index answers the equality as an IN list's is lion_match_index()'s, as
+ * for any clause.  Arms that do not, or a WHERE that may be scanned untested
+ * (lion_where_scan_untested(), which tests no NOTIN clause on a row),
+ * decline the build: the B-tree's is made too (lion_try_count_anti_path()).
+ *
+ * Its price, besides the count's (lion_count_rel_notin()), is the children
+ * run whole before the first row, as the B-tree's lookups' children are
+ * (lion_count_anti_price()).
+ */
+static Node *
+lion_antifold_costclause(PlannerInfo *root, RelOptInfo *rel,
+						 const LionSmallAnti *arm, Var *outervar,
+						 Node *innerexpr, Oid opno, Oid collation)
+{
+	double		rows = clamp_row_est(arm->innerpath->rows);
+	double		dkeys;
+	double		nd = lion_fkjoin_fk_ndistinct(root, rel, outervar);
+
+	/*
+	 * The rows it subtracts: as many keys as the inner side returns rows,
+	 * each looked up, whose distinct values hold their share of the column's
+	 * rows - every key one of the column's values, the containment core's
+	 * semi join estimate assumes too (eqjoinsel_semi()).
+	 */
+	dkeys = estimate_num_groups(root, list_make1(innerexpr), rows, NULL, NULL);
+	return lion_keys_costclause(outervar, opno, collation,
+								exprType(innerexpr), rows,
+								Min(dkeys, rows) / nd);
+}
+
+static bool
+lion_count_path_antifold(LionCountPathBuild *cx)
+{
+	int			narm;
+	int			a;
+
+	if (!cx->antifold)
+		return true;
+	Assert(cx->anti != NULL);
+	if (cx->runtimemulti || cx->prefixmulti)
+		return false;
+	narm = 1 + list_length(cx->anti->arms);
+	if (narm > LION_MAX_ANTI_ARMS)
+		return false;
+	for (a = 0; a < narm; a++)
+	{
+		const LionSmallAnti *arm = (a == 0) ? cx->anti :
+			(const LionSmallAnti *) list_nth(cx->anti->arms, a - 1);
+		LionAntiKey *key;
+		Node	   *inner;
+		Var		   *innervar;
+		Oid			opno;
+		LionLeafInfo leaf;
+		LionClauseInfo *ci;
+
+		if (list_length(arm->keys) != 1 || list_length(arm->clauses) != 1)
+			return false;
+		key = (LionAntiKey *) linitial(arm->keys);
+		if (((RestrictInfo *) linitial(arm->clauses))->clause !=
+			(Expr *) key->clause)
+			return false;
+		if (key->outervar->varno != (int) cx->rti ||
+			key->outervar->varattno <= 0 || key->outervar->varlevelsup != 0)
+			return false;
+		inner = key->innerexpr;
+		innervar = (Var *) lion_strip(inner);
+		if (innervar == NULL || !IsA(innervar, Var) ||
+			innervar->varlevelsup != 0 || innervar->varattno <= 0 ||
+			!bms_is_member(innervar->varno, arm->innerrel->relids))
+			return false;
+		opno = key->outerleft ? key->clause->opno :
+			get_commutator(key->clause->opno);
+		if (!OidIsValid(opno))
+			return false;
+
+		memset(&leaf, 0, sizeof(leaf));
+		leaf.var = key->outervar;
+		leaf.val = (Node *) makeNullConst(exprType(inner), exprTypmod(inner),
+										  exprCollation(inner));
+		leaf.costclause = lion_antifold_costclause(cx->root, cx->input_rel,
+												   arm, key->outervar, inner,
+												   opno,
+												   key->clause->inputcollid);
+		leaf.opno = opno;
+		leaf.cmptype = exprType(inner);
+		leaf.extractquery = InvalidOid;
+		leaf.collation = key->clause->inputcollid;
+		leaf.kind = LION_CLAUSE_NOTIN;
+		cx->antifoldclause[a] = list_length(cx->whereattnos);
+		cx->antifoldvar[a] = innervar;
+		cx->antifoldfunc[a] = get_opcode(key->clause->opno);
+		lion_append_clause(&leaf, (Node *) key->clause, false,
+						  &cx->whereattnos, &cx->clauseinfos,
+						  &cx->whereclauses, &cx->whereconsts,
+						  &cx->wherekinds, &cx->whereopnos,
+						  &cx->whereinor);
+
+		/* no restriction's, nor a filtered count's */
+		ci = (LionClauseInfo *) llast(cx->clauseinfos);
+		ci->filter = 0;
+		ci->rinfono = -1;
+
+		/* true of a NULL k: it proves nothing of the column, as `IS DISTINCT FROM` */
+		cx->newnegated = true;
+	}
+	cx->nantifold = narm;
+	return true;
+}
+
+/*
+ * ... and what the plan says of it, once the count is known to be one it
+ * stands beside: one plain table's, ungrouped or grouped by one or two of its
+ * columns, serial - never partitions, a count(DISTINCT), the aggregates over
+ * keys or of slices, a top k, filtered counts, a coalesce group, expression
+ * columns, cells or the decoded walk (lion_count_priv_check()).  The arms'
+ * operators are EXECUTE-checked as the join core would have made checks its
+ * clause (lion_replaced_functions()).
+ */
+static bool
+lion_count_path_antifold_priv(LionCountPathBuild *cx)
+{
+	LionCountPriv *p = &cx->priv;
+	int			a;
+
+	if (cx->nantifold == 0 || cx->partitioned || cx->distvar != NULL ||
+		cx->wattnos != NIL || cx->sattnos != NIL || cx->topkn > 0 ||
+		cx->nfilter > 0 || cx->groupcoal != NULL || p->vcols != NIL ||
+		cx->cells || cx->decode || cx->partialtarget != NULL ||
+		p->ngroupn > 0 || p->ncelldim > 0 || p->nscol > 0)
+		return false;
+	p->nantifold = cx->nantifold;
+	for (a = 0; a < cx->nantifold; a++)
+	{
+		p->antifoldclause[a] = cx->antifoldclause[a];
+		p->antifoldrelid[a] = (Index) cx->antifoldvar[a]->varno;
+		p->antifoldcol[a] = cx->antifoldvar[a]->varattno;
+		p->exec_funcs = list_append_unique_oid(p->exec_funcs,
+											   cx->antifoldfunc[a]);
+	}
+	return true;
+}
+
+/*
  * THE ANTI JOIN OVER A SMALL INNER SIDE (DESIGN.md §27): the count planned so
  * far is the outer table's, of its WHERE; the query's is that count less the
  * rows some row of the inner side matches, which the node finds by looking
@@ -5505,6 +5668,8 @@ lion_count_path_anti(LionCountPathBuild *cx)
 
 	if (anti == NULL)
 		return true;
+	if (cx->antifold)
+		return lion_count_path_antifold_priv(cx);
 	if (cx->partitioned || cx->distvar != NULL ||
 		cx->wattnos != NIL || cx->topkn > 0 || cx->nfilter > 0 ||
 		cx->groupcoal != NULL || p->vcols != NIL)
@@ -6144,7 +6309,9 @@ lion_count_anti_price(const LionCountPathBuild *cx, const LionUnits *units,
 
 	if (cx->anti == NULL)
 		return 0.0;
-	lookups = lion_units_price(units, cx->antiplan.cost);
+
+	/* folded into the WHERE (§27), it looks nothing up: the count does */
+	lookups = cx->antifold ? 0.0 : lion_units_price(units, cx->antiplan.cost);
 	cpath->path.startup_cost += lookups;
 	cpath->path.total_cost += lookups;
 #if PG_VERSION_NUM >= 180000
@@ -6168,7 +6335,8 @@ lion_count_anti_price(const LionCountPathBuild *cx, const LionUnits *units,
  * (lion_anti_parallel_child()), one an arm, where the join's expressions may
  * be evaluated in a worker and every inner side has one, and into *run the
  * price of a participant's run - `lookups`, the lookups' price, and the
- * children's prices.  NIL, and *run 0, when there are none.
+ * children's prices.  NIL, and *run 0, when there are none, and for the anti
+ * join folded into the WHERE, which is serial.
  */
 static List *
 lion_count_anti_parallel(const LionCountPathBuild *cx, Cost lookups,
@@ -6179,7 +6347,7 @@ lion_count_anti_parallel(const LionCountPathBuild *cx, Cost lookups,
 	ListCell   *lc;
 
 	*run = 0.0;
-	if (cx->anti == NULL ||
+	if (cx->anti == NULL || cx->antifold ||
 		!is_parallel_safe(cx->root, (Node *) cx->priv.anti.exprs))
 		return NIL;
 	foreach(lc, lion_count_anti_children(cx->anti))
@@ -7414,7 +7582,8 @@ static void
 lion_try_count_path_ext(PlannerInfo *root, RelOptInfo *input_rel,
 						RelOptInfo *output_rel, GroupPathExtraData *extra,
 						const LionFkJoin *fj, const LionSmallAnti *anti,
-						bool distinctstage, bool leakproofresid)
+						bool antifold, bool distinctstage,
+						bool leakproofresid)
 {
 	LionCountPathBuild cx;
 	LionPartialCands *cands;
@@ -7422,6 +7591,7 @@ lion_try_count_path_ext(PlannerInfo *root, RelOptInfo *input_rel,
 
 	lion_count_path_init(&cx, root, input_rel, output_rel, extra, fj);
 	cx.anti = anti;
+	cx.antifold = antifold;
 	cx.distinctstage = distinctstage;
 	cx.leakproofresid = leakproofresid;
 
@@ -7453,7 +7623,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				   const LionFkJoin *fj)
 {
 	lion_try_count_path_ext(root, input_rel, output_rel, extra, fj, NULL,
-							false, false);
+							false, false, false);
 }
 
 /*
@@ -7466,7 +7636,7 @@ lion_try_count_path_leakproof(PlannerInfo *root, RelOptInfo *input_rel,
 							  GroupPathExtraData *extra)
 {
 	lion_try_count_path_ext(root, input_rel, output_rel, extra, NULL, NULL,
-							false, true);
+							false, false, true);
 }
 
 /*
@@ -7474,7 +7644,10 @@ lion_try_count_path_leakproof(PlannerInfo *root, RelOptInfo *input_rel,
  * small inner side"): input_rel is the query's join rel, and `anti` what
  * lion_fkjoin_recognize_small_anti() found of it.  The count is planned as
  * the outer table's own, every phase unchanged, and lion_count_path_anti()
- * adds the subtraction.
+ * adds the subtraction - and once more with the anti join folded into the
+ * WHERE as negated lists instead ("The anti join as a negated list",
+ * lion_count_path_antifold()), which needs no B-tree; add_path() keeps the
+ * cheaper.
  */
 void
 lion_try_count_anti_path(PlannerInfo *root, RelOptInfo *input_rel,
@@ -7482,7 +7655,10 @@ lion_try_count_anti_path(PlannerInfo *root, RelOptInfo *input_rel,
 						 const LionSmallAnti *anti)
 {
 	lion_try_count_path_ext(root, input_rel, output_rel, extra, NULL, anti,
-							false, false);
+							false, false, false);
+	if (lion_enable_count_anti_list)
+		lion_try_count_path_ext(root, input_rel, output_rel, extra, NULL,
+								anti, true, false, false);
 }
 
 /*
@@ -7527,7 +7703,7 @@ lion_try_distinct_path(PlannerInfo *root, RelOptInfo *input_rel,
 	PG_TRY();
 	{
 		lion_try_count_path_ext(root, input_rel, output_rel, &extra, NULL,
-								NULL, true, false);
+								NULL, false, true, false);
 	}
 	PG_FINALLY();
 	{
@@ -7557,6 +7733,8 @@ lion_try_count_path_once(LionCountPathBuild *cx)
 	if (!lion_count_path_group_by(cx))
 		return false;
 	if (!lion_count_path_where(cx))
+		return false;
+	if (!lion_count_path_antifold(cx))
 		return false;
 	if (!lion_count_path_fkjoin(cx))
 		return false;

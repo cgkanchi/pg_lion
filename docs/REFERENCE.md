@@ -943,6 +943,24 @@ working around a bad choice:
   can be NULL (a NOT NULL column, or a filter that rules NULL out): 19 plans that one as the same
   anti join as `NOT EXISTS`, and it is counted as that is. Off, the pushdown does not count an anti
   join this way.
+- `pg_lion.enable_count_anti_list`: let the count pushdown answer the anti join of
+  `pg_lion.enable_count_anti` with no B-tree, from a Lion index on `t.k`: the node runs the inner
+  side as its child at the start of each run, collects its keys (NULL ones left out) into one list,
+  and subtracts the rows of `k = ANY (keys)` from the count of the `WHERE`, a NULL `k` kept
+  (DESIGN.md §27, "The anti join as a negated list"). Each `NOT EXISTS` (or `LEFT JOIN ... IS
+  NULL`) must join on one equality of a column of `t` with a column of the inner side, which a Lion
+  index on `t`'s column answers. The count is serial and of one table, `count(*)`, `count(1)` or a
+  `count(col)`, ungrouped or grouped by one or two of `t`'s columns: not over partitions, a
+  `count(DISTINCT)`, a count by cells, a `FILTER` or the top k. The planner prices this beside the
+  B-tree's lookups and keeps the cheaper. EXPLAIN prints the clause among the `Lion Indexes` as
+  `NOT EXISTS (k = s.a)`, and under ANALYZE `Lists Collected` and `Anti Join Keys`, the keys read
+  from the inner sides:
+
+      Custom Scan (LionCount)
+        Lion Indexes: t_x (x = 3), t_k (NOT EXISTS (k = s.a))
+        ->  Seq Scan on s
+
+  Off, only the B-tree's lookups are tried; `pg_lion.enable_count_anti` off turns off both.
 - `pg_lion.enable_window_count`: answer `count(*) OVER ()` beside the rows of one table - `SELECT
   *, count(*) OVER () FROM t WHERE ... ORDER BY ts DESC LIMIT 20`, a page with its total - with the
   `LionWindowCount` node (DESIGN.md §10, "A count of every row beside the rows"): the pushdown's

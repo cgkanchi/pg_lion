@@ -1568,6 +1568,18 @@ lion_begin_clauses(LionCountScanState *st, CustomScanState *node,
 			continue;
 		}
 
+		/*
+		 * ... nor a NOT EXISTS folded into a negated list's (DESIGN.md §27,
+		 * "The anti join as a negated list"): its keys are its child's,
+		 * collected the same way (lion_antifold_values()).
+		 */
+		if (lion_antifold_of(st, i) >= 0)
+		{
+			cl->con = NULL;
+			cl->valstate = NULL;
+			continue;
+		}
+
 		if (IsA(cl->valexpr, Const))
 		{
 			cl->con = (Const *) cl->valexpr;
@@ -2282,6 +2294,34 @@ lion_begin_decoded_walk(LionCountScanState *st, const LionCountPriv *priv,
 	st->decode = dr;
 }
 
+/*
+ * The NOT EXISTS folded into NOTIN clauses (DESIGN.md §27, "The anti join as
+ * a negated list"): which clause each arm is and its key's column of its
+ * child, and the children - the inner sides - started, one an arm, after
+ * whatever children the node has already (it has none: lion_count_priv_check()
+ * holds such a plan to no other).  Before the clauses, whose values they
+ * are.
+ */
+static void
+lion_begin_antifold(LionCountScanState *st, CustomScanState *node,
+					CustomScan *cscan, const LionCountPriv *priv,
+					EState *estate, int eflags)
+{
+	int			a;
+
+	st->nantifold = priv->nantifold;
+	st->antifoldkeys = 0;
+	for (a = 0; a < st->nantifold; a++)
+	{
+		st->antifoldclause[a] = priv->antifoldclause[a];
+		st->antifoldcol[a] = priv->antifoldcol[a];
+		st->antifoldps[a] = ExecInitNode((Plan *) list_nth(cscan->custom_plans,
+														   a),
+										 estate, eflags);
+		node->custom_ps = lappend(node->custom_ps, st->antifoldps[a]);
+	}
+}
+
 void
 lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 {
@@ -2339,6 +2379,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_wagg(st, node, priv, own, estate);
 	lion_begin_slices(st, priv, estate);
 	lion_begin_residual(st, node, priv, own, estate);
+	lion_begin_antifold(st, node, cscan, priv, estate, eflags);
 	lion_begin_clauses(st, node, priv, own);
 	lion_begin_driving_column(st, priv);
 	lion_begin_ors_and_items(st, priv);
