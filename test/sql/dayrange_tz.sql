@@ -129,6 +129,9 @@ DECLARE
 	r text;
 BEGIN
 	PERFORM set_config('TimeZone', z, true);
+	-- values quoted with their offsets, which every version reads back (a
+	-- zone's LMT abbreviation is not read before PostgreSQL 18)
+	PERFORM set_config('DateStyle', 'ISO, YMD', true);
 	preds := 0; ranges := 0; mismatches := 0; nrows := 0;
 	FOR p IN
 		SELECT DISTINCT format('tz::date %s %L', op, (a.at + g * interval '1 day')::date)

@@ -683,34 +683,45 @@ EXECUTE lion_dr_q(NULL);
      0
 (1 row)
 
-EXPLAIN (COSTS OFF) EXECUTE lion_dr_r('2026-03-05', '2026-03-05');
+-- (the InitPlans spelled as PostgreSQL 19 names them)
+CREATE FUNCTION lion_dr_plan(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		RETURN NEXT regexp_replace(l, '(InitPlan|SubPlan) (\d+)', '\1 expr_\2', 'g');
+	END LOOP;
+END
+$$;
+SELECT * FROM lion_dr_plan($$EXECUTE lion_dr_r('2026-03-05', '2026-03-05')$$) AS p("QUERY PLAN");
                                                       QUERY PLAN                                                       
 -----------------------------------------------------------------------------------------------------------------------
  Result
-   InitPlan 1
+   InitPlan expr_1
      ->  Custom Scan (LionCount)
            Lion Indexes: lion_dr_t_ts (ts >= lion_day_first('day'::text, $1) AND ts <= lion_day_last('day'::text, $1))
-   InitPlan 2
+   InitPlan expr_2
      ->  Aggregate
            ->  Seq Scan on lion_dr_t
                  Filter: (ts >= lion_day_first('month'::text, $1))
-   InitPlan 3
+   InitPlan expr_3
      ->  Aggregate
            ->  Seq Scan on lion_dr_t lion_dr_t_1
                  Filter: (ts < lion_day_first('week'::text, $1))
-   InitPlan 4
+   InitPlan expr_4
      ->  Aggregate
            ->  Seq Scan on lion_dr_t lion_dr_t_2
                  Filter: (ts < lion_day_first($2))
-   InitPlan 5
+   InitPlan expr_5
      ->  Aggregate
            ->  Seq Scan on lion_dr_t lion_dr_t_3
                  Filter: (ts <= lion_day_last($2))
-   InitPlan 6
+   InitPlan expr_6
      ->  Aggregate
            ->  Seq Scan on lion_dr_t lion_dr_t_4
                  Filter: (ts > lion_day_last($2))
-   InitPlan 7
+   InitPlan expr_7
      ->  Custom Scan (LionCount)
            Lion Indexes: lion_dr_t_ts (ts >= lion_day_first($2) AND ts <= lion_day_last($2))
 (27 rows)
@@ -856,4 +867,5 @@ SELECT lion_day_first('fortnight', '2026-03-05');
 ERROR:  unit "fortnight" not supported by a lion day range
 DROP TABLE lion_dr_t, lion_dr_o, lion_dr_e, lion_dr_b, lion_dr_p;
 DROP FUNCTION lion_dr(text, text);
+DROP FUNCTION lion_dr_plan(text);
 DROP FUNCTION lion_dr_h(int8, int8);

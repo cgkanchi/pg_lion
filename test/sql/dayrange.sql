@@ -288,7 +288,18 @@ EXECUTE lion_dr_q('infinity');
 EXECUTE lion_dr_q('-infinity');
 EXECUTE lion_dr_q('300000-01-01');
 EXECUTE lion_dr_q(NULL);
-EXPLAIN (COSTS OFF) EXECUTE lion_dr_r('2026-03-05', '2026-03-05');
+-- (the InitPlans spelled as PostgreSQL 19 names them)
+CREATE FUNCTION lion_dr_plan(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		RETURN NEXT regexp_replace(l, '(InitPlan|SubPlan) (\d+)', '\1 expr_\2', 'g');
+	END LOOP;
+END
+$$;
+SELECT * FROM lion_dr_plan($$EXECUTE lion_dr_r('2026-03-05', '2026-03-05')$$) AS p("QUERY PLAN");
 CREATE TABLE lion_dr_args (a timestamp, b date);
 INSERT INTO lion_dr_args VALUES ('2026-03-05', '2026-03-05'),
 	('2026-03-05 12:00', '0044-03-15 BC'), ('infinity', 'infinity'),
@@ -343,4 +354,5 @@ SELECT lion_day_first('fortnight', '2026-03-05');
 
 DROP TABLE lion_dr_t, lion_dr_o, lion_dr_e, lion_dr_b, lion_dr_p;
 DROP FUNCTION lion_dr(text, text);
+DROP FUNCTION lion_dr_plan(text);
 DROP FUNCTION lion_dr_h(int8, int8);
