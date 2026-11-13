@@ -491,9 +491,9 @@ lion_gsets_finer(PlannerInfo *root, RelOptInfo *input_rel,
 	set_pathtarget_cost_width(root, innertarget);
 
 	/* the query's aggregates, over the counted groups */
-	if (!lion_join_aggs_lookup(&cx.countfn, NULL, NULL, NULL))
+	if (!lion_join_aggs_lookup(root, &cx.countfn, NULL, NULL, NULL))
 		return NULL;
-	if (!lion_join_aggs_lookup(NULL, &cx.sumfn, &cx.mul2op, &cx.mul4op))
+	if (!lion_join_aggs_lookup(root, NULL, &cx.sumfn, &cx.mul2op, &cx.mul4op))
 		cx.sumfn = InvalidOid;
 	*aggtarget = copy_pathtarget(output_rel->reltarget);
 	(*aggtarget)->exprs = (List *) lion_gsets_mutator((Node *) (*aggtarget)->exprs,
