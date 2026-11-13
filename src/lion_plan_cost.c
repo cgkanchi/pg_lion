@@ -7622,18 +7622,16 @@ lion_tsquery_pos_shape(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
  * many (lion_tsquery_pos_shape()) - every row with `foo` for `foo <-> !bar`,
  * where the clause keeps an eighth of them.  Priced from the clause's own
  * rows and the superset's one lexeme, that filter comes to a sixteenth of
- * what it takes, and an FK-side join that probes it at two or three keys
- * beats a nested loop of the dimension into a btree of the fact's key that
- * runs 8 to 40 times as fast (DESIGN.md §17, "The price").
+ * what it takes (DESIGN.md §17, "The price").
  *
  * Every count's cursors - one a lexeme the query names, those under a NOT
  * too - begin again at their lexemes' first member, and seek to the count's
  * candidates in order, decoding the members between (LION_POS_MEMBER_COST):
- * at most every member of the lexeme, which a count whose candidates lie
- * close together comes to, and LION_POS_SEEK_MEMBERS a candidate where they
- * lie further apart than a chunk's members.  Each candidate is then decided
- * at LION_POS_CHECK_COST a lexeme.  A lexeme's members are the rows that
- * have it, by core's estimate of a query of it alone.
+ * every member of the lexeme, which a count whose candidates lie close
+ * together comes to, and less where they lie further apart, the chunks and
+ * leaves between stepped over (lion_pos_seek_members()).  Each candidate is
+ * then decided at LION_POS_CHECK_COST a lexeme.  A lexeme's members are the
+ * rows that have it, by core's estimate of a query of it alone.
  */
 static Cost
 lion_cost_posfilter_clause(PlannerInfo *root, RelOptInfo *rel,
@@ -7677,8 +7675,8 @@ lion_cost_posfilter_clause(PlannerInfo *root, RelOptInfo *rel,
 	cost = cand * nlex * LION_POS_CHECK_COST;
 	for (k = 0; k < nlex; k++)
 		cost += counts *
-			Min(Max(tuples * lexsel[k], 1.0),
-				percount * LION_POS_SEEK_MEMBERS) * LION_POS_MEMBER_COST;
+			lion_pos_seek_members(Max(tuples * lexsel[k], 1.0), percount) *
+			LION_POS_MEMBER_COST;
 	pfree(lexsel);
 	return cost;
 }

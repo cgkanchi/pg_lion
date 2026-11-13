@@ -194,16 +194,17 @@ SELECT fp_run($q$SELECT count(*) FROM fp_fact f JOIN fp_dim d ON f.fk = d.pk
 RESET pg_lion.fkjoin_collect_container_cost;
 -- An index scan decides its superset from positions too, its cursors begun
 -- again at every scan: the inner scan of a key's rows, repeated for each
--- key, is priced with the seeks to them (lion_cost_scan_posfilter()) - both
--- lexemes' 15,000 members decoded, at 2.4 cpu_operator_cost, and 75
--- candidates at 4.3 a lexeme, the AND of the two as the intersection probe
--- measures it, a third more than core's product - beyond the same scan of
--- `foo & bar`, which the posting sets answer alone.  And the candidates are
--- the superset's (lion_tsquery_pos_shape()): `foo <-> !bar` decides every
--- one of a key's 75 rows with `foo`, reading `bar` beside it, where it
--- selects a quarter of them by core's estimate, and is priced above the
--- scan of `foo` alone, which reads the same set and decides nothing; priced
--- from its own rows and its one lexeme in the superset, it came to 74 below.
+-- key, is priced with the seeks to them (lion_cost_scan_posfilter()) - each
+-- lexeme's cursor seeking its 75 candidates among 15,000 members, 200 apart,
+-- some 58 members decoded a seek (lion_pos_seek_members()) at 2.4
+-- cpu_operator_cost, and the 75 candidates at 4.3 a lexeme - beyond the same
+-- scan of `foo & bar`, which the posting sets answer alone.  And the
+-- candidates are the superset's (lion_tsquery_pos_shape()): `foo <-> !bar`
+-- decides every one of a key's 75 rows with `foo`, reading `bar` beside it,
+-- where it selects a quarter of them by core's estimate - the phrase's price
+-- again, less the heap fetches of the rows it turns away, below the scan of
+-- `foo` alone, which reads the same set, decides nothing and fetches them
+-- all.
 CREATE FUNCTION fp_inner_cost(tq text) RETURNS float8
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -225,22 +226,24 @@ SELECT round((fp_inner_cost('foo <-> bar') -
 			  fp_inner_cost('foo'))::numeric) AS not_inner_more;
  phrase_inner_more | not_inner_more 
 -------------------+----------------
-               182 |             90
+                54 |            -37
 (1 row)
 
 /*
  * The plan that choice makes: 20,000 rows over 2,000 keys, ten a key spread
  * over the heap, `foo` in every row and `bar` in fifteen of sixteen, and a
  * btree on the key.  `foo <-> !bar` selects a sixteenth of the rows by
- * core's estimate, and its position filter decides every row: at three keys
- * a nested loop over the btree, which fetches the keys' 30 rows and tests
- * them, is the plan, where the FK-side join's counts, each decoding both
- * lexemes' members up to its key's ten rows, take ten times as long on the
- * release build (0.33 ms against 3.2 ms); priced over a sixteenth of the
- * candidates and `foo`'s members alone, the join was taken.  At a hundred
- * keys a hash join over a sequential scan of the fact is the plan, priced
- * below the FK-side join, which collects the filter once and takes less than
- * half as long on a release build (1.4 ms against 3.2 ms).
+ * core's estimate, and its position filter decides every row.  At three keys
+ * the FK-side join's counts, each seeking its key's ten rows among both
+ * lexemes' 20,000 members, are the plan, priced below any nested loop of the
+ * dimension into the fact: 0.15 to 0.24 ms on the release build with the
+ * cache warm, where the nested loop over the btree, which fetches the keys'
+ * 30 rows and tests them, takes 0.06 to 0.09 ms.  Core prices those heap
+ * pages at random_page_cost whether they are cached or not; read from disk,
+ * the counts were the faster at two million rows (DESIGN.md §17, "The
+ * price").  At a hundred keys a hash join over a sequential scan of the fact
+ * is the plan, priced below the FK-side join, which collects the filter once
+ * and takes half as long on a release build (1.3 ms against 2.6 to 2.9 ms).
  */
 CREATE TABLE fp_not (id int, fk int, d tsvector) WITH (autovacuum_enabled = off);
 INSERT INTO fp_not
@@ -275,9 +278,9 @@ END $$;
 SELECT k, fp_plan(format($q$SELECT count(*) FROM fp_not f JOIN fp_ndim d
 	ON f.fk = d.pk WHERE d.pk <= %s AND f.d @@ 'foo <-> !bar'$q$, k)) AS plan
 FROM (VALUES (3), (100)) v(k);
-  k  |              plan              
------+--------------------------------
-   3 | Nested Loop, fact by fp_not_fk
+  k  |            plan             
+-----+-----------------------------
+   3 | LionCount
  100 | Hash Join, fact by no index
 (2 rows)
 

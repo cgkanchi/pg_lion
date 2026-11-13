@@ -7685,29 +7685,45 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     safe"): a row the snapshot sees keeps its TID and its positions, and a TID that changes hands
     in between is a row the snapshot does not see, which a copy may keep or drop as a stale copy
     may (§27, "Why a stale copy is safe").
-  - **The price** (`lion_cost_posfilter()`).  A cursor decodes its chunk's members up to the
-    candidate's, so a count whose candidates lie close together - a copy's, a count of every
-    row - decodes each member of its lexemes once, and one whose candidates lie further apart than
-    a chunk holds decodes part of one at each: 1,606 to 1,703 members a seek, measured over trees
-    of 400,000 to 7.5 million members of one position (`LION_POS_SEEK_MEMBERS`, 1,650).  That was
-    with chunks of half a page; with the 512-byte chunks of "Block bounds" (2026-11-10), over 2
-    million members on a release build, a seek to every 10,000th member costs what 385 members do
-    and one to every 1,000th 180, against 1,585 and 1,200 before on the same machine (a count of
-    `r & foo <-> bar`, `r` in one row of 1,000: 50 ms to 6.4 ms).  The price is left at 1,650,
-    about four times high: it errs towards the plans it chose before, which now run faster.  Each
-    member decoded is `pg_lion.position_member_cost` (2.4 `cpu_operator_cost`), and each
-    candidate `pg_lion.position_check_cost` (4.3) a lexeme beyond that, `TS_execute()` and its
-    callbacks: 11.4 to 12.8 ns, the leaves a cursor steps and descends to included, and 21.6 ns
-    on the release build (§10, "The units"), at the reference's 5 ns a `cpu_operator_cost`.
+  - **The price** (`lion_cost_posfilter()`, `lion_pos_seek_members()`).  A cursor moves from
+    where it stood to the candidate's member: the members between are decoded while they are in
+    the chunk it reads, the chunks after that are stepped over by their headers while they are on
+    its leaf, the next leaf is taken by its right link, and a candidate further right than that is
+    reached by a descent.  So a count whose candidates lie close together - a copy's, a count of
+    every row - decodes each member of its lexemes once, and a seek to a candidate further away
+    costs less than the members it passes over and grows more slowly than they do: about
+    7 gap^0.4 members, and at most 470, a descent and a leaf.  Fitted on a release build
+    (2026-11-12) to counts of one key's rows among 2 million - one in 2 to one in 100,000 of them -
+    ANDed with `foo <-> bar`, every row holding both once, less the same counts of `foo & bar`,
+    in members at that machine's own cost of one (the count of every row): 2.4 a seek at a gap of
+    2, 20 at 30, 45 at 100, 74 at 300, 105 at 1,000, 180 at 3,000, 240 to 360 at 10,000 and 430
+    to 470 past 30,000; trees of 400,000 and 7.5 million members came out within a third of those.
+    Until then a seek was `LION_POS_SEEK_MEMBERS` = 1,650 members wherever the gap passed that,
+    fitted when a chunk held half a page and a seek decoded half of one (1,606 to 1,703 measured
+    over trees of 400,000 to 7.5 million members): up to ten times what a seek takes with the
+    512-byte chunks of "Block bounds".  Each member decoded is `pg_lion.position_member_cost`
+    (2.4 `cpu_operator_cost`), and each candidate `pg_lion.position_check_cost` (4.3) a lexeme
+    beyond that, `TS_execute()` and its callbacks: 11.4 to 12.8 ns, the leaves a cursor steps and
+    descends to included, and 21.6 ns on the release build (§10, "The units"), at the reference's
+    5 ns a `cpu_operator_cost`.
     *(Fitted on 2 and 10 million rows, `foo` and `bar` in three rows of four and `new` and
     `york` in a fifth, where the probing counts run at 453 to 487 units a millisecond and a count
     of every row at 476 to 511.  A fit on 400,000 rows, whose trees are a few leaves, comes to
     1.8 and 1,000, which over the larger trees prices the probing counts at 211 to 263 units a
-    millisecond and takes the FK-side join of `new <-> york` at 3 and 20 keys of 2 million rows -
-    2.5 ms against the nested loop's 0.37, 15 against 3.5 - and at 20 keys of 10 million, 21
-    against 2.7; at 2.4 and 1,650 each of those takes the nested loop.  At 200 keys of 10 million
-    the join still collects the filter, 144 ms against the nested loop's 30: core prices that
-    nested loop at its own rate, which §39 holds out.)*  The candidates are the SUPERSET's rows,
+    millisecond.  With the seek refitted, the FK-side join of `new <-> york` - a fifth of 2
+    million rows, 100 a key, a btree on the key - is taken over the nested loop at 3 and 20 keys:
+    on a warm cache 0.8 ms against the nested loop's 0.3, and 3.5 against 1.5; from a cold one
+    (the server restarted, the OS cache dropped) 5 to 8 ms against 9 to 10, and 12 to 16 against
+    57 to 67.  At 200 keys the join is taken either way.  Core prices that nested loop's heap
+    fetches as reads whether or not they are cached, at its own rate, which §39 holds out.  For
+    the same reason a lion scan of the fact is taken as the nested loop's inner side over the
+    btree's at a few keys of 20,000 rows: 60 to 70 µs a key on a warm cache against 15 to 30.
+    Over 400,000 rows, 200 a key, `foo` in every row and `bar` in fifteen of sixteen, the join's
+    probing counts of `foo <-> !bar` are taken from 1 key, where 1,650 took the nested loop over
+    the btree up to 10: at 2, 5 and 10 keys 1.2, 2.7 and 4.9 ms warm against 0.3, 0.7 and 1.4,
+    and 6 to 10, 10 to 11 and 12 to 19 ms cold against 12 to 16, 27 to 31 and 50 to 58.  At 20
+    keys, where 1,650 took a hash join over a sequential scan of the fact, 10 ms against 56.)*
+    The candidates are the SUPERSET's rows,
     not the clause's (`lion_tsquery_pos_shape()`): each operand is estimated as core estimates a
     query of it alone, the clause and its superset are combined from those as core combines a
     tsquery's operands, and the candidates are the rows the caller's filters select times the
@@ -7734,11 +7750,8 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     product: `new <-> york`'s, over 10,000 rows in two partitions, at 11 against 31 on the same
     rows unpartitioned.  A cursor is a lexeme's, one for each the query names, those under a
     NOT too, and its members are the rows that have the lexeme.  Priced from the clause's own rows
-    and the superset's one lexeme, `foo <-> !bar` would come to a sixteenth of what it takes:
-    over 400,000 rows and 2,000 keys, the FK-side join would be taken at one to ten keys over a
-    nested loop into a btree of the fact's key that runs 8 to 40 times as fast (1.2 ms against
-    18 ms at two keys, on the release build); and the correlated phrase's probing counts would be
-    priced at a fifth of their time.  The copy is priced once for its candidates, and every
+    and the superset's one lexeme, `foo <-> !bar` would come to a sixteenth of what it takes,
+    and the correlated phrase's probing counts would be priced at a fifth of their time.  The copy is priced once for its candidates, and every
     other count for its own, its lexemes decoded up to them - which an FK-side join's probing
     counts, their candidates a few of every part of the heap, pay at almost every one.
     The heap recheck (`lion_cost_recheck()`) charges such a clause nothing.  An AM scan, plain or
@@ -15119,7 +15132,8 @@ copy's size is the planner's formula over the rows the filters' product leaves, 
 independent, in no more containers than the sparsest filter has. A clause the row filter decides
 from stored positions (`LionClauseState.posfilter`) is decided as the copy is made: each row the
 product leaves sought under each of the clause's lexemes, and each lexeme's members decoded - its
-set's rows, at most `LION_POS_SEEK_MEMBERS` a row - at the planner's prices (§17, "The price").
+set's rows, or what the seeks to the rows take where they lie further apart
+(`lion_pos_seek_members()`) - at the planner's prices (§17, "The price").
 No price - no switch - where no copy can be made: a hot standby, filters that only subtract, a list located a batch at a time. A
 copy expected not to fit a hash join's memory (`get_hash_memory_limit()`, what a plan that collects
 is given) is priced as it will be made, SPILLED: its pages written once - and every count after the
