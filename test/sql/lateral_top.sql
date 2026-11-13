@@ -129,11 +129,24 @@ SELECT DISTINCT ON (country) country, id, ts FROM lt_e
  ORDER BY country, ts DESC$$);
 
 -- ---- row_number() <= k: the first k rows of each group ----
-EXPLAIN (COSTS OFF)
+-- (the window's plan as PostgreSQL 16 and 17 print it: no "Window:" line, and
+-- its function's window unnamed)
+CREATE FUNCTION lt_plan(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		CONTINUE WHEN ln ~ '^\s*Window: ';
+		RETURN NEXT regexp_replace(ln, 'OVER w[0-9]+', 'OVER (?)', 'g');
+	END LOOP;
+END
+$$;
+SELECT * FROM lt_plan($$
 SELECT * FROM (SELECT id, country, ts,
 					  row_number() OVER (PARTITION BY country ORDER BY ts DESC) AS rn
 				 FROM lt_e WHERE status = 'paid') s
- WHERE rn <= 3;
+ WHERE rn <= 3$$) AS p("QUERY PLAN");
 SELECT lt_check($$
 SELECT * FROM (SELECT id, country, ts,
 					  row_number() OVER (PARTITION BY country ORDER BY ts DESC) AS rn
@@ -330,4 +343,5 @@ RESET pg_lion.enable_lateral_tops;
 
 DROP TABLE lt_e, lt_c, lt_pt;
 DROP FUNCTION lt_check(text);
+DROP FUNCTION lt_plan(text);
 DROP FUNCTION lt_h(int8, int8, int8);

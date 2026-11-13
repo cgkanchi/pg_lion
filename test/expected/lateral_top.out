@@ -207,16 +207,28 @@ SELECT DISTINCT ON (country) country, id, ts FROM lt_e
 (1 row)
 
 -- ---- row_number() <= k: the first k rows of each group ----
-EXPLAIN (COSTS OFF)
+-- (the window's plan as PostgreSQL 16 and 17 print it: no "Window:" line, and
+-- its function's window unnamed)
+CREATE FUNCTION lt_plan(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		CONTINUE WHEN ln ~ '^\s*Window: ';
+		RETURN NEXT regexp_replace(ln, 'OVER w[0-9]+', 'OVER (?)', 'g');
+	END LOOP;
+END
+$$;
+SELECT * FROM lt_plan($$
 SELECT * FROM (SELECT id, country, ts,
 					  row_number() OVER (PARTITION BY country ORDER BY ts DESC) AS rn
 				 FROM lt_e WHERE status = 'paid') s
- WHERE rn <= 3;
+ WHERE rn <= 3$$) AS p("QUERY PLAN");
                                           QUERY PLAN                                           
 -----------------------------------------------------------------------------------------------
  WindowAgg
-   Window: w1 AS (PARTITION BY country ORDER BY lt_e.ts ROWS UNBOUNDED PRECEDING)
-   Run Condition: (row_number() OVER w1 <= 3)
+   Run Condition: (row_number() OVER (?) <= 3)
    ->  Incremental Sort
          Sort Key: country, lt_e.ts DESC
          Presorted Key: country
@@ -228,7 +240,7 @@ SELECT * FROM (SELECT id, country, ts,
                ->  Limit
                      ->  Index Scan using lt_e_ts on lt_e
                            Filter: ((status = 'paid'::text) AND (country = country))
-(14 rows)
+(13 rows)
 
 SELECT lt_check($$
 SELECT * FROM (SELECT id, country, ts,
@@ -635,4 +647,5 @@ SELECT DISTINCT ON (country) country, id, ts FROM lt_e
 RESET pg_lion.enable_lateral_tops;
 DROP TABLE lt_e, lt_c, lt_pt;
 DROP FUNCTION lt_check(text);
+DROP FUNCTION lt_plan(text);
 DROP FUNCTION lt_h(int8, int8, int8);
