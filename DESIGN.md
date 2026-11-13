@@ -16122,7 +16122,8 @@ counts t's rows WITHOUT a qualifying inner row: a complement of the forward semi
 which no count per key gives, and core's plan is an anti join over the whole of t. Where the inner
 side is a few rows, the complement is cheap the other way round: count t's WHERE as the count
 pushdown counts any, and take away the rows of it that some inner row matches, which a B-tree on
-`t.k` finds a key at a time.
+`t.k` finds a key at a time - or, where the join is on one column of `t`, a lion index on it as a
+list of the keys ("The anti join as a negated list" below).
 
 **What is computed.**
 
@@ -16649,6 +16650,102 @@ keys in the heap's order under a WHERE of a hundredth that it counts 1.4 times s
 WHERE at all, keys in the heap's order, it left to core inner sides of up to 10,000 keys that the
 node counts twice as fast - by the price of counting the whole table against a merge join, the
 count's own, not the lookups'.
+
+### The anti join as a negated list (2026-11-13)
+
+The anti join over a small inner side needs a B-tree on `t.k`, and its lookups grow with the keys:
+a key and its rows fetched at a time, each row tested. Without that B-tree the query went to core's
+hash anti join, which reads the whole WHERE of t. But the rows the anti join keeps are a set the
+lion index on `k` answers directly:
+
+    NOT EXISTS (SELECT 1 FROM s WHERE s.a = t.k AND <filters on s>)
+      = rows of t whose k is none of the inner side's keys
+      = t \ rows(k = ANY (keys))
+
+A row of t is kept where no inner row's key equals its k: never true of a NULL k, the operator
+being strict, so a NULL k is kept; and otherwise where k is none of the keys - the complement of the
+IN list `k = ANY (keys)`, whose rows the lion index answers exactly as it answers any IN list (§15),
+with an inner row's NULL key left out of the list, as it matches no row. So the NOT EXISTS is a
+negated clause of the count's WHERE, `LION_CLAUSE_NOTIN`, beside §35's: the rows it rejects are the
+list's, subtracted at every container key, and a NULL row passes it as it passes `IS DISTINCT
+FROM`. The count is t's count of W less those rows, by the same merge as every other negated
+source - one count, a GROUP BY's groups, `count(col)`.
+
+**Recognition.** The anti join is `lion_fkjoin_recognize_small_anti()`'s, the NOT EXISTS or its
+`LEFT JOIN ... IS NULL` spelling, and the build is made once more beside the B-tree's
+(`lion_try_count_anti_path()`; add_path() keeps the cheaper), folding each arm into one NOTIN clause
+(`lion_count_path_antifold()`) where its one join clause is its key: a plain column of t, compared
+by its operator - commuted where the inner side is on the left - with a plain column of the inner
+side, through relabels. Whether a lion index on t's column answers the operator as an IN list's
+equality, under its collation, is `lion_match_index()`'s as for any clause; one that does not
+declines the build, as does any arm that does not fold: a second join clause, an inner expression,
+an operator with no commutator. Folded, the count is one plain table's, ungrouped or grouped by one
+or two of its columns, serial: not partitions, a `count(DISTINCT)`, cells, the decoded walk, a top
+k, filtered counts, the aggregates over keys or of slices, a coalesce group or expression columns
+(`lion_count_path_antifold_priv()`, held by `lion_count_priv_check()`), nor beside a multi-key
+query that may narrow nothing, whose heap scan tests no NOTIN clause on a row
+(`lion_where_scan_untested()`).
+
+**The keys.** Each arm's inner side is a child of the node, its cheapest total path, run whole at
+the start of each run (`lion_antifold_values()`) - and again at a rescan - its key's column read off
+every row, NULLs left out, into the list's array; past as many as a count locates at once
+(`lion_array_batch_size()`) into a tuplestore of work_mem that spills, as a dimension that only
+filters has its keys collected (`lion_child_key_values()`, the two share it). Duplicates stay: the
+list's lookup locates a batch's once, and a union takes a key's rows once. The list, however short,
+is collected into one set (`lion_locate_list()`): pinless, within what is left of hash_mem and into
+a file past it, a negated source to seek at each container key rather than a union of a set a key
+merged at every count. A stale copy can only subtract dead rows and rows inserted after the
+snapshot, the argument that lets any negated set be copied (§32, "Why the counts stay exact"). The
+child runs under the query's snapshot, as the anti join's inner side would have.
+
+**The price.** The list's lookups, its containers read and their union built, as an IN list's of
+as many keys as the child is expected to return (`lion_count_rel_notin()` over the clause
+`lion_keys_costclause()` makes: `k = ANY` over that many NULL placeholders, its selectivity the
+inner side's distinct keys over k's distinct values - the containment core's semi join estimate
+assumes too), its set walked once into memory and sought there by the merges; the children's
+prices before the first row, as the B-tree lookups' children are. `lion_list_sample_sel()` now
+leaves an array of NULL placeholders to its RestrictInfo's selectivity: it had sampled none of its
+values and called the list's share 0, which priced a dimension that only filters with more than a
+thousand keys as selecting nothing.
+
+**EXPLAIN** prints the clause as the anti join it answers, the key the child's column it is read
+from, and under ANALYZE the keys the lists were made of and the lists collected:
+
+    Custom Scan (LionCount) (actual rows=1 loops=1)
+      Lion Indexes: lcl_rows_x (x = 3), lcl_rows_k (NOT EXISTS (k = s.a))
+      Lists Collected: 1
+      Anti Join Keys: 8
+      ->  Seq Scan on lcl_skip s (actual rows=9 loops=1)
+            Filter: (f = 0)
+
+The plan carries the arms in `LION_PRIV_ANTIFOLD` (shape 36): each one's clause and its key's
+column, the inner side's relid and attnum at the PATH stage, the child's resno at the PLAN stage.
+EXECUTE on the function of each arm's operator, as the query wrote it, is asked of whoever runs the
+plan (`lion_replaced_functions()`), as of any clause lion answers; core's hash join, which commutes
+the clause, asks its commutator's instead. `pg_lion.enable_count_anti_list` turns the fold off, and
+`pg_lion.enable_count_anti` both routes.
+
+**Measured** (2026-11-13, PostgreSQL 18, release build, warm): a table of 2,000,000 events with
+lion indexes on `status`, `country` and `user_id` and no B-tree but its primary key's, and a users
+table of 200,000 whose NOT EXISTS keeps the events of users not on one plan, a quarter of them, or
+of a few hundred users; core's plan a parallel hash anti join with up to two workers, LionCount
+serial:
+
+| query | inner keys | LionCount | core's plan |
+|---|---|---|---|
+| `status = 'paid'` (a fifth of the rows) | 49,935 | 90 ms | 209 ms |
+| `status = 'paid'` | 504 | 5.7 ms | 112 ms |
+| GROUP BY country (50 groups), no WHERE | 49,935 | 128 ms | 356 ms |
+
+The model chose the node in each. With a B-tree on `user_id` as well, the fold still won: 89 ms
+against core's 133 ms at 49,935 keys (the B-tree's lookups not chosen), 4.5 ms against the
+B-tree's lookups' 10.9 ms and core's 77 ms at 504, and 106 ms against 309 ms grouped.
+
+`test/sql/countanti_list.sql` checks every answer against core's
+plan: each WHERE form, counts of columns, one and two grouping columns, empty and NULL inner sides,
+cross-type and text keys, two arms, the LEFT JOIN spelling, a list past work_mem, rescans with
+parameters on either side, generic plans, a snapshot with deletes of either table, EXECUTE revoked
+and row-level security.
 
 ### The dimension from a B-tree (2026-10-20)
 

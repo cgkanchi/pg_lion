@@ -33,6 +33,7 @@ bool		lion_enable_count_partial = true;
 create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 bool		lion_enable_semijoin = true;
 bool		lion_enable_count_anti = true;
+bool		lion_enable_count_anti_list = true;
 set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook = NULL;
 
 const CustomPathMethods lion_count_path_methods = {
@@ -1347,11 +1348,36 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		list_free(vars);
 	}
 
+	/*
+	 * The NOT EXISTS folded into NOTIN clauses (DESIGN.md §27, "The anti join
+	 * as a negated list"): each arm's key, a column of its child's target
+	 * list, which the node reads the keys from - its resno there now.
+	 */
+	if (priv.nantifold > 0)
+	{
+		int			a;
+
+		if (list_length(custom_plans) != priv.nantifold ||
+			list_length(best_path->custom_paths) != priv.nantifold)
+			elog(ERROR, "LionCount: an anti join list needs a child plan an arm");
+		for (a = 0; a < priv.nantifold; a++)
+		{
+			Var		   *kvar = makeVar((int) priv.antifoldrelid[a],
+									   priv.antifoldcol[a],
+									   InvalidOid, -1, InvalidOid, 0);
+
+			priv.antifoldcol[a] =
+				lion_child_resno((Plan *) list_nth(custom_plans, a), kvar);
+			priv.antifoldrelid[a] = 0;
+		}
+	}
+
 	cscan->scan.plan.targetlist = tlist;
 	cscan->scan.plan.qual = list_concat_copy(having, priv.cellquals);
 	cscan->scan.scanrelid = 0;
 	cscan->flags = best_path->flags;
-	cscan->custom_plans = priv.hasanti ? custom_plans : NIL;
+	cscan->custom_plans = (priv.hasanti || priv.nantifold > 0) ?
+		custom_plans : NIL;
 
 	/*
 	 * The clause values move from custom_private into custom_exprs, which is
