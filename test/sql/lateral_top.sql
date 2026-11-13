@@ -5,6 +5,10 @@
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
+/* VACUUM can only set all-visible for commits that reached disk (citext.sql). */
+SET synchronous_commit = on;
+/* every row in ANALYZE's sample, so that the estimates are the same each run */
+SET default_statistics_target = 1000;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
 SET max_parallel_workers_per_gather = 0;
 
