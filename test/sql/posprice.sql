@@ -116,10 +116,14 @@ SELECT round(((pq_count('pq_part', 'new <-> york') - pq_count('pq_part', 'new & 
  * the heap, `alpha beta` in two of five and a btree on the key.  The AND of
  * `alpha` and `beta` holds 2.5 times core's product of them, less than the
  * three times a rows estimate takes from the intersection probe (DESIGN.md
- * §29.11): priced over that product, the FK-side join's counts at three
- * keys, each deciding its key's four candidates from both lexemes' 8,000
- * members, would be taken over a nested loop that fetches the keys' 30 rows and
- * tests them, ten times as fast.  At a hundred keys the join collects the
+ * §29.11).  At three keys the FK-side join's counts, each seeking its key's
+ * four candidates among both lexemes' 8,000 members, are the plan, priced
+ * below any nested loop of the dimension into the fact: 0.12 ms on the
+ * release build with the cache warm, where the nested loop over the btree,
+ * which fetches the keys' 30 rows and tests them, takes 0.045 ms.  Core
+ * prices those heap pages at random_page_cost whether they are cached or
+ * not; read from disk, the counts were the faster at two million rows
+ * (DESIGN.md §17, "The price").  At a hundred keys the join collects the
  * filter once and is the plan.
  */
 CREATE TABLE pq_fact (id int, fk int, d tsvector) WITH (autovacuum_enabled = off);

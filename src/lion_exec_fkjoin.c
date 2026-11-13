@@ -517,9 +517,9 @@ lion_join_node_size(const LionKeyNode *node, const LionPostingSet *sets,
  * fits.  A clause the row filter decides from stored positions
  * (LionClauseState.posfilter) is decided as the copy is made, every row the
  * copy would hold sought under each of its lexemes (LION_POS_CHECK_COST),
- * and each lexeme's members decoded on the way - its set's rows, or
- * LION_POS_SEEK_MEMBERS a candidate where the candidates are fewer
- * (LION_POS_MEMBER_COST, lion_cost_posfilter()).  What cannot
+ * and each lexeme's members decoded on the way - its set's rows, or less
+ * where the candidates are fewer (lion_pos_seek_members(),
+ * LION_POS_MEMBER_COST, lion_cost_posfilter()).  What cannot
  * be collected is what lion_join_collect_into() refuses: filters that only
  * subtract, a list located a batch at a time.
  */
@@ -630,7 +630,7 @@ lion_join_copy_price(LionCountScanState *st, Size budget, double *pages)
 	copyrows = tuples * Min(frac, 1.0);
 	cost += copyrows * poskeys * LION_POS_CHECK_COST;
 	for (j = 0; j < nposmembers; j++)
-		cost += Min(posmembers[j], Max(copyrows, 1.0) * LION_POS_SEEK_MEMBERS) *
+		cost += lion_pos_seek_members(posmembers[j], Max(copyrows, 1.0)) *
 			LION_POS_MEMBER_COST;
 	pfree(posmembers);
 	copykeys = Max(Min(copykeys, copyrows), 1.0);
