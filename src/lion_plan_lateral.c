@@ -209,7 +209,7 @@ lion_lateral_drop(Node *jt, Node *clause)
  * partitioned table's own (partitioned) index counts: its partitions' are
  * the same method's.
  */
-static bool
+bool
 lion_lateral_lion_key(Oid relid, AttrNumber attno)
 {
 	Oid			lionam = lion_get_am_oid();
@@ -592,7 +592,9 @@ lion_lateral_plan_alt(Query *alt, const char *query_string, int cursorOptions,
 
 /*
  * The planner hook: the query as written, and - where lion_lateral_rewrite()
- * makes another of it - as rewritten, the cheaper of the two plans kept.  A
+ * or lion_top_rewrite() (lion_plan_grouptop.c, §57: the first rows of each
+ * group, probed per key) makes another of it, the two in one copy where both
+ * do - as rewritten, the cheaper of the two plans kept.  A
  * cursor that asks for its first rows fast is planned as written alone,
  * since the two plans' total costs are not what it is decided on, and so is
  * a query planned in a parallel worker, which cannot start a subtransaction,
@@ -611,10 +613,20 @@ lion_lateral_planner(Query *parse, const char *query_string,
 	PlannedStmt *plan;
 	PlannedStmt *altplan;
 
-	if (lion_enable_lateral_counts &&
+	if ((lion_enable_lateral_counts || lion_enable_lateral_tops) &&
 		(cursorOptions & CURSOR_OPT_FAST_PLAN) == 0 && !IsInParallelMode() &&
 		!RecoveryInProgress())
-		alt = lion_lateral_rewrite(parse);
+	{
+		Query	   *top;
+
+		if (lion_enable_lateral_counts)
+			alt = lion_lateral_rewrite(parse);
+		/* the first rows of each group probed per key (§57) */
+		top = lion_enable_lateral_tops ?
+			lion_top_rewrite(alt != NULL ? alt : parse) : NULL;
+		if (top != NULL)
+			alt = top;
+	}
 	plan = lion_lateral_plan(parse, query_string, cursorOptions, boundParams
 #if PG_VERSION_NUM >= 190000
 							 ,es

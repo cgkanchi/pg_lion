@@ -35860,3 +35860,127 @@ and `FILTER`, aggregates lion does not count per key, a join inside the subquery
 relation outside it, two subqueries, a text key, a view, many outer rows, every decline above,
 the setting off, and a prepared statement's custom and generic plans; every answer compared with
 the setting off), and `test/modules/lion_hooktest/sql/hooks_lion_outer.sql` (the refusing hook).
+
+## 57. The first rows of each group, planned again as a probe per key (2026-11-13)
+
+    SELECT DISTINCT ON (country) country, id, ts
+      FROM ev WHERE status = 'paid' ORDER BY country, ts DESC;
+
+    SELECT * FROM (SELECT id, country, ts,
+                          row_number() OVER (PARTITION BY country ORDER BY ts DESC) AS rn
+                     FROM ev WHERE status = 'paid') s
+     WHERE rn <= 3;
+
+    SELECT country, max(ts) FROM ev WHERE status = 'paid' GROUP BY country;
+
+PostgreSQL answers each by reading every paid row, sorting or hashing them by `country`, and
+keeping the first one or three of each group, or the greatest `ts`. Each needs only the first k
+rows of each group in one order, which the same query finds one group at a time:
+
+    SELECT ... FROM (SELECT DISTINCT country FROM ev WHERE status = 'paid') k,
+         LATERAL (SELECT ... FROM ev WHERE status = 'paid' AND country = k.country
+                   ORDER BY ts DESC LIMIT 1) l
+
+The keys that have a row the WHERE keeps come from LionCount's first-visible-row grouping (§10),
+in key order; each key's first rows from an ordered walk with `LIMIT`: a B-tree on `ts`
+filtered by the WHERE, or `LionOrdered` over a lion index's ordered column (§30.11).
+`pg_lion.enable_lateral_tops` (lion_plan_grouptop.c) makes that rewrite and lets the planner
+choose, through §56's planner hook: the query is planned as written and as rewritten, and the
+cheaper plan is kept, with §56.2's rules (a fast-start cursor, a parallel worker and a hot standby
+plan the query as written; an error planning the rewrite is dropped with its plan). Both rewrites
+go into the one second plan when a query has shapes of both.
+
+### 57.1 The rewrite
+
+`lion_top_apply()` replaces the query's one relation `t` with the join above, `l` taking `t`'s place
+in the range table, and leaves the rest of the query as it was: the DISTINCT ON and its ORDER BY,
+the window and the outer query's filter on it, the grouping and its aggregates now run over the rows
+the probes return. `l`'s columns are the columns of `t` the query reads outside its WHERE,
+renumbered; the WHERE goes into both subqueries, and the probe adds `g = k.g` with the grouping's
+own equality and collation, and `ORDER BY <order> LIMIT k`. The grouping column itself is read
+from `k`, not `l`, where equal values are spelled alike (`lion_type_equalimage()` under the type's
+own equality), so the result prints the same; the planner then sees one row per key where it
+would have taken `l`'s column, whose rows are one probe's few, for a single group, and estimated
+every grouping or DISTINCT above as one row.
+
+### 57.2 When the two are the same query
+
+The rows the probes return are the first k of each group of `g` in the order, and the rest of the
+query gives the same answer over them:
+
+- **DISTINCT ON (g) ... ORDER BY g, <order>** keeps the first row of each group in `<order>`: k = 1,
+  the order the ORDER BY's items after `g`.
+- **row_number() OVER (PARTITION BY g ORDER BY <order>)** in a subquery of the FROM list, with an
+  ANDed clause of the outer query's WHERE `rn <= c`, `rn < c` or `rn = c` (either way round, `c` a
+  constant integer): the rows the clause keeps are among the first `c` of each group (`c - 1` for
+  `<`, none for `c <= 0`). The clause is one of the WHERE's ANDed clauses, so a row of the subquery
+  it rejects reaches nothing of the outer query's result whatever its joins: a join pairs the row
+  and the WHERE removes the pair, and an outer join that had paired a row only with rejected ones
+  now NULL-extends it, which the strict clause removes as well. Every window function of the
+  subquery is that row_number(), and nothing of it - LIMIT, OFFSET, DISTINCT, an aggregate -
+  sees all its rows. A row_number() of rows tied in the order numbers them in either order, as the
+  sort as written does.
+- **GROUP BY g** where every aggregate is one whose result is the first value of its argument in
+  its sort operator's order (`pg_aggregate.aggsortop`: min, max, bool_and, bool_or, every), all of
+  one argument and one operator, without FILTER, DISTINCT or ORDER BY: k = 1, the order the
+  argument by that operator, NULLs last so that the first row has a value where the group has one.
+  Where the argument is a column the rows never have NULL in, the order's own NULL placement is
+  taken instead (first, for a descending one), which an index's default order provides.
+- **g is a plain column of the table with a lion index among whose keys it is, and never NULL in
+  the rows read**: declared NOT NULL (by a valid constraint, from PostgreSQL 18 on; not trusted on
+  an inheritance parent that has children, which may disagree), or rejected by the WHERE
+  (`find_nonnullable_vars()`). The probe's equality meets no NULL, so a NULL group would be lost.
+- **The query reads one table** and nothing else: no join, set operation, CTE, sublink,
+  set-returning function in the target list, row lock, row-level security (including a role that
+  bypasses it, whose plan the cache keeps per role), TABLESAMPLE, volatile function or reference to
+  an outer query. Grouping sets are declined, and so is a GROUP BY whose other output columns rely
+  on a primary key (`constraintDeps`).
+
+Ties in the order are the query's own: DISTINCT ON over tied rows keeps one of them, and the probe's
+LIMIT keeps one of them, possibly another.
+
+### 57.3 Measured
+
+PostgreSQL 18.7, release build, 2 parallel workers per gather, warm, best of 6; a synthetic `ev`
+of 2,000,000 rows, 50 values of `country`, five of `status` (399,548 paid), 20 of `kind`, 200,000
+of `user_id`, every column NOT NULL, lion indexes on those and on `flag` and `ts`, a B-tree on `ts
+DESC`:
+
+| query | as written | rewrite on |
+| --- | --- | --- |
+| DISTINCT ON (country), paid | 465 ms | 1.9 ms |
+| row_number() <= 3 by country, paid | 469 ms | 6.7 ms |
+| country, max(ts), paid | 145 ms | 1.8 ms |
+| DISTINCT ON (country) *, no WHERE | 1,426 ms | 0.8 ms |
+| kind, max(ts), void in one country | 34 ms | 7.9 ms |
+| DISTINCT ON (country), paid, kind = 3, flag (6,674 rows) | 45 ms | as written |
+| DISTINCT ON (user_id), paid (172,675 groups) | 270 ms | as written |
+| user_id, max(ts), paid | 291 ms | as written |
+
+Without the B-tree, the probes walk the lion index on `ts` (`LionOrdered`, `Ordered By: ev_ts (ts,
+backward)`): the first query 716 ms as written against 4.6 ms. A query that qualifies is planned
+twice: 0.44 ms against 0.24 for the first.
+
+### 57.4 Not done
+
+- A grouping column that may be NULL in the rows read: the NULL group would need a probe of its
+  own (`g IS NULL`), as a UNION ALL arm.
+- Several grouping columns (`DISTINCT ON (a, b)`, `PARTITION BY a, b`, `GROUP BY a, b`), whose
+  keys are pairs, and a grouping expression.
+- `rank()` and `dense_rank()`, whose bound keeps the ties past the k-th row; a bound that is a
+  parameter (`rn <= $1`), whose value is not known when the probe's LIMIT is made.
+- A join in the query, or a view over the table (planned as a subquery the rewrite does not open).
+- The probe filters by the WHERE row by row as the walk goes: a parameterized `LionOrdered` builds
+  its lion set again on every rescan, since the key is one of its clauses, so a probe that would
+  use the set prices it per key, and a selective WHERE of several lion columns (the sixth row
+  above) stays as written. A set of the clauses without the key, built once and intersected with
+  each key's posting set, is the way to take it.
+
+Tests: `test/sql/lateral_top.sql` (each shape; every column, another order, NULLs in the order,
+an ORDER BY's LIMIT and OFFSET, expressions of the row; a grouping column that may be NULL with
+and without a WHERE that rejects it; the bound written each way, beside other filters, `rn = c`,
+`rn <= 0`; the outer query joining, sorting and grouping; min, max of a column with NULLs, the
+same aggregate twice, HAVING, ORDER BY and LIMIT of the groups; the shapes inside another query; a
+prepared statement's generic and custom plans; a partitioned table; many groups; every decline
+above; the setting off; every answer compared with the setting off), and
+`test/modules/lion_hooktest/sql/hooks_lion_outer.sql` (the refusing hook).

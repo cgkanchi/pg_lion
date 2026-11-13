@@ -2268,6 +2268,16 @@ extern void lion_selfuncs_init(void);
 /* lion_plan_lateral.c: a grouped subquery joined in, tried as LATERAL (§56) */
 extern PGDLLIMPORT bool lion_enable_lateral_counts;
 extern void lion_lateral_init(void);
+extern bool lion_lateral_lion_key(Oid relid, AttrNumber attno);
+
+/*
+ * lion_plan_grouptop.c: the first rows of each group - DISTINCT ON,
+ * row_number() <= k, min/max per group - tried as a LATERAL probe of each
+ * group's key (§57)
+ */
+extern PGDLLIMPORT bool lion_enable_lateral_tops;
+extern Query *lion_top_rewrite(Query *parse);
+extern void lion_top_init(void);
 
 /*
  * The INLINE limit lion index idx's entries were written under, from its meta
