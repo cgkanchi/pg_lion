@@ -1240,19 +1240,53 @@ typedef struct LionVColScope
  * 4.3: `foo <-> bar` decides its 7.5 million candidates in 528 ms beyond
  * what `foo & bar` takes, priced at 476 units a millisecond.
  *
- * A seek decodes a chunk's members from the first, or from where the cursor
- * stood, up to the candidate's (lion_poscursor_seek()), skipping the chunks
- * before it by their headers: a cursor that walks every member once - the
- * candidates of one count, or a collection's, close together - decodes each
- * member once, and one whose candidates lie further apart than a chunk
- * decodes part of one at each, LION_POS_SEEK_MEMBERS on average: 1,606 to
- * 1,703 members a seek, measured, over trees of 400,000 to 7.5 million
- * members of one position.  Members of more positions, which a chunk holds
- * fewer of, cost more each.
+ * A seek moves a cursor from where it stood to the candidate's member
+ * (lion_poscursor_seek()): the members between are decoded while they are in
+ * the chunk it reads, the chunks after that are stepped over by their headers
+ * while they are on its leaf, the next leaf is taken by its right link, and a
+ * candidate further right than that is reached by a descent.  A cursor that
+ * walks every member once - the candidates of one count, or a collection's,
+ * close together - decodes each member once.  Further apart, a seek costs less
+ * than the members it passes over, and grows more slowly than they do: about
+ * LION_POS_SEEK_SCALE times the gap to the power LION_POS_SEEK_POWER, in
+ * members decoded, and at most LION_POS_SEEK_MEMBERS, a descent and a leaf
+ * (lion_pos_seek_members()).  Fitted on the release build to counts of one
+ * key's rows among 2 million - one in 2 to one in 100,000 of them - ANDed
+ * with `foo <-> bar`, every row holding both once, less the same counts of
+ * `foo & bar`, in members at that machine's own cost of one (from the count
+ * of every row): 2.4 a seek at a gap of 2, 20 at 30, 45 at 100, 74 at 300,
+ * 105 at 1,000, 180 at 3,000, 240 to 360 at 10,000 and 430 to 470 past
+ * 30,000.  Trees of 400,000 and 7.5 million members came out within a third
+ * of those.  With the half-page chunks before "Block bounds" a seek decoded
+ * half a chunk, and LION_POS_SEEK_MEMBERS was 1,650 members wherever the gap
+ * passed that (1,606 to 1,703 measured): up to ten times what a seek costs
+ * now.  Members of more positions, which a chunk holds fewer of, cost more
+ * each.
  */
 #define LION_POS_MEMBER_COST	(lion_position_member_cost * cpu_operator_cost)
 #define LION_POS_CHECK_COST		(lion_position_check_cost * cpu_operator_cost)
-#define LION_POS_SEEK_MEMBERS	1650.0
+#define LION_POS_SEEK_SCALE		7.0
+#define LION_POS_SEEK_POWER		0.4
+#define LION_POS_SEEK_MEMBERS	470.0
+
+/*
+ * The members' worth of decoding that `seeks` seeks in order over a lexeme's
+ * `members` take (above): every member when they are as many as the seeks,
+ * and LION_POS_SEEK_SCALE gap^LION_POS_SEEK_POWER, at most
+ * LION_POS_SEEK_MEMBERS, a seek when they lie `gap` members apart.  Never
+ * more than the members themselves.
+ */
+static inline double
+lion_pos_seek_members(double members, double seeks)
+{
+	double		gap;
+
+	if (members <= 0.0 || seeks <= 0.0)
+		return 0.0;
+	gap = members / seeks;
+	return seeks * Min(Min(gap, LION_POS_SEEK_SCALE * pow(gap, LION_POS_SEEK_POWER)),
+					   LION_POS_SEEK_MEMBERS);
+}
 
 /* Which walk a range bounds, for the cost model (DESIGN.md §28). */
 #define LION_RANGED_NONE	0
