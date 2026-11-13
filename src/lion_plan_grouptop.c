@@ -114,6 +114,17 @@ lion_top_upper_walker(Node *node, int *depth)
 	return expression_tree_walker(node, lion_top_upper_walker, depth);
 }
 
+/* Is e the grouping's RTE (PostgreSQL 18 on)? */
+static bool
+lion_top_group_rte(RangeTblEntry *e)
+{
+#if PG_VERSION_NUM >= 180000
+	return e->rtekind == RTE_GROUP;
+#else
+	return false;
+#endif
+}
+
 /* Does the tree read relation *ti's whole row? */
 static bool
 lion_top_wholerow_walker(Node *node, Index *ti)
@@ -158,13 +169,9 @@ lion_top_relation(Query *q)
 	foreach(lc, q->rtable)
 	{
 		i++;
-		if (i == (Index) rtr->rtindex)
-			continue;
-#if PG_VERSION_NUM >= 180000
-		if (((RangeTblEntry *) lfirst(lc))->rtekind == RTE_GROUP)
-			continue;
-#endif
-		return 0;
+		if (i != (Index) rtr->rtindex &&
+			!lion_top_group_rte((RangeTblEntry *) lfirst(lc)))
+			return 0;
 	}
 	rte = rt_fetch(rtr->rtindex, q->rtable);
 	if (rte->rtekind != RTE_RELATION || rte->securityQuals != NIL ||
