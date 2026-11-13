@@ -732,11 +732,12 @@ INSERT INTO lion_dr_args VALUES ('2026-03-05', '2026-03-05'),
 	('-infinity', '-infinity'), ('294276-12-31 23:59:59.999999', '4714-11-24 BC'),
 	('4714-11-24 00:00:00 BC', '5874897-12-31'), ('2000-01-01', NULL);
 CREATE FUNCTION lion_dr_run() RETURNS SETOF text LANGUAGE plpgsql AS $$
-DECLARE r record; x text;
+DECLARE r record; x record;
 BEGIN
 	FOR r IN SELECT * FROM lion_dr_args LOOP
+		-- all seven counts
 		EXECUTE format('EXECUTE lion_dr_r(%L, %L)', r.a, r.b) INTO x;
-		RETURN NEXT format('%s %s: %s', r.a, r.b, x);
+		RETURN NEXT format('%s %s: %s', r.a, r.b, x::text);
 	END LOOP;
 END $$;
 -- generic, custom, and with the rewrite off: the same counts
@@ -748,15 +749,15 @@ INSERT INTO lion_dr_res SELECT 'off', x FROM lion_dr_run() x;
 RESET pg_lion.enable_date_ranges;
 RESET plan_cache_mode;
 SELECT x, string_agg(how, ',' ORDER BY how) FROM lion_dr_res GROUP BY x ORDER BY x;
-                         x                          |     string_agg     
-----------------------------------------------------+--------------------
- -infinity -infinity: 1                             | custom,generic,off
- Mon Nov 24 00:00:00 4714 BC 12-31-5874897: 0       | custom,generic,off
- Sat Jan 01 00:00:00 2000 : 2                       | custom,generic,off
- Sun Dec 31 23:59:59.999999 294276 11-24-4714 BC: 0 | custom,generic,off
- Thu Mar 05 00:00:00 2026 03-05-2026: 16            | custom,generic,off
- Thu Mar 05 12:00:00 2026 03-15-0044 BC: 0          | custom,generic,off
- infinity infinity: 1                               | custom,generic,off
+                                   x                                    |     string_agg     
+------------------------------------------------------------------------+--------------------
+ -infinity -infinity: (1,6080,0,0,1,6079,1)                             | custom,generic,off
+ Mon Nov 24 00:00:00 4714 BC 12-31-5874897: (0,6079,1,6079,6079,1,0)    | custom,generic,off
+ Sat Jan 01 00:00:00 2000 : (2,6057,25,0,0,0,0)                         | custom,generic,off
+ Sun Dec 31 23:59:59.999999 294276 11-24-4714 BC: (0,1,6079,1,1,6079,0) | custom,generic,off
+ Thu Mar 05 00:00:00 2026 03-05-2026: (16,2767,3279,3254,3270,2810,16)  | custom,generic,off
+ Thu Mar 05 12:00:00 2026 03-15-0044 BC: (0,2767,3279,8,10,6070,2)      | custom,generic,off
+ infinity infinity: (1,1,6079,6079,6080,0,1)                            | custom,generic,off
 (7 rows)
 
 DEALLOCATE lion_dr_q;
@@ -808,6 +809,61 @@ SELECT lion_dr('date_trunc(''month'', ts) < (SELECT timestamp ''2026-03-05'')');
  as a range, 3313 rows
 (1 row)
 
+-- ---- a cached plan run by another role: one that may not run the bound
+-- functions gets the clause as written, not an error, since the query does
+-- not call them itself; the role that may gets the range again ----
+CREATE ROLE lion_dr_noexec;
+GRANT SELECT ON lion_dr_t TO lion_dr_noexec;
+REVOKE EXECUTE ON FUNCTION lion_day_first(date) FROM PUBLIC;
+SET plan_cache_mode = force_generic_plan;
+PREPARE lion_dr_s(date) AS SELECT count(*) FROM lion_dr_t WHERE ts::date = $1;
+SELECT * FROM lion_dr_plan($$EXECUTE lion_dr_s('2026-03-05')$$) AS p("QUERY PLAN");
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_dr_t_ts (ts >= lion_day_first($1) AND ts <= lion_day_last($1))
+(2 rows)
+
+EXECUTE lion_dr_s('2026-03-05');
+ count 
+-------
+    16
+(1 row)
+
+SET ROLE lion_dr_noexec;
+SELECT * FROM lion_dr_plan($$EXECUTE lion_dr_s('2026-03-05')$$) AS p("QUERY PLAN");
+            QUERY PLAN             
+-----------------------------------
+ Aggregate
+   ->  Seq Scan on lion_dr_t
+         Filter: ((ts)::date = $1)
+(3 rows)
+
+EXECUTE lion_dr_s('2026-03-05');
+ count 
+-------
+    16
+(1 row)
+
+RESET ROLE;
+SELECT * FROM lion_dr_plan($$EXECUTE lion_dr_s('2026-03-05')$$) AS p("QUERY PLAN");
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_dr_t_ts (ts >= lion_day_first($1) AND ts <= lion_day_last($1))
+(2 rows)
+
+EXECUTE lion_dr_s('2026-03-05');
+ count 
+-------
+    16
+(1 row)
+
+DEALLOCATE lion_dr_s;
+RESET plan_cache_mode;
+GRANT EXECUTE ON FUNCTION lion_day_first(date) TO PUBLIC;
+REVOKE SELECT ON lion_dr_t FROM lion_dr_noexec;
+DROP ROLE lion_dr_noexec;
 -- ---- the bound functions, called directly ----
 SELECT d, lion_day_first(d), lion_day_last(d)
   FROM unnest(ARRAY[date '2026-03-05', '0044-03-15 BC', 'infinity', '-infinity',

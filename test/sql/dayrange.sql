@@ -306,11 +306,12 @@ INSERT INTO lion_dr_args VALUES ('2026-03-05', '2026-03-05'),
 	('-infinity', '-infinity'), ('294276-12-31 23:59:59.999999', '4714-11-24 BC'),
 	('4714-11-24 00:00:00 BC', '5874897-12-31'), ('2000-01-01', NULL);
 CREATE FUNCTION lion_dr_run() RETURNS SETOF text LANGUAGE plpgsql AS $$
-DECLARE r record; x text;
+DECLARE r record; x record;
 BEGIN
 	FOR r IN SELECT * FROM lion_dr_args LOOP
+		-- all seven counts
 		EXECUTE format('EXECUTE lion_dr_r(%L, %L)', r.a, r.b) INTO x;
-		RETURN NEXT format('%s %s: %s', r.a, r.b, x);
+		RETURN NEXT format('%s %s: %s', r.a, r.b, x::text);
 	END LOOP;
 END $$;
 -- generic, custom, and with the rewrite off: the same counts
@@ -340,6 +341,28 @@ SELECT p, lion_dr(p) ~ '^as a range, ' AS ok FROM unnest(ARRAY[
 -- a subquery's value
 SELECT lion_dr('ts::date = (SELECT max(d) FROM (VALUES (date ''2026-03-05''), (''2026-03-04'')) v(d))');
 SELECT lion_dr('date_trunc(''month'', ts) < (SELECT timestamp ''2026-03-05'')');
+
+-- ---- a cached plan run by another role: one that may not run the bound
+-- functions gets the clause as written, not an error, since the query does
+-- not call them itself; the role that may gets the range again ----
+CREATE ROLE lion_dr_noexec;
+GRANT SELECT ON lion_dr_t TO lion_dr_noexec;
+REVOKE EXECUTE ON FUNCTION lion_day_first(date) FROM PUBLIC;
+SET plan_cache_mode = force_generic_plan;
+PREPARE lion_dr_s(date) AS SELECT count(*) FROM lion_dr_t WHERE ts::date = $1;
+SELECT * FROM lion_dr_plan($$EXECUTE lion_dr_s('2026-03-05')$$) AS p("QUERY PLAN");
+EXECUTE lion_dr_s('2026-03-05');
+SET ROLE lion_dr_noexec;
+SELECT * FROM lion_dr_plan($$EXECUTE lion_dr_s('2026-03-05')$$) AS p("QUERY PLAN");
+EXECUTE lion_dr_s('2026-03-05');
+RESET ROLE;
+SELECT * FROM lion_dr_plan($$EXECUTE lion_dr_s('2026-03-05')$$) AS p("QUERY PLAN");
+EXECUTE lion_dr_s('2026-03-05');
+DEALLOCATE lion_dr_s;
+RESET plan_cache_mode;
+GRANT EXECUTE ON FUNCTION lion_day_first(date) TO PUBLIC;
+REVOKE SELECT ON lion_dr_t FROM lion_dr_noexec;
+DROP ROLE lion_dr_noexec;
 
 -- ---- the bound functions, called directly ----
 SELECT d, lion_day_first(d), lion_day_last(d)

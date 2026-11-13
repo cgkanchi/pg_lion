@@ -476,6 +476,12 @@ lion_dayrange_runtime_value(Node *expr)
  * as a query's function is (that asks USAGE on the schema, which running
  * one does not).  An extension whose SQL predates them keeps the clauses
  * that need them as written.
+ *
+ * Whether the plan calls them turns on the current user's EXECUTE, and the
+ * query does not call them itself, so the plan is marked as made for this
+ * role: a cached plan run after SET ROLE, or inside a SECURITY DEFINER
+ * function, is made again for that role, which keeps the clauses as written
+ * if it may not run them (rather than failing where the query would not).
  */
 static bool
 lion_dayrange_lookup(LionDayRangeCtx *cx)
@@ -509,6 +515,7 @@ lion_dayrange_lookup(LionDayRangeCtx *cx)
 	nsp = get_extension_schema(extoid);
 	if (!OidIsValid(nsp))
 		return false;
+	cx->root->glob->dependsOnRole = true;
 	for (i = 0; i < LION_DAYFN_N; i++)
 	{
 		Oid			fn;
