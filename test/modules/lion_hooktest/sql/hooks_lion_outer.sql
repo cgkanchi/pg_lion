@@ -108,3 +108,32 @@ SELECT count(*) FROM hk_u u
 RESET lion_hooktest.refuse_lateral;
 DROP TABLE hk_u, hk_e;
 DROP FUNCTION hk_per_outer_row(text);
+
+-- The same for the first rows of each group probed per key (DESIGN.md §57):
+-- the per-key form has a LATERAL subquery, which the other hook refuses, and
+-- the query runs as written with the same rows.
+CREATE FUNCTION hk_per_key(q text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Nested Loop' THEN
+			RETURN true;
+		END IF;
+	END LOOP;
+	RETURN false;
+END $$;
+SELECT hk_per_key($$
+SELECT DISTINCT ON (k) k, v FROM hk WHERE k IN (1, 2, 3)
+ ORDER BY k, v DESC$$) AS per_key;
+SELECT DISTINCT ON (k) k, v FROM hk WHERE k IN (1, 2, 3) ORDER BY k, v DESC;
+BEGIN;
+SET LOCAL lion_hooktest.refuse_lateral = on;
+SELECT hk_per_key($$
+SELECT DISTINCT ON (k) k, v FROM hk WHERE k IN (1, 2, 3)
+ ORDER BY k, v DESC$$) AS per_key;
+SELECT DISTINCT ON (k) k, v FROM hk WHERE k IN (1, 2, 3) ORDER BY k, v DESC;
+SELECT 1 AS still_in_the_transaction;
+COMMIT;
+DROP FUNCTION hk_per_key(text);

@@ -356,6 +356,17 @@ of one customer's orders for each customer the outer side keeps, and the cheaper
 (`pg_lion.enable_lateral_counts`, DESIGN.md §56). For 4,262 outer rows over two million fact rows
 that took 54 ms against 258 for the subquery grouped first.
 
+The latest row of each group - `SELECT DISTINCT ON (customer_id) * FROM orders WHERE status =
+'open' ORDER BY customer_id, placed_at DESC`, a subquery's `row_number() OVER (PARTITION BY
+customer_id ORDER BY placed_at DESC)` kept to `rn <= 3`, or `SELECT customer_id, max(placed_at)
+... GROUP BY customer_id` - is planned a second time as a probe of each key: the customers with an
+open order listed from the Lion index on `customer_id`, then each one's latest orders read with an
+ordered index walk (a B-tree on `placed_at`, or a Lion index on it) and `LIMIT`. The cheaper plan
+is kept (`pg_lion.enable_lateral_tops`, DESIGN.md §57): over two million rows and 50 groups the
+three took 1.9, 6.7 and 1.8 ms against 465, 469 and 145; with 170,000 groups the sort is cheaper
+and the query is planned as written. The grouping column needs a Lion index and must be `NOT NULL`
+or filtered by the `WHERE` (`customer_id IS NOT NULL` will do).
+
 A `LEFT JOIN` from the dimension keeps every customer, one with no order counted 0: `SELECT
 cu.country, count(o.id) FROM customers cu LEFT JOIN orders o ON o.customer_id = cu.id AND o.status =
 'open' GROUP BY cu.country` is pushed down as the JOIN is, each customer emitted with its count

@@ -733,6 +733,17 @@ working around a bad choice:
   each such query is planned twice. Needs the library loaded before the query is planned
   (`shared_preload_libraries` or `session_preload_libraries`): otherwise the first query of a
   session, the one that loads it, is planned as written.
+- `pg_lion.enable_lateral_tops`: plan a query that keeps only the first rows of each group a
+  second time, as a probe of each group's key, and keep the cheaper plan (DESIGN.md §57). The
+  shapes are `SELECT DISTINCT ON (g) ... ORDER BY g, <order>`, a subquery's `row_number() OVER
+  (PARTITION BY g ORDER BY <order>)` that the outer `WHERE` bounds (`rn <= 3`, `rn < 3`, `rn =
+  1`), and `GROUP BY g` with only `min`, `max`, `bool_and`, `bool_or` or `every` of one
+  expression. The second plan lists the keys of `g` that have a row the `WHERE` keeps (`LionCount`)
+  and fetches each key's first rows in `<order>` with `LIMIT`, an ordered index walk. Tried when
+  the query reads one table, `g` is a plain column with a Lion index and is never NULL in the rows
+  read (declared `NOT NULL`, or rejected by the `WHERE`), and nothing needs every row of a group
+  (another window function or aggregate, a `FILTER`); each such query is planned twice. Needs the
+  library loaded before the query is planned, as `pg_lion.enable_lateral_counts` does.
 - `pg_lion.enable_semijoin`: offer `LionSemiJoin` and `LionAntiJoin`, a semi or anti join over a
   fact table answered from the Lion index on its foreign key (DESIGN.md §27, "The semi and anti
   join as a join path"). PostgreSQL's `enable_hashjoin`, `enable_mergejoin` and `enable_nestloop`

@@ -831,9 +831,11 @@ _PG_init(void)
 	/*
 	 * A grouped subquery joined on its grouping column, planned again as a
 	 * LATERAL subquery whose count a lion index answers per outer row
-	 * (DESIGN.md §56): its GUC and the planner hook.
+	 * (DESIGN.md §56): its GUC and the planner hook.  The first rows of each
+	 * group, planned again as a probe of each group's key (§57): its GUC.
 	 */
 	lion_lateral_init();
+	lion_top_init();
 
 	/*
 	 * lionvec (DESIGN.md §44): its tables, its popcount kernel, its
