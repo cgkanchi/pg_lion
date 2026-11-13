@@ -19,6 +19,9 @@ RESET client_min_messages;
 -- VACUUM can only set all-visible once the commit record is on disk
 SET synchronous_commit = on;
 SET default_statistics_target = 1000;
+-- the B-tree's lookups: the anti join folded into the WHERE as a negated list
+-- (DESIGN.md §27, "The anti join as a negated list") is countanti_list.sql's
+SET pg_lion.enable_count_anti_list = off;
 
 /*
  * lca() runs a query through the pushdown - every join method disabled, so

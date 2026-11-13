@@ -179,6 +179,8 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 				char	   *val;
 				int			filt = lion_join_filter_of(st,
 													   (int) (cl - st->clause));
+				int			fold = lion_antifold_of(st,
+													(int) (cl - st->clause));
 
 				if (opname == NULL)
 					elog(ERROR, "LionCount: cache lookup failed for operator %u",
@@ -211,6 +213,32 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 					val = deparse_expression((Node *) tle->expr, context, true,
 											 false);
 					appendStringInfo(buf, "%s %s %s", attname, opname, val);
+					pfree(opname);
+					pfree(val);
+					break;
+				}
+
+				/*
+				 * A NOT EXISTS folded into a negated list (DESIGN.md §27,
+				 * "The anti join as a negated list") prints as the anti join
+				 * it answers, its key the column of its child the keys are
+				 * read from: `NOT EXISTS (k = s.a)`.
+				 */
+				if (fold >= 0)
+				{
+					Plan	   *fplan = st->antifoldps[fold]->plan;
+					TargetEntry *tle = (TargetEntry *)
+						list_nth(fplan->targetlist,
+								 st->antifoldcol[fold] - 1);
+					List	   *fancestors = lcons(st->css.ss.ps.plan,
+												   list_copy(ancestors));
+
+					context = set_deparse_context_plan(es->deparse_cxt, fplan,
+													   fancestors);
+					val = deparse_expression((Node *) tle->expr, context, true,
+											 false);
+					appendStringInfo(buf, "NOT EXISTS (%s %s %s)", attname,
+									 opname, val);
 					pfree(opname);
 					pfree(val);
 					break;
@@ -1564,7 +1592,8 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 	{
 		uint8		counted = st->clause[i].counted |
 			((st->workercounted != NULL) ? st->workercounted[i] : 0);
-		int64	   *n = (st->clause[i].kind == LION_CLAUSE_ARRAY) ? lists :
+		int64	   *n = (st->clause[i].kind == LION_CLAUSE_ARRAY ||
+						  st->clause[i].kind == LION_CLAUSE_NOTIN) ? lists :
 			ranges;
 
 		if (counted & LION_SRC_COLLECTED)
@@ -2060,6 +2089,13 @@ lion_explain_analyze(LionCountScanState *st, ExplainState *es)
 	/* ... and the anti join over a small inner side's (DESIGN.md §27) */
 	if (st->anti != NULL)
 		lion_explain_anti_counters(st, es);
+
+	/*
+	 * ... or, folded into negated lists, the inner sides' keys their lists
+	 * were made of (NULL ones left out), in every run.
+	 */
+	if (st->nantifold > 0)
+		ExplainPropertyInteger("Anti Join Keys", NULL, st->antifoldkeys, es);
 }
 
 void

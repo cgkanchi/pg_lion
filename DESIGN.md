@@ -11004,9 +11004,9 @@ The rules (`test/upgrade/lint.py` checks them in CI, upgrade.yml):
   reached through upgrade scripts `<ext>--<from>--<to>.sql`, and a chain of them leads from every
   version that has one to the current one.
 - `default_version` is `X.Y.Z` at a release and `X.Y.Z-devN` between releases, where `X.Y.Z` is
-  the release being prepared. META.json's `version` and each `provides.<ext>.version` are that
-  `X.Y.Z`, without the `-devN`; `provides.<ext>.file` is the install script,
-  `<ext>--<default_version>.sql`.
+  the release being prepared. `provides.<ext>.version` in META.json is that `X.Y.Z`, without the
+  `-devN`, and `provides.<ext>.file` the install script, `<ext>--<default_version>.sql`;
+  META.json's own `version`, the distribution's, is the newest of the extensions' `X.Y.Z`.
 - Changing an install script that the base branch has under the same version is refused: rename
   it to the next `-devN` (`git mv`), set `default_version` and META.json's `file`, and add
   `<ext>--<old>--<new>.sql` doing the same change with plain DDL - `CREATE OR REPLACE FUNCTION`,
@@ -16122,7 +16122,8 @@ counts t's rows WITHOUT a qualifying inner row: a complement of the forward semi
 which no count per key gives, and core's plan is an anti join over the whole of t. Where the inner
 side is a few rows, the complement is cheap the other way round: count t's WHERE as the count
 pushdown counts any, and take away the rows of it that some inner row matches, which a B-tree on
-`t.k` finds a key at a time.
+`t.k` finds a key at a time - or, where the join is on one column of `t`, a lion index on it as a
+list of the keys ("The anti join as a negated list" below).
 
 **What is computed.**
 
@@ -16649,6 +16650,102 @@ keys in the heap's order under a WHERE of a hundredth that it counts 1.4 times s
 WHERE at all, keys in the heap's order, it left to core inner sides of up to 10,000 keys that the
 node counts twice as fast - by the price of counting the whole table against a merge join, the
 count's own, not the lookups'.
+
+### The anti join as a negated list (2026-11-13)
+
+The anti join over a small inner side needs a B-tree on `t.k`, and its lookups grow with the keys:
+a key and its rows fetched at a time, each row tested. Without that B-tree the query went to core's
+hash anti join, which reads the whole WHERE of t. But the rows the anti join keeps are a set the
+lion index on `k` answers directly:
+
+    NOT EXISTS (SELECT 1 FROM s WHERE s.a = t.k AND <filters on s>)
+      = rows of t whose k is none of the inner side's keys
+      = t \ rows(k = ANY (keys))
+
+A row of t is kept where no inner row's key equals its k: never true of a NULL k, the operator
+being strict, so a NULL k is kept; and otherwise where k is none of the keys - the complement of the
+IN list `k = ANY (keys)`, whose rows the lion index answers exactly as it answers any IN list (§15),
+with an inner row's NULL key left out of the list, as it matches no row. So the NOT EXISTS is a
+negated clause of the count's WHERE, `LION_CLAUSE_NOTIN`, beside §35's: the rows it rejects are the
+list's, subtracted at every container key, and a NULL row passes it as it passes `IS DISTINCT
+FROM`. The count is t's count of W less those rows, by the same merge as every other negated
+source - one count, a GROUP BY's groups, `count(col)`.
+
+**Recognition.** The anti join is `lion_fkjoin_recognize_small_anti()`'s, the NOT EXISTS or its
+`LEFT JOIN ... IS NULL` spelling, and the build is made once more beside the B-tree's
+(`lion_try_count_anti_path()`; add_path() keeps the cheaper), folding each arm into one NOTIN clause
+(`lion_count_path_antifold()`) where its one join clause is its key: a plain column of t, compared
+by its operator - commuted where the inner side is on the left - with a plain column of the inner
+side, through relabels. Whether a lion index on t's column answers the operator as an IN list's
+equality, under its collation, is `lion_match_index()`'s as for any clause; one that does not
+declines the build, as does any arm that does not fold: a second join clause, an inner expression,
+an operator with no commutator. Folded, the count is one plain table's, ungrouped or grouped by one
+or two of its columns, serial: not partitions, a `count(DISTINCT)`, cells, the decoded walk, a top
+k, filtered counts, the aggregates over keys or of slices, a coalesce group or expression columns
+(`lion_count_path_antifold_priv()`, held by `lion_count_priv_check()`), nor beside a multi-key
+query that may narrow nothing, whose heap scan tests no NOTIN clause on a row
+(`lion_where_scan_untested()`).
+
+**The keys.** Each arm's inner side is a child of the node, its cheapest total path, run whole at
+the start of each run (`lion_antifold_values()`) - and again at a rescan - its key's column read off
+every row, NULLs left out, into the list's array; past as many as a count locates at once
+(`lion_array_batch_size()`) into a tuplestore of work_mem that spills, as a dimension that only
+filters has its keys collected (`lion_child_key_values()`, the two share it). Duplicates stay: the
+list's lookup locates a batch's once, and a union takes a key's rows once. The list, however short,
+is collected into one set (`lion_locate_list()`): pinless, within what is left of hash_mem and into
+a file past it, a negated source to seek at each container key rather than a union of a set a key
+merged at every count. A stale copy can only subtract dead rows and rows inserted after the
+snapshot, the argument that lets any negated set be copied (§32, "Why the counts stay exact"). The
+child runs under the query's snapshot, as the anti join's inner side would have.
+
+**The price.** The list's lookups, its containers read and their union built, as an IN list's of
+as many keys as the child is expected to return (`lion_count_rel_notin()` over the clause
+`lion_keys_costclause()` makes: `k = ANY` over that many NULL placeholders, its selectivity the
+inner side's distinct keys over k's distinct values - the containment core's semi join estimate
+assumes too), its set walked once into memory and sought there by the merges; the children's
+prices before the first row, as the B-tree lookups' children are. `lion_list_sample_sel()` now
+leaves an array of NULL placeholders to its RestrictInfo's selectivity: it had sampled none of its
+values and called the list's share 0, which priced a dimension that only filters with more than a
+thousand keys as selecting nothing.
+
+**EXPLAIN** prints the clause as the anti join it answers, the key the child's column it is read
+from, and under ANALYZE the keys the lists were made of and the lists collected:
+
+    Custom Scan (LionCount) (actual rows=1 loops=1)
+      Lion Indexes: lcl_rows_x (x = 3), lcl_rows_k (NOT EXISTS (k = s.a))
+      Lists Collected: 1
+      Anti Join Keys: 8
+      ->  Seq Scan on lcl_skip s (actual rows=9 loops=1)
+            Filter: (f = 0)
+
+The plan carries the arms in `LION_PRIV_ANTIFOLD` (shape 36): each one's clause and its key's
+column, the inner side's relid and attnum at the PATH stage, the child's resno at the PLAN stage.
+EXECUTE on the function of each arm's operator, as the query wrote it, is asked of whoever runs the
+plan (`lion_replaced_functions()`), as of any clause lion answers; core's hash join, which commutes
+the clause, asks its commutator's instead. `pg_lion.enable_count_anti_list` turns the fold off, and
+`pg_lion.enable_count_anti` both routes.
+
+**Measured** (2026-11-13, PostgreSQL 18, release build, warm): a table of 2,000,000 events with
+lion indexes on `status`, `country` and `user_id` and no B-tree but its primary key's, and a users
+table of 200,000 whose NOT EXISTS keeps the events of users not on one plan, a quarter of them, or
+of a few hundred users; core's plan a parallel hash anti join with up to two workers, LionCount
+serial:
+
+| query | inner keys | LionCount | core's plan |
+|---|---|---|---|
+| `status = 'paid'` (a fifth of the rows) | 49,935 | 90 ms | 209 ms |
+| `status = 'paid'` | 504 | 5.7 ms | 112 ms |
+| GROUP BY country (50 groups), no WHERE | 49,935 | 128 ms | 356 ms |
+
+The model chose the node in each. With a B-tree on `user_id` as well, the fold still won: 89 ms
+against core's 133 ms at 49,935 keys (the B-tree's lookups not chosen), 4.5 ms against the
+B-tree's lookups' 10.9 ms and core's 77 ms at 504, and 106 ms against 309 ms grouped.
+
+`test/sql/countanti_list.sql` checks every answer against core's
+plan: each WHERE form, counts of columns, one and two grouping columns, empty and NULL inner sides,
+cross-type and text keys, two arms, the LEFT JOIN spelling, a list past work_mem, rescans with
+parameters on either side, generic plans, a snapshot with deletes of either table, EXECUTE revoked
+and row-level security.
 
 ### The dimension from a B-tree (2026-10-20)
 
@@ -35474,7 +35571,9 @@ sum under a range from slices beside the aggregates.
 `WHERE ts::date BETWEEN '2026-03-01' AND '2026-03-07'` read every row: a function of the column is
 in no operator family, lion's or a B-tree's, and the plan was a sequential scan (192 to 254 ms on 2M
 rows against 1 to 2 ms for the same counts written as ranges of `ts`). For a `timestamp` column
-they are ranges of `ts`, and are now planned as those ranges (`lion_plan_dayrange.c`).
+they are ranges of `ts`, and are now planned as those ranges (`lion_plan_dayrange.c`); for a
+`timestamptz` column, and a value known only when the query runs, see "Bounds known when the query
+runs" below.
 
 **Why it is exact.** `ts::date` (`date(timestamp)`) and `date_trunc(unit, ts)` of a `timestamp
 without time zone` are immutable and monotone - never smaller for a larger `ts` - and constant over
@@ -35483,7 +35582,7 @@ bucket of the constant `c`:
 
 | clause | is |
 |---|---|
-| `f(ts) = c` | `ts >= A AND ts < N` (when `f(A) = c`; a `c` inside a bucket equals no `f(ts)`, left alone) |
+| `f(ts) = c` | `ts >= A AND ts < N` (when `f(A) = c`; a `c` inside a bucket equals no `f(ts)`: an empty range, below) |
 | `f(ts) < c` | `ts < A` when `c` is its bucket's value, else `ts < N` |
 | `f(ts) <= c` | `ts < N` |
 | `f(ts) > c` | `ts >= N` |
@@ -35502,7 +35601,8 @@ millennium, a week seven days, a quarter three months), and the bucket is taken 
 are the timestamps of `c` and `c + 1`, computed as `date2timestamp()` does once `c` is checked to
 lie inside `timestamp`'s range. A constant within two
 thousand years of either end of `timestamp`'s range, an infinite one, or a date past that range is
-left alone, so that computing a bound never raises an error the clause itself would not.
+not computed this way, so that computing a bound never raises an error the clause itself would not:
+its bounds are folded from `first(c)` and `last(c)` (below).
 
 **Where.** The query's quals are rewritten in place, once for each base relation, from the hook
 after `get_relation_info()` (`lion_get_relation_info()`, `build_simple_rel_hook` from 19): it runs
@@ -35517,21 +35617,130 @@ its parent's, translated after this, and are not looked at.
 **Which relations.** Only a column with a lion index key on it (a plain column, `timestamp`), and
 only a clause no index of the relation has as an expression key - an expression index on
 `(ts::date)` keeps its clause. A table without lion keeps PostgreSQL's plans as they were.
-Only constants: a generic plan's `$1`, `current_date` and other stable expressions are left as
-written, since the bound's conversion could then fail at run time where the clause does not.
 `pg_lion.enable_date_ranges` (on) turns it off.
-
-**Not done.** `timestamptz` columns: the cast and the two-argument `date_trunc()` depend on the
-session's time zone, and a day of some zones' clocks is not one range - the clocks of St. John's,
-Moncton and Goose Bay stepped back across midnight every autumn from 1987 to 2010, and Alaska's by
-a whole day in 1867 - so the exact set is a union of ranges known only at run time. IN lists of
-days, `<>`, and a comparison across types (`ts::date = timestamp '...'`) are left as written.
 
 Tests: `test/sql/dayrange.sql` (every comparison with the constant on either side, every unit on and inside a
 bucket's edge, BC buckets, infinities, NULLs, the clause under OR, NOT, `IS NOT TRUE`, CASE and an
 outer join's `ON`, the declines, an expression index, a table without lion, a partitioned table
 pruned by the range, and a generic plan), each against the same query with the rewrite off and
 sequential scans only.
+
+### Bounds known when the query runs (2026-11-13)
+
+The rewrite now also takes a value known only when the query starts - a generic plan's `$1`,
+`current_date`, `now()`, a subquery's value: anything without a column of the row, a volatile
+function or a set - and `timestamptz` columns. Their bounds are calls of the extension's functions
+(`lion_daybounds.c`), which an index qual, a `LionCount` bound or a filter evaluates once per scan
+and a cached plan evaluates again at each run.
+
+**timestamp.** With `first(c)` the least `ts` whose `f(ts) >= c` and `last(c)` the greatest whose
+`f(ts) <= c`, monotone `f` makes each comparison one range, exact for every `c`:
+
+| clause | is |
+|---|---|
+| `f(ts) < c` | `ts < lion_day_first(c)` |
+| `f(ts) <= c` | `ts <= lion_day_last(c)` |
+| `f(ts) > c` | `ts > lion_day_last(c)` |
+| `f(ts) >= c` | `ts >= lion_day_first(c)` |
+| `f(ts) = c` | both of the `>=` and `<=` bounds |
+
+(`lion_day_first(unit, c)` and `lion_day_last(unit, c)` for `date_trunc()`). A constant goes through
+the plan-time path above when that path takes it; one it leaves - an infinity, a constant near or
+past the ends of `timestamp`'s range, an `=` inside a bucket - has `first(c)` and `last(c)` folded
+into constants (`lion_day_bound()`), so those are ranges too, an empty one for the `=`. The bounds
+never raise an error: a date past `timestamp`'s range gives `infinity` or the range's last instant,
+an infinite `c` the infinity, and a `c` past every bucket an empty range. The truncation is
+PostgreSQL's own (`timestamp_trunc()`), made on the broken-down fields without the range checks;
+where the clause itself fails on a row - `date_trunc('month', ts)` of the first days of 4714 BC,
+whose month starts before the type's range - the range places the row by its own value, so the
+query that failed now answers.
+
+**timestamptz.** The cast and `date_trunc()` of a `timestamptz` are those of its LOCAL time in the
+session's TimeZone, `L(t) = t + offset(t)`, and `L` is not monotone: where the clocks step back, an
+hour of local times comes twice. So `{t : f(t) >= c}` - the instants whose local time reaches the
+first one of `c`'s bucket - is a union of ranges, found by walking the zone's offset changes
+(`pg_next_dst_boundary()`) across the eight days around the bucket's local start
+(`lion_day_from()`): for each run of one offset, the instants whose local time is past it. `<` and
+`<=` are complements, `=` the `>=` set less the `>` one. Where the step back crosses the bucket's
+start - St. John's and Goose Bay at 00:01 every autumn from 1987 to 2010, Sitka's whole repeated day
+in 1867 - that is two ranges; otherwise one. No zone in the time zone database steps back twice
+within four days, so two always do (checked over every zone's changes from 1700 to 2100, below),
+and a third, or an offset of a week or more, is an error with a hint to turn the setting off, never a
+wrong row. The planner cannot know how many a run will need - the zone, or `c`, may change between
+runs of a cached plan - so the clause is always
+
+    (ts >= lion_day_lo(c, op, 1) AND ts <= lion_day_hi(c, op, 1)) OR
+    (ts >= lion_day_lo(c, op, 2) AND ts <= lion_day_hi(c, op, 2))
+
+with an unused piece the empty range `[p, p - 1 microsecond]`, which core's estimate of a range pair
+prices at next to no rows (crossed bounds a microsecond apart are taken for round-off, not for
+missing statistics). A B-tree or lion answers it with a BitmapOr of two index scans, and
+`LionCount` takes it beside another source that pins (a GROUP BY, an equality); as the only clause
+of a count it is left to the bitmap scans, which measured as fast as the single range (below).
+
+`date_trunc(unit, ts)` of a `timestamptz`, for a unit of a day or more, is `g(T(L(t)))`: `T` the
+truncation of the local time, `g` its bucket's start read back as an instant in the zone
+(`DetermineTimeZoneOffset()`, as `timestamptz_trunc_internal()` does). `g` never decreases from one
+bucket to the next where offsets differ by at most a day, which PostgreSQL assumes too, so the
+buckets whose instant compares with `c` are a run of them, and the instants of the clause are those
+whose local time lies in the run - the cast's problem again, with buckets for days. The run's ends
+are found by walking buckets from the one 15 days before `c`'s local time (`lion_day_trunc_marks()`),
+checking `g`'s order on the way. Units below a day are left as written: their truncation keeps the
+instant's own offset rather than finding the bucket's, which is another function.
+
+Every timestamptz range's edges are checked against the clause, computed as PostgreSQL computes it,
+where that cannot fail: each edge is in and the instant beside it out (`lion_day_check()`). The
+results are kept per call (`fn_extra`), keyed by the zone, the unit, the comparison and `c`.
+
+The functions are looked up in the extension's own schema from the catalog cache, checked to be the
+extension's and executable by the user planning (as the executor checks them again); an extension
+whose SQL predates them (`ALTER EXTENSION pg_lion UPDATE` not run) keeps the clauses that need them as
+written. A role that may not execute them, running a plan cached by one that may, gets PostgreSQL's
+permission error; they are executable by PUBLIC as installed.
+
+**Flat ANDs and ORs.** The planner is handed its quals flat (`canonicalize_qual()`,
+`eval_const_expressions()`), and what it does with an OR's arms takes an AND's arguments to be
+clauses and an OR's to be no ORs (`make_sub_restrictinfos()`, `TidQualFromRestrictInfoList()`). An
+AND of two bounds put under an AND - `(k = 2 AND ts::date = '...') OR k = 3`, since the first
+version - left an AND inside an AND, which crashed the TID path's scan of the OR; the union under an
+OR would leave an OR inside one. The rewrite now gives an AND or OR whose argument becomes one of
+its own kind that one's arguments (`lion_dayrange_mutator()`).
+
+**Measured** (PostgreSQL 18.7, release build; 5M rows over a year, one every 6.3 s, lion indexes on
+a `timestamp` and a `timestamptz` copy of the column; TimeZone America/New_York; best of six):
+
+| query | as written | the ranges | one range by hand |
+|---|---|---|---|
+| `count(*)` of a day of `timestamptz` (13,700 rows) | 368 ms | 4.2 ms | 6.3 ms |
+| `count(*)` of a month of `timestamptz` (412,000 rows) | 697 ms | 88 ms | 145 ms |
+| the same over minutes (ten rows a key): a day | 423 ms | 3.0 ms | 3.2 ms |
+| ... a month | | 29 ms | 39 ms |
+| ... a month `GROUP BY g` | | 37 ms (`LionCount`) | 69 ms |
+
+The `timestamp` column's day was 6.9 and 3.5 ms (an index scan) and its month 123 and 42 ms. The
+second piece costs one descent of the index that finds nothing.
+
+**Not done.** IN lists of days, `<>`, a comparison across types (`ts::date = timestamp '...'`),
+`date_trunc()` of a `timestamptz` to less than a day or with a zone argument, and `AT TIME ZONE`.
+`LionCount` does not take the timestamptz union as a count's only clause: an OR of ranges is
+collected and holds no pin (§32).
+
+Tests: `test/sql/dayrange.sql` adds infinities and constants at and past both ends of the type's
+range, rows there, a generic plan's parameters run against custom plans and the rewrite off for
+values from 4714 BC to infinity and NULL, `current_date`, `localtimestamp` and a subquery's value,
+volatile and row-dependent values left alone, the nested AND and OR, and the bound functions called
+directly. `test/sql/dayrange_tz.sql` runs the cast and `date_trunc()` of every unit of a day or more
+with each comparison on and inside bucket edges around the clock changes of fourteen zones (St.
+John's, Havana and Tehran stepping back across midnight, Apia and Kiritimati skipping a day, Sitka
+repeating one, Lord Howe's half hour, Dublin's negative summer time, POSIX and fixed offsets), each
+against the same query with the rewrite off and sequential scans only, plus the two-piece days'
+bounds, the clause under OR, NOT and `IS NOT TRUE`, infinities and NULL, a plan cached in UTC and
+run in St. John's and Apia, a parallel scan, and the functions' refusals. Outside the suite, every
+zone in the time zone database with a distinct history and an offset change between 1700 and 2100
+(316 of them) was checked at each of those changes, 36,037 in all: each instant from 26 hours before
+to 26 hours after, hourly, and a microsecond, a second, a minute and half an hour either side,
+against the cast for each comparison with the dates around, and `date_trunc()` of a day, week, month
+and year with a value on and off a bucket's edge: no difference, no error.
 
 ## 55. Statement-level insert batching (2026-11-10)
 

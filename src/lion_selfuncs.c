@@ -6513,6 +6513,18 @@ lion_list_sample_sel(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		}
 		nvalues = u;
 	}
+
+	/*
+	 * A list of NULLs alone is a planner's placeholder for keys known only
+	 * at run time (lion_keys_costclause()), whose RestrictInfo carries its
+	 * selectivity: no value to count, and no estimate of 0 to give for it.
+	 */
+	if (nvalues == 0)
+	{
+		pfree(elems);
+		pfree(nulls);
+		return false;
+	}
 	k = Min(nvalues, LION_LIST_SAMPLE_KEYS);
 	index = index_open(idx->indexoid, NoLock);
 	for (i = 0; i < k; i++)

@@ -443,6 +443,21 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §27, "The anti join as a negated list": whether that count may
+	 * instead subtract the rows whose key is one of the inner side's keys,
+	 * looked up in the lion index on the counted table's join column - which
+	 * needs no B-tree.  pg_lion.enable_count_anti switches it off as well.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_count_anti_list",
+							 "Enables lion's count of one table less the rows whose key is one of a NOT EXISTS's inner keys, from the lion index.",
+							 "Off, only the B-tree lookups of pg_lion.enable_count_anti answer such an anti join.",
+							 &lion_enable_count_anti_list,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
 	 * DESIGN.md §10, "A count of every row beside the rows": whether
 	 * count(*) OVER () beside a relation's rows may come from lion's count of
 	 * the relation (the LionWindowCount node) instead of a WindowAgg that

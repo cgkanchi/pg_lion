@@ -23,6 +23,9 @@ SET max_parallel_workers_per_gather = 0;
 -- Cells only: a GROUP BY of expressions of one or two columns is otherwise
 -- the columns' own groups, merged (DESIGN.md §36), where that is cheaper.
 SET pg_lion.enable_expr_groups = off;
+-- ... and beside an anti join, the B-tree's lookups: the anti join folded
+-- into the WHERE as a negated list (DESIGN.md §27) counts no cells
+SET pg_lion.enable_count_anti_list = off;
 -- EXPLAIN in a form every supported release prints the same way (the
 -- definition test/sql/citext.sql uses: 18's "Disabled: true" lines dropped,
 -- subplans named "expr_N", integer actual row counts, sorting off while it

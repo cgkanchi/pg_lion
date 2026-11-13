@@ -74,6 +74,10 @@ lion_eval_clause_values(LionCountScanState *st)
 	if (st->join != NULL && st->join->nfilter > 0)
 		lion_join_filter_values(st);
 
+	/* ... and of the NOT EXISTS folded into negated lists (§27) */
+	if (st->nantifold > 0)
+		lion_antifold_values(st);
+
 	MemoryContextSwitchTo(oldcxt);
 }
 
@@ -1191,7 +1195,8 @@ lion_locate_list(LionCountScanState *st, LionClauseState *cl,
 	*sets = NULL;
 	*nsets = 0;
 	*tree = NULL;
-	Assert(cl->kind == LION_CLAUSE_ARRAY && !cl->valisnull);
+	Assert((cl->kind == LION_CLAUSE_ARRAY ||
+			cl->kind == LION_CLAUSE_NOTIN) && !cl->valisnull);
 
 	memset(&w, 0, sizeof(w));
 	w.batch = lion_array_batch_size();
@@ -1203,7 +1208,10 @@ lion_locate_list(LionCountScanState *st, LionClauseState *cl,
 	else
 	{
 		w.arr = DatumGetArrayTypeP(cl->val);
-		if (ArrayGetNItems(ARR_NDIM(w.arr), ARR_DIMS(w.arr)) <= w.batch)
+
+		/* a negated list is collected however short (lion_locate_where()) */
+		if (cl->kind == LION_CLAUSE_ARRAY &&
+			ArrayGetNItems(ARR_NDIM(w.arr), ARR_DIMS(w.arr)) <= w.batch)
 		{
 			if ((Pointer) w.arr != DatumGetPointer(cl->val))
 				pfree(w.arr);
@@ -2201,6 +2209,26 @@ lion_locate_where(LionCountScanState *st)
 				src->rangewalk = rs;
 			else if (src->tree == NULL)
 				st->wheremissing = true;
+			continue;
+		}
+
+		/*
+		 * A NOT EXISTS folded into a negated list (DESIGN.md §27, "The anti
+		 * join as a negated list"): its keys - however few - collected into
+		 * one set (lion_locate_list()), held as a range taken as a source is,
+		 * which every count subtracts as a negated source: one set to seek
+		 * at each container key, where the sets of its keys located apart
+		 * would be a union to merge at every count.  No key with a row is
+		 * nothing to subtract.  A stale copy subtracts nothing a count
+		 * should keep (§9, "Why the counts stay exact").
+		 */
+		if (cl->kind == LION_CLAUSE_NOTIN)
+		{
+			if (cl->valisnull)
+				elog(ERROR, "LionCount: a negated list with no keys collected");
+			src->negated = true;
+			(void) lion_locate_list(st, cl, &src->sets, &src->nsets,
+									&src->tree);
 			continue;
 		}
 

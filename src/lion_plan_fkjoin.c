@@ -1527,44 +1527,38 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
- * The clause the cost model is given for a dimension folded into a fact filter
- * (DESIGN.md §27, "A second dimension that only filters"): `fk = ANY (array)`
- * over an array of as many elements as the dimension's path is expected to
- * return, all NULL - what estimate_array_length() reads for the number of
- * keys, at a bit each - in a RestrictInfo of the fact alone whose cached
- * selectivity is the share of the fact's rows the keys hold, which
- * clause_selectivity() returns without looking at the array (ten million
- * elements at most, a megabyte and a quarter of bits).  That share is
- * the keys over the fk's distinct values or the dimension's rows, whichever
- * is more: every key one value of the fk's, as many fact rows each as any
- * other, where the dimension's keys are the fk's values - and where the fk
- * holds values no key has, the keys' share of those.
+ * The clause the cost model prices a list of keys known only at run time
+ * by: `var = ANY (array)` over an array of `nkeys` elements, all NULL - what
+ * estimate_array_length() reads for the number of keys, at a bit each, ten
+ * million elements at most (a megabyte and a quarter of bits) - in a
+ * RestrictInfo of var's relation alone whose cached selectivity is `sel`,
+ * which clause_selectivity() returns without looking at the array; a long
+ * list's sample (lion_list_sample_sel()) has no value in it to count.  A
+ * dimension folded into a fact filter's (below) and a NOT EXISTS folded into
+ * a negated list's (DESIGN.md §27, "The anti join as a negated list").
  */
-static Node *
-lion_fkjoin_filter_costclause(PlannerInfo *root, RelOptInfo *rel,
-							  const LionFkFilter *f)
+Node *
+lion_keys_costclause(Var *var, Oid opno, Oid collation, Oid elemtype,
+					 double nkeys, Selectivity sel)
 {
-	Oid			elemtype = exprType(f->pkexpr);
-	double		keys = clamp_row_est(f->path->rows);
-	int			nkeys = (int) Min(keys, 10000000.0);
-	Size		bytes = ARR_OVERHEAD_WITHNULLS(1, nkeys);
+	int			n = (int) Min(clamp_row_est(nkeys), 10000000.0);
+	Size		bytes = ARR_OVERHEAD_WITHNULLS(1, n);
 	ArrayType  *arr = (ArrayType *) palloc0(bytes);
 	ScalarArrayOpExpr *saop = makeNode(ScalarArrayOpExpr);
 	RestrictInfo *ri = makeNode(RestrictInfo);
-	double		nd = lion_fkjoin_fk_ndistinct(root, rel, f->fkvar);
 
 	SET_VARSIZE(arr, bytes);
 	arr->ndim = 1;
 	arr->dataoffset = (int32) bytes;
 	arr->elemtype = elemtype;
-	ARR_DIMS(arr)[0] = nkeys;
+	ARR_DIMS(arr)[0] = n;
 	ARR_LBOUND(arr)[0] = 1;
 
-	saop->opno = f->opno;
-	saop->opfuncid = get_opcode(f->opno);
+	saop->opno = opno;
+	saop->opfuncid = get_opcode(opno);
 	saop->useOr = true;
-	saop->inputcollid = f->collation;
-	saop->args = list_make2(copyObject(f->fkvar),
+	saop->inputcollid = collation;
+	saop->args = list_make2(copyObject(var),
 							makeConst(get_array_type(elemtype), -1,
 									  InvalidOid, -1, PointerGetDatum(arr),
 									  false, false));
@@ -1572,13 +1566,36 @@ lion_fkjoin_filter_costclause(PlannerInfo *root, RelOptInfo *rel,
 
 	ri->clause = (Expr *) saop;
 	ri->is_pushed_down = true;
-	ri->clause_relids = bms_make_singleton(rel->relid);
+	ri->clause_relids = bms_make_singleton(var->varno);
 	ri->required_relids = ri->clause_relids;
 	ri->num_base_rels = 1;
 	ri->eval_cost.startup = -1;
-	ri->norm_selec = Min(keys / Max(nd, Max(f->rel->tuples, 1.0)), 1.0);
+	ri->norm_selec = Min(Max(sel, 0.0), 1.0);
 	ri->outer_selec = -1;
 	return (Node *) ri;
+}
+
+/*
+ * The clause the cost model is given for a dimension folded into a fact filter
+ * (DESIGN.md §27, "A second dimension that only filters"): `fk = ANY (array)`
+ * over as many keys as the dimension's path is expected to return
+ * (lion_keys_costclause()), whose selectivity is the share of the fact's rows
+ * the keys hold.  That share is the keys over the fk's distinct values or
+ * the dimension's rows, whichever is more: every key one value of the fk's,
+ * as many fact rows each as any other, where the dimension's keys are the
+ * fk's values - and where the fk holds values no key has, the keys' share of
+ * those.
+ */
+static Node *
+lion_fkjoin_filter_costclause(PlannerInfo *root, RelOptInfo *rel,
+							  const LionFkFilter *f)
+{
+	double		keys = clamp_row_est(f->path->rows);
+	double		nd = lion_fkjoin_fk_ndistinct(root, rel, f->fkvar);
+
+	return lion_keys_costclause(f->fkvar, f->opno, f->collation,
+								exprType(f->pkexpr), keys,
+								keys / Max(nd, Max(f->rel->tuples, 1.0)));
 }
 
 /*

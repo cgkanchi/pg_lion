@@ -2128,6 +2128,12 @@ extern PGDLLIMPORT set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook;
  * small inner side"): pg_lion.enable_count_anti.
  */
 extern PGDLLIMPORT bool lion_enable_count_anti;
+
+/*
+ * ... and folded into the count's WHERE as negated lists instead (DESIGN.md
+ * §27, "The anti join as a negated list"): pg_lion.enable_count_anti_list.
+ */
+extern PGDLLIMPORT bool lion_enable_count_anti_list;
 extern PGDLLIMPORT bool lion_enable_window_count;
 extern PGDLLIMPORT bool lion_enable_count_rows;
 extern PGDLLIMPORT bool lion_enable_count_minmax;
