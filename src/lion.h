@@ -2537,6 +2537,10 @@ struct PlannerInfo;
 extern bool lion_enable_date_ranges;	/* GUC pg_lion.enable_date_ranges */
 extern void lion_rewrite_day_filters(struct PlannerInfo *root,
 									 struct RelOptInfo *rel);
+/* ... and their bounds when known only at run time (lion_daybounds.c) */
+extern int	lion_day_unit(const char *str, int len);
+extern bool lion_day_unit_whole_days(int val);
+extern int64 lion_day_bound(int val, Datum c, bool last);	/* a Timestamp */
 /* the entries a lion path's lookups hand their answer out by (lion_amcost.c) */
 extern double lion_cost_path_entries(struct PlannerInfo *root,
 									 struct IndexPath *path);
