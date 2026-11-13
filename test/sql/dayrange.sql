@@ -288,14 +288,14 @@ EXECUTE lion_dr_q('infinity');
 EXECUTE lion_dr_q('-infinity');
 EXECUTE lion_dr_q('300000-01-01');
 EXECUTE lion_dr_q(NULL);
--- (the InitPlans spelled as PostgreSQL 19 names them)
+-- (the InitPlans spelled as PostgreSQL 19 names them, without 16's "returns")
 CREATE FUNCTION lion_dr_plan(q text) RETURNS SETOF text
 LANGUAGE plpgsql AS $$
 DECLARE
 	l text;
 BEGIN
 	FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
-		RETURN NEXT regexp_replace(l, '(InitPlan|SubPlan) (\d+)', '\1 expr_\2', 'g');
+		RETURN NEXT regexp_replace(l, '(InitPlan|SubPlan) (\d+)( \(returns [^)]*\))?', '\1 expr_\2', 'g');
 	END LOOP;
 END
 $$;
