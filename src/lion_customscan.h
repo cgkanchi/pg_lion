@@ -4951,8 +4951,8 @@ extern Cost lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 								  bool force, double *reads, bool *unite);
 
 /* lion_plan_fkjoin.c */
-extern bool lion_join_aggs_lookup(Oid *countfn, Oid *sumfn, Oid *mul2op,
-								  Oid *mul4op);
+extern bool lion_join_aggs_lookup(PlannerInfo *root, Oid *countfn,
+								  Oid *sumfn, Oid *mul2op, Oid *mul4op);
 extern CustomPath *lion_join_agg_wrap(PlannerInfo *root,
 									  RelOptInfo *output_rel, Path *aggpath,
 									  List *checkaggs);

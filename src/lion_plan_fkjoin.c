@@ -679,9 +679,16 @@ lion_fkjoin_mul_op(Oid lefttype)
  * int2 * int8 and int4 * int8, for an Agg over rows that carry their counts;
  * false, and the ordinary plan, when one is missing or the current user may
  * not run it.  Each is asked for only when its pointer is not NULL.
+ *
+ * Whether the plan runs the aggregates turns on the current user's EXECUTE,
+ * and the query does not call them itself, so the plan is marked as made for
+ * this role: a cached plan run after SET ROLE, or inside a SECURITY DEFINER
+ * function, is made again for that role, which gets the ordinary plan if it
+ * may not run them (rather than failing where the query would not).
  */
 bool
-lion_join_aggs_lookup(Oid *countfn, Oid *sumfn, Oid *mul2op, Oid *mul4op)
+lion_join_aggs_lookup(PlannerInfo *root, Oid *countfn, Oid *sumfn,
+					  Oid *mul2op, Oid *mul4op)
 {
 	Oid			extoid = get_extension_oid("pg_lion", true);
 	Oid			nsp;
@@ -691,6 +698,7 @@ lion_join_aggs_lookup(Oid *countfn, Oid *sumfn, Oid *mul2op, Oid *mul4op)
 	nsp = get_extension_schema(extoid);
 	if (!OidIsValid(nsp))
 		return false;
+	root->glob->dependsOnRole = true;
 	if (countfn != NULL)
 	{
 		*countfn = lion_fkjoin_ext_agg(extoid, nsp, "lion_join_count");
@@ -719,14 +727,14 @@ lion_join_aggs_lookup(Oid *countfn, Oid *sumfn, Oid *mul2op, Oid *mul4op)
 }
 
 static bool
-lion_fkjoin_rewrite_init(LionFkAggRewrite *cx, const LionFkJoin *fj,
-						 bool needcount, bool needsum)
+lion_fkjoin_rewrite_init(PlannerInfo *root, LionFkAggRewrite *cx,
+						 const LionFkJoin *fj, bool needcount, bool needsum)
 {
 	Aggref	   *n;
 
 	memset(cx, 0, sizeof(LionFkAggRewrite));
 	cx->fj = fj;
-	if (!lion_join_aggs_lookup(needcount ? &cx->countfn : NULL,
+	if (!lion_join_aggs_lookup(root, needcount ? &cx->countfn : NULL,
 							   needsum ? &cx->sumfn : NULL,
 							   needsum ? &cx->mul2op : NULL,
 							   needsum ? &cx->mul4op : NULL))
@@ -2116,7 +2124,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 		{
 			LionFkAggRewrite cx;
 
-			if (!lion_fkjoin_rewrite_init(&cx, fj,
+			if (!lion_fkjoin_rewrite_init(root, &cx, fj,
 										  nagg[LION_FKAGG_COUNT] +
 										  nagg[LION_FKAGG_COUNTCOL] +
 										  nagg[LION_FKAGG_COUNTFACT] > 0,

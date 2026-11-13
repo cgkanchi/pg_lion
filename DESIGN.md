@@ -3866,7 +3866,11 @@ left as they stand - and the node on `count()`; the query's rewritten aggregates
 `custom_private` and the node asks EXECUTE on each when it starts, as ExecInitAgg would
 (§9, "Privileges"; `test/sql/node_contracts.sql` has the line). The plan asks one privilege more
 than the ordinary plan where the query has no `count(*)`: `count()`, of the node's own count, and
-the extension's `lion_join_count` and `lion_join_sum`, which are looked up at plan time.
+the extension's `lion_join_count` and `lion_join_sum`, which are looked up at plan time
+(`lion_join_aggs_lookup()`) and used only when the planning user may execute them. That makes the
+plan one made for that role (`dependsOnRole`): a plan cached by one role and run by another after SET
+ROLE, or inside a SECURITY DEFINER function, is planned again for it, and a role that may not run
+them gets the ordinary plan rather than a permission error the query would not raise.
 
 **Declined**, to the ordinary plan: an aggregate that reads a column outside the grouping, or one
 not in the table above (`avg`, `array_agg` without DISTINCT, `bit_xor`, a `sum` of a bigint); an
@@ -35709,8 +35713,10 @@ results are kept per call (`fn_extra`), keyed by the zone, the unit, the compari
 The functions are looked up in the extension's own schema from the catalog cache, checked to be the
 extension's and executable by the user planning (as the executor checks them again); an extension
 whose SQL predates them (`ALTER EXTENSION pg_lion UPDATE` not run) keeps the clauses that need them as
-written. A role that may not execute them, running a plan cached by one that may, gets PostgreSQL's
-permission error; they are executable by PUBLIC as installed.
+written. Whether the plan calls them turns on the planning user's EXECUTE, so the plan is marked as
+made for that role (`dependsOnRole`): a role running a plan cached by another is planned for anew,
+and one that may not execute them gets the clauses as written, not a permission error the query
+would not raise. They are executable by PUBLIC as installed.
 
 **Flat ANDs and ORs.** The planner is handed its quals flat (`canonicalize_qual()`,
 `eval_const_expressions()`), and what it does with an OR's arms takes an AND's arguments to be

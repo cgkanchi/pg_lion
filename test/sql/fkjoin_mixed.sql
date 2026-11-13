@@ -504,6 +504,28 @@ GRANT EXECUTE ON FUNCTION lion_join_count(bigint) TO PUBLIC;
 SET ROLE lion_mj_reader;
 SELECT lion_mj('SELECT count(DISTINCT d.pk), count(*) FROM lion_mf f JOIN lion_md d ON d.pk = f.fk WHERE f.hot AND d.kept');
 RESET ROLE;
+-- ... and so does one running a plan cached by a role that may run it: the
+-- plan is made again for the role that runs it, not reused to fail with
+-- "permission denied" where the query, which does not call it, would not
+REVOKE EXECUTE ON FUNCTION lion_join_count(bigint) FROM PUBLIC;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SET plan_cache_mode = force_generic_plan;
+PREPARE lion_mj_s AS SELECT count(DISTINCT d.pk), count(*) FROM lion_mf f JOIN lion_md d ON d.pk = f.fk WHERE f.hot AND d.kept;
+SELECT lion_mj_form('EXECUTE lion_mj_s');
+EXECUTE lion_mj_s;
+SET ROLE lion_mj_reader;
+SELECT lion_mj_form('EXECUTE lion_mj_s');
+EXECUTE lion_mj_s;
+RESET ROLE;
+SELECT lion_mj_form('EXECUTE lion_mj_s');
+DEALLOCATE lion_mj_s;
+RESET plan_cache_mode;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+GRANT EXECUTE ON FUNCTION lion_join_count(bigint) TO PUBLIC;
 -- ... and the planner finds them with no USAGE on the extension's schema,
 -- which running them does not ask for either
 SELECT n.nspname AS lion_schema FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace

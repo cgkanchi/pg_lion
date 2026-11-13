@@ -229,5 +229,44 @@ SELECT gs_cost('SELECT a, b, sum(DISTINCT s) FROM gs WHERE t IN (''v1'', ''v2'')
 SELECT gs_cost('SELECT a, b, count(*), GROUPING(a, b) FROM gs GROUP BY ROLLUP (a, b)');
 SELECT gs_q('SELECT a, b, sum(DISTINCT s) FROM gs WHERE t IN (''v1'', ''v2'') GROUP BY a, b');
 
+-- ---- a cached plan run by a role that may not run lion_join_count() ----
+-- The counts' aggregates are the extension's, which the query does not call:
+-- a plan cached by a role that may run them is made again for one that may
+-- not, which gets the ordinary plan rather than "permission denied".
+CREATE ROLE lion_gs_reader;
+GRANT SELECT ON gs TO lion_gs_reader;
+REVOKE EXECUTE ON FUNCTION lion_join_count(bigint) FROM PUBLIC;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET plan_cache_mode = force_generic_plan;
+CREATE FUNCTION gs_counted(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionJoinAgg\)' THEN
+			RETURN 'over the counts';
+		END IF;
+	END LOOP;
+	RETURN 'the ordinary plan';
+END $$;
+PREPARE gs_s AS SELECT b, count(*) FROM gs WHERE c = 1 GROUP BY ROLLUP (b) ORDER BY b;
+SELECT gs_counted('EXECUTE gs_s');
+EXECUTE gs_s;
+SET ROLE lion_gs_reader;
+SELECT gs_counted('EXECUTE gs_s');
+EXECUTE gs_s;
+RESET ROLE;
+SELECT gs_counted('EXECUTE gs_s');
+DEALLOCATE gs_s;
+DROP FUNCTION gs_counted(text);
+RESET plan_cache_mode;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
+GRANT EXECUTE ON FUNCTION lion_join_count(bigint) TO PUBLIC;
+REVOKE ALL ON gs FROM lion_gs_reader;
+DROP ROLE lion_gs_reader;
+
 DROP TABLE gs, gsp;
 DROP FUNCTION gs_q(text), gs_plan(text), gs_cost(text);
